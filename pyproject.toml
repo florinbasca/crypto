@@ -1,0 +1,51 @@
+[project]
+name = "crypto"
+version = "0.1.0"
+description = "Market-neutral cross-sectional crypto stat-arb: factor model, residual prediction, MVO backtest"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = "==3.13.*"
+dependencies = [
+    "aiohttp>=3.12.13",
+    "antropy>=0.1.9",
+    "beautifulsoup4>=4.13.4",
+    "catboost>=1.2.8",
+    "ccxt>=4.4.91",
+    "ipdb>=0.13.13",
+    "joblib>=1.5.1",
+    "jupyter>=1.1.1",
+    "jupyter-core>=5.9.1",
+    "lxml>=6.0.0",
+    "matplotlib>=3.10.3",
+    "notebook>=7.5.0",
+    "numpy>=2.2.6",
+    "pandas>=2.3.0",
+    "polars>=1.0.0",
+    "prettyprint>=0.1.5",
+    "pyarrow>=15.0.0",
+    "pycoingecko>=3.2.0",
+    "python-dateutil>=2.9.0.post0",
+    "pywavelets>=1.8.0",
+    "PyYAML>=6.0.1",
+    "requests>=2.32.4",
+    "rich>=14.2.0",
+    "scikit-learn>=1.7.0",
+    "scipy>=1.16.0",
+    "seaborn>=0.13.2",
+    "sqlalchemy>=2.0.41",
+    "statsmodels>=0.14.5",
+    "ta>=0.11.0",
+    "tqdm>=4.67.1",
+    "xgboost>=3.0.2",
+    "yfinance>=0.2.64",
+]
+
+[dependency-groups]
+# Dev tooling (installed by `uv sync`, excluded from runtime installs via
+# `uv sync --no-dev`). Keeps test runs reproducible so `uv sync` no longer
+# prunes pytest.
+dev = [
+    "nbstripout>=0.9.1",
+    "pytest>=8.0",
+]
