@@ -163,7 +163,7 @@ How far the backtested numbers should be trusted out of sample:
 - **No MTV crypto value signal.** The SLS value construction needs clean
   on-chain transaction volume. This repo does not have that data, and exchange
   volume is not a valid substitute for market-cap / transaction-value MTV.
-- **Approximate transaction costs.** A 5 bps/side base cost is charged on
+- **Approximate transaction costs.** A 2 bps/side base cost is charged on
   turnover, scaled per name by a trailing-ADV liquidity multiplier (illiquid
   names cost more, fill slower). The model is still cross-sectional and does
   *not* use realized execution data, calibrated impact curves, capacity caps,
