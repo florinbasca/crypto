@@ -391,9 +391,18 @@ config = {
         # floors raise per-signal IC but breadth collapses (0.03 -> ~7 signals).
         'min_ic': 0.01,
         'min_icir': 0.02,
-        # Annualized Sharpe of the signal's own daily returns - the standalone
-        # track-record floor a signal must clear to be selected.
+        # Annualized Sharpe of the signal's own GROSS daily returns - the
+        # standalone track-record floor a signal must clear to be selected.
         'min_sharpe_threshold': 0.3,
+        # Cost-aware economic floor: annualized Sharpe of the signal's own daily
+        # returns AFTER paying portfolio.cost_bps/side on its rebalance turnover,
+        # traded in its selected direction. Gross IC/Sharpe ignore costs, so a
+        # high-gross-IC short-horizon signal whose few-bp edge cannot clear a
+        # round trip was being selected and then losing money in the book (the
+        # 22-window run showed standalone net edge negative across every bucket
+        # while gross looked like a +2 Sharpe). 0.0 = require net break-even;
+        # None = disable (revert to gross-only selection).
+        'min_net_sharpe_threshold': 0.0,
         'max_correlation_threshold': 0.50,
         'max_signal_turnover': 1.0,      # Max avg turnover per rebalance cycle
         # Minimum directly-observed holding lag (bars) a signal may be selected
@@ -465,7 +474,10 @@ config = {
         'candidate_ranking': {
             'enabled': True,
             'score_weights': {
-                'sharpe': 0.30,
+                # Rank on the COST-AWARE (net) Sharpe, not gross: prefer signals
+                # whose edge survives their own trading cost under the family and
+                # de-correlation caps.
+                'sharpe_net': 0.30,
                 'icir': 0.25,
                 'ic_tstat': 0.20,
                 'inverse_turnover': 0.15,

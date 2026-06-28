@@ -311,6 +311,21 @@ class SignalSelector:
         sharpe = (ret / ret_std.replace(0, np.nan)) * np.sqrt(365)
         sharpe_f = (ret_f / ret_f_std.replace(0, np.nan)) * np.sqrt(365)
 
+        # Cost-aware (net) edge in the TRADED direction. The gross Sharpe above is
+        # what the signal would earn if trading were free; the economic floor is
+        # the Sharpe AFTER paying cost_bps/side on the signal's own rebalance
+        # turnover. Many high-gross-IC short-horizon signals are net-NEGATIVE -
+        # their few-bp edge never clears a round trip - so gating on gross alone
+        # admits signals the book then loses money trading.
+        cost = PORT['cost_bps'] / 10000.0
+        sign_map = dict(zip(ic_mean.index, sign))
+        net_row = (d['signal_name'].map(sign_map) * d['ret_gross']
+                   - d['turnover'] * cost)
+        gn = net_row.groupby(d['signal_name'])
+        net_ret = gn.mean().reindex(ic_mean.index)
+        net_std = gn.std().reindex(ic_mean.index)
+        sharpe_net = (net_ret / net_std.replace(0, np.nan)) * np.sqrt(365)
+
         turnover = g['turnover'].sum() / g['n_rebalances'].sum().replace(0, np.nan)
 
         # Stability: IC sign agreement across window thirds. A pooled IC made
@@ -345,6 +360,8 @@ class SignalSelector:
             'ic_tstat': tstat.values,
             'icir': (ic_mean / ic_std.replace(0, np.nan)).values,
             'sharpe': np.where(sign > 0, sharpe.values, sharpe_f.values),
+            'sharpe_net': sharpe_net.values,
+            'net_ret_mean': net_ret.values,
             'avg_turnover': turnover.values,
             'stable_thirds': stable.values,
             'recent_third_consistent': recent.values,
@@ -414,6 +431,8 @@ class SignalSelector:
                 'p_horizon': p_horizon, 'best_lag': best_lag,
                 'ic_mean': best['ic_mean'], 'icir': best['icir'],
                 'ic_tstat': best['ic_tstat'], 'sharpe': best['sharpe'],
+                'sharpe_net': best['sharpe_net'],
+                'net_ret_mean': best['net_ret_mean'],
                 'avg_turnover': best['avg_turnover'],
                 'stable_thirds': best['stable_thirds'],
                 'recent_third_consistent': best['recent_third_consistent'],
@@ -465,6 +484,11 @@ class SignalSelector:
             (stats['avg_turnover'] <= WF['max_signal_turnover']) &
             (stats['stable_thirds'] >= WF['min_stable_thirds'])
         )
+        # Cost-aware economic floor: the signal must clear its own trading cost at
+        # its rebalance horizon. None -> off (gross-only behaviour); 0.0 -> require
+        # the net edge to at least break even after cost_bps/side.
+        if WF.get('min_net_sharpe_threshold') is not None:
+            gates &= (stats['sharpe_net'] >= WF['min_net_sharpe_threshold'])
         if WF.get('min_holding_lag_bars', 0) > 0:
             gates &= (stats['holding_lag'] >= WF['min_holding_lag_bars'])
         if WF.get('require_recent_third', True):
@@ -590,12 +614,14 @@ class SignalSelector:
     def _rank_candidates(stats: pd.DataFrame) -> List[str]:
         cfg = WF.get('candidate_ranking', {})
         if not cfg.get('enabled', False):
-            return stats.sort_values('sharpe', ascending=False)['signal_name'].tolist()
+            key = 'sharpe_net' if 'sharpe_net' in stats.columns else 'sharpe'
+            return stats.sort_values(key, ascending=False)['signal_name'].tolist()
 
         weights = cfg.get('score_weights', {})
         scores = pd.Series(0.0, index=stats['signal_name'].values)
         # Longer directly selected holding lags are more implementation-friendly.
-        col_map = {'sharpe': 'sharpe', 'icir': 'icir', 'ic_tstat': 'ic_tstat',
+        col_map = {'sharpe': 'sharpe', 'sharpe_net': 'sharpe_net',
+                   'icir': 'icir', 'ic_tstat': 'ic_tstat',
                    'inverse_turnover': 'avg_turnover',
                    'inverse_decay': 'holding_lag'}
         for metric, w in weights.items():
