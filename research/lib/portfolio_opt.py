@@ -3,18 +3,24 @@ Portfolio Optimization: shrunk-covariance MVO with neutrality constraints.
 
 Construction (per rebalance):
     maximize   alpha' w - (1/2) w' Sigma w
-    subject to A' w = 0          (dollar / market-beta / size-beta neutrality)
+    subject to |A' w| <= band    (dollar + factor-beta neutrality bands)
                |w_i| <= max_pos
                sum |w_i| = gross
+
+A's columns are whatever the caller passes - in production [dollar, market,
+size, momentum, vol] (config `portfolio.neutrality`), so EVERY hedged factor is
+constrained on the actual traded coin weights, not just at the residual stage.
+`band` is a per-column vector; band = 0 recovers exact neutrality (A' w = 0).
 
 Sigma is the Ledoit-Wolf shrunk covariance of RESIDUAL returns (factors are
 hedged by the neutrality constraints, so the residual covariance is the
 relevant risk).
 
 Solution: closed-form KKT projection of the unconstrained MVO direction onto
-the null space of the equality constraints, then iterative box-clip +
-re-projection, then gross normalization. Risk aversion drops out under the
-gross-leverage normalization, so no gamma parameter is exposed.
+the null space of the constraints, then iterative box-clip + re-projection
+(which re-imposes only the exposure EXCESS beyond each band), then gross
+normalization. Risk aversion drops out under the gross-leverage normalization,
+so no gamma parameter is exposed.
 
 This is deliberately solver-free: it runs at every 10-minute rebalance over a
 3-year backtest (~150k solves), where a QP solver would dominate runtime. The
@@ -65,11 +71,29 @@ def shrunk_covariance(returns: pd.DataFrame,
     return pd.DataFrame(cov, index=keep, columns=keep)
 
 
+def _band_reproject(A: np.ndarray, w: np.ndarray, band: np.ndarray) -> np.ndarray:
+    """Pull each exposure A'w back inside +/-band, removing only the EXCESS.
+
+    e = A'w are the current exposures (net-dollar, factor betas). We clip each
+    into its band and remove the minimum-norm weight change that carries off the
+    excess `e - clip(e)`. lstsq on the Gram matrix A'A (not a direct inverse)
+    keeps this robust to collinear constraint columns - the ones-vector and
+    market beta ~ 1 for every name are near-collinear. band = 0 reproduces the
+    exact projection onto the null space of A (A'w = 0)."""
+    if A.shape[1] == 0:
+        return w
+    e = A.T @ w
+    excess = e - np.clip(e, -band, band)
+    m = np.linalg.lstsq(A.T @ A, excess, rcond=None)[0]
+    return w - A @ m
+
+
 def solve_constrained_mvo(alpha: pd.Series,
                           cov: pd.DataFrame,
                           constraints: pd.DataFrame,
                           max_position: float = 0.05,
                           gross_leverage: float = 1.0,
+                          bands=None,
                           n_iter: int = 10) -> pd.Series:
     """
     Solve the constrained MVO described in the module docstring.
@@ -77,10 +101,13 @@ def solve_constrained_mvo(alpha: pd.Series,
     Args:
         alpha: expected (residual) returns per asset
         cov: covariance (assets x assets), must share index with alpha
-        constraints: (assets x k) matrix A; solution satisfies A' w = 0.
-            Typically columns = [ones, beta_market, beta_size].
+        constraints: (assets x k) matrix A; solution satisfies |A' w| <= band.
+            Columns are whatever the caller passes - in production
+            [dollar, market, size, momentum, vol].
         max_position: per-name cap as a fraction of gross leverage
         gross_leverage: target sum |w|
+        bands: per-column exposure band (len k, aligned to constraints.columns);
+            None or all-zero -> exact neutrality (A' w = 0).
         n_iter: clip / re-project iterations
 
     Returns:
@@ -96,8 +123,10 @@ def solve_constrained_mvo(alpha: pd.Series,
 
     # Drop degenerate constraint columns (e.g. all-NaN betas -> filled 0)
     A = np.nan_to_num(A, nan=0.0)
-    col_norms = np.linalg.norm(A, axis=0)
-    A = A[:, col_norms > 1e-12]
+    keep_cols = np.linalg.norm(A, axis=0) > 1e-12
+    A = A[:, keep_cols]
+    band = (np.abs(np.asarray(bands, dtype=float))[keep_cols]
+            if bands is not None else np.zeros(A.shape[1]))
 
     try:
         S_inv_a = np.linalg.solve(S, a)
@@ -131,13 +160,8 @@ def solve_constrained_mvo(alpha: pd.Series,
         w = w * (gross_leverage / gross)
 
         clipped = np.clip(w, -cap_eff, cap_eff)
-        # Re-impose equality constraints: rank-revealing projection onto
-        # col(A) via lstsq (robust to collinear constraint columns)
-        if A.shape[1] > 0:
-            correction = A @ np.linalg.lstsq(A, clipped, rcond=None)[0]
-            w_new = clipped - correction
-        else:
-            w_new = clipped
+        # Re-impose neutrality within the band (band = 0 -> exact).
+        w_new = _band_reproject(A, clipped, band)
 
         if np.max(np.abs(w_new - w)) < 1e-10:
             w = w_new
@@ -157,21 +181,21 @@ def solve_equal_weight(alpha: pd.Series,
                        constraints: pd.DataFrame,
                        max_position: float = 0.05,
                        gross_leverage: float = 1.0,
+                       bands=None,
                        n_iter: int = 10) -> pd.Series:
     """Covariance-free benchmark book paired against `solve_constrained_mvo`.
 
     Weights come from the cross-sectional RANK of alpha (centered to zero sum),
     NOT from alpha magnitude or the covariance: a flat (identity) risk model.
-    The same equality constraints (A' w = 0), per-name cap and gross target are
+    The same neutrality bands (|A' w| <= band), per-name cap and gross target are
     then imposed by the identical clip/re-project loop, so the ONLY difference
     versus the MVO is the risk model. Running both isolates what the
     Ledoit-Wolf covariance weighting adds (or destroys). Rank weighting also
     strips the magnitude outliers a negatively-skewed signal feeds the MVO, so
     a large EW-minus-MVO gap points at cov-driven concentration on those tails.
 
-    `constraints` is the same A passed to the MVO (columns = ones, beta_market,
-    beta_size, ...). Returns weights indexed like the MVO solver (0 for assets
-    not scored).
+    `constraints`/`bands` are the same A and band vector passed to the MVO.
+    Returns weights indexed like the MVO solver (0 for assets not scored).
     """
     a = alpha.dropna()
     assets = list(a.index)
@@ -179,7 +203,10 @@ def solve_equal_weight(alpha: pd.Series,
         return pd.Series(dtype=float)
 
     A = np.nan_to_num(constraints.loc[assets].values.astype(float), nan=0.0)
-    A = A[:, np.linalg.norm(A, axis=0) > 1e-12]
+    keep_cols = np.linalg.norm(A, axis=0) > 1e-12
+    A = A[:, keep_cols]
+    band = (np.abs(np.asarray(bands, dtype=float))[keep_cols]
+            if bands is not None else np.zeros(A.shape[1]))
 
     # Centered cross-sectional rank -> dollar-neutral, magnitude-free direction.
     ranks = pd.Series(a.values, index=assets).rank().values
@@ -195,10 +222,7 @@ def solve_equal_weight(alpha: pd.Series,
             break
         w = w * (gross_leverage / gross)
         clipped = np.clip(w, -cap_eff, cap_eff)
-        if A.shape[1] > 0:
-            w_new = clipped - A @ np.linalg.lstsq(A, clipped, rcond=None)[0]
-        else:
-            w_new = clipped
+        w_new = _band_reproject(A, clipped, band)
         if np.max(np.abs(w_new - w)) < 1e-10:
             w = w_new
             break

@@ -504,7 +504,19 @@ config = {
         'shrinkage': 'ledoit_wolf',          # 'ledoit_wolf' or float in [0,1] (mvo only)
         'gross_leverage': 1.0,               # Sum |w| target
         'max_position': 0.05,                # Per-name cap (fraction of gross)
-        'neutrality': ['dollar', 'market', 'size', 'momentum', 'vol'],  # Equality constraints B'w = 0
+        'neutrality': ['dollar', 'market', 'size', 'momentum', 'vol'],  # Constrained exposures B'w
+        # Neutrality BANDS: each exposure is held within +/- band rather than at
+        # exactly zero. Bands give the optimizer slack to retain alpha and cut
+        # turnover instead of fighting the position cap to hit exact zero. Units:
+        # 'dollar' = net long-short as a fraction of gross; factor entries =
+        # portfolio beta to that factor. A band of 0.0 reproduces exact neutrality.
+        'neutrality_band': {
+            'dollar':   0.05,   # net exposure <= 5% of gross
+            'market':   0.10,   # |portfolio beta| <= 0.10
+            'size':     0.10,
+            'momentum': 0.10,
+            'vol':      0.10,
+        },
         'weight_smoothing_halflife': 6,      # legacy fixed EWM rate (fallback only)
         # HARD turnover budget. The per-bar trade toward the aim is throttled so
         # realized turnover never exceeds this many x gross per year - the

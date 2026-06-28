@@ -1338,6 +1338,12 @@ class WalkForwardPortfolio:
                     if n in PORT['neutrality']:
                         cons[n] = betas[f'beta_{n}'].reindex(assets).fillna(0.0)
                 A = pd.DataFrame(cons)
+                # Per-constraint neutrality bands, aligned to A's columns; each
+                # exposure is held within +/-band rather than at exactly zero
+                # (missing/0 -> exact). See portfolio.neutrality_band.
+                band_cfg = PORT.get('neutrality_band', {})
+                bands = np.array([band_cfg.get(c, 0.0) for c in A.columns],
+                                 dtype=float)
 
                 cov_a = cov.loc[assets, assets]
                 # Risk diagnostics for this rebalance: eigen-concentration of the
@@ -1360,11 +1366,13 @@ class WalkForwardPortfolio:
                 if self._weight_scheme == 'equal_weight':
                     w_target = solve_equal_weight(alpha, A,
                                                   max_position=cap,
-                                                  gross_leverage=gross_target)
+                                                  gross_leverage=gross_target,
+                                                  bands=bands)
                 else:
                     w_target = solve_constrained_mvo(alpha, cov_a, A,
                                                      max_position=cap,
-                                                     gross_leverage=gross_target)
+                                                     gross_leverage=gross_target,
+                                                     bands=bands)
                 target_index = pd.Index(w_target.index)
                 target_values = w_target.values.astype(float, copy=False)
                 alpha_values = alpha.reindex(target_index).fillna(0.0).values
