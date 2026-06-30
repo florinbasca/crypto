@@ -188,8 +188,6 @@ How far the backtested numbers should be trusted out of sample:
 
 ## License
 
-Copyright (C) 2026 Florin Basca.
-
 Licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0) — see
 [`LICENSE`](LICENSE). In short: you are free to use, study, modify, and
 redistribute this code, but any derivative you distribute **or run as a network
