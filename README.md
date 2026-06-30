@@ -37,6 +37,18 @@ uv run python research/signals/evaluate.py   # score the spaces (research/lib/sp
 uv run python research/portfolio/walk_forward.py    # walk-forward selection + MVO backtest
 ```
 
+Each stage reads the tables the previous one writes, so run in order. If
+`residual_returns.py` acceptance checks FAIL, stop and debug the factor model
+before building features or signals. After changing the universe, refresh prices
+and market-cap before rebuilding downstream. `evaluate.py` is incremental per
+signal — use `--fresh` after changing features, residuals, or signal definitions
+(`--limit N` for a quick run).
+
+Once the pipeline has run, open `notebooks/portfolio.ipynb` for the full
+walk-forward backtest summary and risk diagnostics — equity/drawdown, per-window
+and per-signal attribution, cost/exposure, factor-neutrality, and the rank-vs-MVO
+comparison — all read from the persisted `wf_portfolio_*` tables.
+
 ## Architecture
 
 - **Universe**: candidates = the live Hyperliquid perp listing (tradability
@@ -160,9 +172,6 @@ How far the backtested numbers should be trusted out of sample:
 - **Market data only.** Inputs are crypto prices plus market-cap, funding, and
   open-interest — no fundamentals, on-chain, order-book/L2, sentiment/news, or
   macro data. The entire edge is price-derived.
-- **No MTV crypto value signal.** The SLS value construction needs clean
-  on-chain transaction volume. This repo does not have that data, and exchange
-  volume is not a valid substitute for market-cap / transaction-value MTV.
 - **Approximate transaction costs.** A 2 bps/side base cost is charged on
   turnover, scaled per name by a trailing-ADV liquidity multiplier (illiquid
   names cost more, fill slower). The model is still cross-sectional and does
