@@ -41,6 +41,27 @@ reward = validation score after evaluation
 
 The search expands promising branches while still reserving some exploration budget for less-tested branches.
 
+How MCTS works - four steps, repeated thousands of times:
+
+```text
+1. SELECT   walk down the tree from the root; at each node pick the child that
+            balances exploitation (high avg reward) and exploration (few visits),
+            e.g. UCB:  avg_reward + c * sqrt( ln(parent_visits) / child_visits )
+2. EXPAND   at a leaf, add one new child (one new action on the partial expression)
+3. SIMULATE complete the partial expression cheaply, evaluate it -> reward
+4. BACKPROP update visit count and avg reward on every node back up to the root
+```
+
+Budget flows automatically toward branches that keep scoring well, so the tree
+grows asymmetrically: deep where promising, shallow elsewhere.
+
+Caveat: MCTS assumes a partial expression's value predicts the value of its
+completions. That link is weak for signals (`res_zscore` alone can score badly
+while a gated `-res_zscore**2` scores well), so the parent's average reward can
+mislead SELECT. v1 therefore uses evolutionary search, which only ever evaluates
+complete candidates; a bandit over candidate families keeps the budget-steering
+benefit at the level where value does transfer.
+
 ### Evolutionary LLM Search
 
 AlphaEvolve-style systems use LLMs to generate variants of candidate programs, evaluate them, then keep the best variants for future mutation. The important part is not the LLM. The important part is the evaluator and the selection pressure.

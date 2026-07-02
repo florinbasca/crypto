@@ -167,6 +167,67 @@ uv run python research/portfolio/walk_forward.py
 Browse existing spaces with `evaluate.py --list [--category X] [--contains Y]`.
 See `research/signals/README.md`.
 
+
+## Using the agentic signal generator
+
+An LLM-in-the-loop discovery engine (`research/signals/agent/`, design in
+`agent.md` there): an evolutionary search proposes signal programs in a
+bounded DSL over the feature panel, a deterministic harness compiles,
+causality-checks and scores them against forward **residual** returns on a
+train/select/OOS walk-forward, and survivors that pass the promotion gates
+(BY-FDR, deflation for search overfit, N-consecutive-roll persistence,
+orthogonality to the book) are traded through each OOS month as a
+dollar+factor-neutral portfolio. The LLM only ever sees compressed
+diagnostics and emits DSL JSON — evaluation, windows and promotion are fixed
+code it cannot touch.
+
+### Run discovery
+
+```bash
+uv run research/signals/agent/run_discovery.py --max-rolls 2   # test the system first
+uv run research/signals/agent/run_discovery.py                 # full history
+```
+
+**LLM & cost**: `gemini-2.5-flash` (change in config `discovery.llm`). API
+key goes in the gitignored `.env` at the repo root: `LLM_KEY=...`. Cost is
+roughly **$0.05 per roll ≈ $1.50 for the full history**; actuals are tracked
+per run in `discovery_llm_usage`.
+
+Defaults: proposer = the config LLM (`discovery.llm.provider`, currently
+gemini) and a **fresh start** (the discovery tables are cleared first). Flags:
+
+- `--proposer random|llm|anthropic|gemini` — `random` is the no-API baseline
+  / control experiment (the LLM must beat it to be earning its cost)
+- `--ml-probe` — also fit a gradient-boosting ceiling per roll: how much
+  predictability the feature set contains at all
+- `--no-fresh` — keep existing discovery tables; `--no-save` — dry run
+- Each roll's search is seeded with the previous roll's survivors, which
+  re-earn survival on the new windows — that is what makes the
+  `min_rolls_survived` promotion gate measurable.
+
+All knobs live in `config.py` under `discovery.*` (families/input space, DSL
+bounds, search budget, reward weights, promotion gates, backtest, LLM
+provider/model/prices).
+
+### Review what was generated
+
+```bash
+uv run research/signals/agent/inspect_discovery.py                  # summary
+uv run research/signals/agent/inspect_discovery.py --top 20 --survivors-only
+uv run research/signals/agent/inspect_discovery.py --expressions --curve
+```
+
+Prints the per-roll summary, top candidates with their DSL programs and
+select-window stats, the promoted book, the stitched OOS equity curve, and
+LLM token usage/cost. The underlying tables (readable with
+`dbutil.load_data`): `discovery_ledger` (every candidate ever evaluated —
+the audit trail), `discovery_promotions`, `discovery_oos_returns` (daily OOS
+PnL), `discovery_llm_usage`.
+
+Synthetic end-to-end checks (planted signal found, look-ahead caught, noise
+promotes nothing, reproducibility): `uv run python tests/discovery_checks.py`.
+
+
 ## Limitations
 
 How far the backtested numbers should be trusted out of sample:

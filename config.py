@@ -371,6 +371,166 @@ config = {
         'liquidity_window_bars': 144,
     },
 
+    # Agentic signal discovery (research/signals/agent/): bounded-DSL search
+    # over residual-predictive cross-sectional signals with a train/select/OOS
+    # walk-forward. Design in research/signals/agent/agent.md. Everything here
+    # is read via config.get('discovery.<...>') - never hardcoded.
+    'discovery': {
+        'start_date': '2023-08-01',      # First roll's train start
+        'end_date': '2026-06-01',        # No roll's OOS end may exceed this
+        'train_months': 5,               # Candidates generated/fit here
+        'select_months': 1,              # Search reward scored here (only)
+        'oos_months': 1,                 # Promoted book traded here (never searched)
+        'roll_step_months': 1,
+        # Purge at window boundaries: drop the last (max target lag + embargo)
+        # bars of TRAIN before SELECT and of SELECT before OOS so no forward
+        # target leaks across a boundary.
+        'embargo_bars': 12,
+        # Forward residual-return target lags (bars at base_frequency).
+        # target_lag_bars is the primary lag the reward is computed on.
+        'horizon_lags_bars': [6, 36, 144],
+        'target_lag_bars': 36,
+        'min_assets_per_timestamp': 10,
+        'liquidity_window_bars': 144,    # trailing $vol window for the liquid-half flag
+        # Input space: feature columns are resolved by matching these
+        # per-family prefix patterns against the features table (bounded input
+        # space - candidates can only reference resolved columns).
+        'families': {
+            'residual_shape':    ['res_', 'ou_'],
+            'volatility_regime': ['vr_', 'rb_', 'ib_'],
+            'liquidity':         ['lq_', 'vl_', 'ms_', 'cap_turnover'],
+            'derivatives':       ['fr_', 'oi_', 'pos_'],
+            'cross_sectional':   ['cs_'],
+            'factor_context':    ['fl_', 'mk_'],
+        },
+        'max_features_per_family': 12,   # cap resolved columns per family
+        # DSL bounds (hypothesis space)
+        'dsl': {
+            'windows': [6, 36, 144, 432],   # allowed rolling windows (bars)
+            'max_depth': 4,                  # expression tree depth cap
+            'max_conditions': 2,             # gates per candidate
+            'max_nodes': 24,                 # total expression+condition nodes
+        },
+        # Evolutionary search (per roll). Budget = n_generations * batch_size.
+        'search': {
+            'seed': 7,
+            'n_generations': 8,
+            'batch_size': 16,
+            'survivors': 12,                 # population carried between generations
+            'mutation_prob': 0.6,            # mutate a parent vs sample fresh
+            'diversity_max_corr': 0.8,       # survivor de-correlation ceiling
+            'bandit_ucb_c': 1.0,             # family-bandit exploration constant
+        },
+        # Reward = sum_k weight_k * term_k / scale_k, SELECT window only.
+        # Scales are FIXED constants (not batch-relative) so rewards are
+        # comparable across generations, rolls and resumed runs.
+        'reward': {
+            'weights': {
+                'ic_tstat': 1.0,
+                'net_sharpe': 0.5,
+                'liquid_ic_ratio': 0.25,
+                'turnover': -0.25,
+                'complexity': -0.15,
+                'instability': -0.75,
+                'similarity': -0.5,
+            },
+            'scales': {
+                'ic_tstat': 2.0,
+                'net_sharpe': 1.0,
+                'liquid_ic_ratio': 1.0,
+                'turnover': 1.0,
+                'complexity': 10.0,
+                'instability': 0.05,
+                'similarity': 0.5,
+            },
+        },
+        # Promotion gates, applied once per roll to the search survivors.
+        'promotion': {
+            'fdr_alpha': 0.10,
+            'fdr_method': 'by',              # 'by' or 'bh'
+            'min_select_ic_tstat': 2.0,
+            # Search-overfit haircut: |t| must also clear deflation_mult x
+            # E[max |N(0,1)| over n_trials] where n_trials comes from the
+            # ledger (all candidates evaluated this roll). 0 disables.
+            'deflation_mult': 1.0,
+            'max_book_corr': 0.5,            # signal corr vs already-promoted book
+            # A candidate must be a search survivor in this many CONSECUTIVE
+            # rolls (by candidate hash) before it may be promoted.
+            'min_rolls_survived': 2,
+            'max_promoted_per_roll': 3,
+            'max_book_size': 15,
+        },
+        # OOS portfolio built on promoted signals: dollar + factor neutral,
+        # solved independently per rebalance stamp (non-sequential, ex-post
+        # costs from |dw| - slightly overstates turnover vs a turnover-aware
+        # optimizer; the price of keeping the backtest fully vectorizable).
+        'backtest': {
+            'rebalance_grid': '1h',
+            'weight_scheme': 'equal_weight',  # 'equal_weight' (rank) or 'mvo'
+            'cost_bps': None,                 # None -> portfolio.cost_bps
+            'funding_pnl': True,              # accrue funding if table available
+            'min_assets': 20,
+            # mvo scheme only: trailing residual covariance
+            'cov_window_days': 30,
+            'cov_min_observations': 1008,
+        },
+        # ML ceiling probe (mode=ml): gradient boosting on ALL resolved
+        # primitives, fit on TRAIN, scored on SELECT. Its IC estimates how much
+        # predictability the feature set contains at all.
+        'ml_probe': {
+            'max_iter': 200,
+            'max_depth': 3,
+            'learning_rate': 0.05,
+            'min_samples_leaf': 200,
+            'l2_regularization': 1.0,
+            'subsample_rows': 200000,        # cap training rows (recent-biased)
+        },
+        # LLM proposer (untrusted: sees compressed diagnostics only, emits DSL
+        # JSON; everything it returns is re-validated and re-scored by code).
+        # provider: 'anthropic' or 'gemini' (google-genai package). The API
+        # key is read from the gitignored repo-root .env under the GENERIC
+        # name below (key_name) - switching LLMs = change provider/model here
+        # and swap the key value in .env; no code or variable renames.
+        'llm': {
+            'provider': 'gemini',
+            'key_name': 'LLM_KEY',       # .env variable holding the API key
+            'model': {
+                'anthropic': 'claude-sonnet-4-6',
+                'gemini': 'gemini-2.5-flash',
+            },
+            'max_tokens': 4096,
+            'candidates_per_call': 8,
+            # Gemini 2.5 thinking budget (tokens). 0 disables thinking so the
+            # whole max_tokens budget goes to the JSON output (thoughts are
+            # billed as output and can truncate the response mid-array).
+            # None = provider default.
+            'gemini_thinking_budget': 0,
+            # $ per million tokens, per provider - used ONLY for the cost
+            # estimate printed/persisted by run_discovery. Prices change, so
+            # pin your provider's current rates here; None disables the
+            # dollar estimate (token counts are always tracked).
+            'price_per_mtok': {
+                'anthropic': {'input': None, 'output': None},
+                # gemini-2.5-flash paid tier (ai.google.dev/gemini-api/docs/
+                # pricing, checked 2026-07): output price includes thinking
+                # tokens. Update here if the model or Google's rates change.
+                'gemini': {'input': 0.30, 'output': 2.50},
+            },
+        },
+        'diagnostics': {
+            'n_bins': 10,                    # binned forward-return deciles
+            'regime_columns': ['res_vol_short', 'cs_rel_volume'],
+            'top_per_family': 6,             # compressed view size
+        },
+        # Persisted tables
+        'tables': {
+            'ledger': 'discovery_ledger',
+            'promotions': 'discovery_promotions',
+            'oos_returns': 'discovery_oos_returns',
+            'llm_usage': 'discovery_llm_usage',
+        },
+    },
+
     # Walk-forward configuration (no look-ahead)
     'walk_forward': {
         'start_date': '2023-08-01',      # First usable panel date (after warmup)
@@ -613,6 +773,29 @@ config = {
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+def load_env_key(name, path=None):
+    """Read NAME=value from the gitignored .env file at the repo root.
+
+    Secrets (API keys) live there, never in this file or in git. Lines are
+    KEY=value; blank lines and '#' comments are ignored; surrounding quotes
+    and whitespace are stripped. Returns the value or None.
+    """
+    env_path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    '.env')
+    try:
+        with open(env_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                if k.strip() == name:
+                    return v.strip().strip('"\'') or None
+    except OSError:
+        return None
+    return None
+
 
 def get(key, default=None):
     """Get a config value using dot notation, e.g. get('risk_model.beta.window_days')."""

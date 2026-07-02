@@ -245,7 +245,28 @@ def _enforce_datetime_types(df: pd.DataFrame, columns: List[str]) -> pd.DataFram
     df = df.copy()
     for column in columns:
         if column in df.columns:
-            df[column] = pd.to_datetime(df[column])
+            df[column] = pd.to_datetime(df[column]).astype('datetime64[ns]')
+    return df
+
+
+def _normalize_datetimes_ns(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce every datetime column to datetime64[ns].
+
+    pandas 3 creates [us]/[s]-unit datetimes (date_range from strings,
+    to_datetime of strings, etc). All legacy Parquet files in db/ are
+    nanosecond; writing a microsecond frame would create mixed-unit files
+    inside one table (a polars scan-schema error waiting to happen), and
+    non-ns frames also break merge_asof joins and int64-nanosecond arithmetic
+    downstream. Normalizing at this single storage boundary keeps the whole
+    pipeline ns-uniform on both pandas 2 and 3."""
+    dt_cols = [c for c in df.columns
+               if pd.api.types.is_datetime64_any_dtype(df[c])
+               and str(df[c].dtype) != 'datetime64[ns]']
+    if not dt_cols:
+        return df
+    df = df.copy()
+    for c in dt_cols:
+        df[c] = df[c].astype('datetime64[ns]')
     return df
 
 
@@ -353,6 +374,7 @@ def save_data(
     if mode == 'replace' and (partition_key is None or partition_value is None):
         raise ValueError("mode='replace' requires partition_key and partition_value")
 
+    data = _normalize_datetimes_ns(data)
     incoming = pl.from_pandas(data)
     partitioned = 'symbol' in data.columns
 
@@ -436,7 +458,7 @@ def load_data(
     df = lf.collect().to_pandas()
     if drop_columns:
         df = df.drop(columns=[c for c in drop_columns if c in df.columns])
-    return df
+    return _normalize_datetimes_ns(df)
 
 
 def iter_data_batches(
@@ -475,7 +497,7 @@ def iter_data_batches(
         if height == 0:
             continue
         for start in range(0, height, batch_size):
-            yield df.slice(start, batch_size).to_pandas()
+            yield _normalize_datetimes_ns(df.slice(start, batch_size).to_pandas())
 
 
 # ---------------------------------------------------------------------------

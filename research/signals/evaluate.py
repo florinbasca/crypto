@@ -189,6 +189,11 @@ def universe_member_mask(df: pd.DataFrame,
     if start_col is None:
         return df['symbol'].isin(set(m['symbol'])).values
 
+    # merge_asof requires matching datetime units; pandas 3 mixes [s]/[us]/
+    # [ns] depending on how each side was built, so pin both sides to ns.
+    for c in [start_col] + ([end_col] if end_col else []):
+        m[c] = pd.to_datetime(m[c]).astype('datetime64[ns]')
+
     out = np.zeros(len(df), dtype=bool)
     right_cols = ['symbol', start_col] + ([end_col] if end_col else [])
     right_by_symbol = {
@@ -196,6 +201,7 @@ def universe_member_mask(df: pd.DataFrame,
         for sym, g in m.groupby('symbol', sort=False)
     }
     left = df[['timestamp', 'symbol']].copy()
+    left['timestamp'] = pd.to_datetime(left['timestamp']).astype('datetime64[ns]')
     left['_row'] = np.arange(len(left))
     for sym, lgrp in left.groupby('symbol', sort=False):
         rgrp = right_by_symbol.get(sym)
@@ -259,17 +265,22 @@ def compute_signal_panel(signal_name: str, registry: Dict,
     return out.dropna(subset=['signal'])
 
 
-def rank_ic_per_timestamp(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
+def rank_ic_per_timestamp(df: pd.DataFrame, target_col: str,
+                          min_assets: Optional[int] = None) -> pd.DataFrame:
     """
     Vectorized per-timestamp Spearman rank IC.
 
     df: [timestamp, signal, <target_col>]; returns [timestamp, ic, n].
+    min_assets: cross-section size floor (None -> module MIN_ASSETS).
     """
     if df.empty:
         return pd.DataFrame(columns=['timestamp', 'ic', 'n'])
+    min_assets = MIN_ASSETS if min_assets is None else int(min_assets)
 
     d = pl.DataFrame({
-        'timestamp': df['timestamp'].astype('int64').to_numpy(),
+        # via datetime64[ns]: pandas 3 stores datetimes as [us]/[s], and a
+        # bare astype(int64) would be misread by the pl.Datetime('ns') cast
+        'timestamp': df['timestamp'].to_numpy(dtype='datetime64[ns]').astype('int64'),
         'signal': df['signal'].to_numpy(dtype=float),
         'target': df[target_col].to_numpy(dtype=float),
     })
@@ -280,7 +291,7 @@ def rank_ic_per_timestamp(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
         )
         .drop_nulls(['signal', 'target'])
         .with_columns(pl.len().over('timestamp').alias('n0'))
-        .filter(pl.col('n0') >= MIN_ASSETS)
+        .filter(pl.col('n0') >= min_assets)
         .with_columns(
             pl.col('signal').rank(method='average').over('timestamp').alias('rs'),
             pl.col('target').rank(method='average').over('timestamp').alias('rr'),
@@ -334,7 +345,7 @@ def quintile_spread_per_timestamp(df: pd.DataFrame, target_col: str) -> pd.DataF
         return pd.DataFrame(columns=['timestamp', 'qspread'])
 
     d = pl.DataFrame({
-        'timestamp': df['timestamp'].astype('int64').to_numpy(),
+        'timestamp': df['timestamp'].to_numpy(dtype='datetime64[ns]').astype('int64'),
         'signal': df['signal'].to_numpy(dtype=float),
         'target': df[target_col].to_numpy(dtype=float),
     })
@@ -394,13 +405,17 @@ def _empty_liq_bucket_df() -> pd.DataFrame:
 
 
 def _backtest_from_arrays(ts_v: np.ndarray, symbols_v: np.ndarray,
-                          signal_v: np.ndarray, target_v: np.ndarray) -> pd.DataFrame:
+                          signal_v: np.ndarray, target_v: np.ndarray,
+                          min_assets: Optional[int] = None,
+                          cost_bps: Optional[float] = None) -> pd.DataFrame:
     if len(ts_v) == 0:
         return _empty_backtest_df()
+    min_assets = MIN_ASSETS if min_assets is None else int(min_assets)
+    cost_bps = COST_BPS if cost_bps is None else float(cost_bps)
 
     stamps, t_codes = np.unique(ts_v, return_inverse=True)
     counts = np.bincount(t_codes, minlength=len(stamps))
-    keep_ts = counts >= MIN_ASSETS
+    keep_ts = counts >= min_assets
     keep = keep_ts[t_codes]
     if not keep.any():
         return _empty_backtest_df()
@@ -434,7 +449,7 @@ def _backtest_from_arrays(ts_v: np.ndarray, symbols_v: np.ndarray,
         'gross_return': gross,
         'turnover': turnover,
     })
-    out['net_return'] = out['gross_return'] - out['turnover'] * COST_BPS / 10000.0
+    out['net_return'] = out['gross_return'] - out['turnover'] * cost_bps / 10000.0
     return out[['timestamp', 'gross_return', 'net_return', 'turnover']]
 
 
@@ -666,7 +681,9 @@ def lag_metrics(panel: pd.DataFrame, target_col: str,
 
 
 def dollar_neutral_backtest(panel: pd.DataFrame, target_col: str,
-                            stride_stamps: Optional[pd.DatetimeIndex]) -> pd.DataFrame:
+                            stride_stamps: Optional[pd.DatetimeIndex],
+                            min_assets: Optional[int] = None,
+                            cost_bps: Optional[float] = None) -> pd.DataFrame:
     """
     Screening backtest: class-2 (dollar-neutral, leverage-1) weights at
     non-overlapping rebalance stamps; PnL = sum w * fwd target; costs on
@@ -690,7 +707,9 @@ def dollar_neutral_backtest(panel: pd.DataFrame, target_col: str,
     if not valid.any():
         return pd.DataFrame(columns=['timestamp', 'gross_return', 'net_return', 'turnover'])
 
-    return _backtest_from_arrays(ts[valid], symbols[valid], signal[valid], target[valid])
+    return _backtest_from_arrays(ts[valid], symbols[valid], signal[valid],
+                                 target[valid], min_assets=min_assets,
+                                 cost_bps=cost_bps)
 
 
 # =============================================================================

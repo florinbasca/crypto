@@ -3,14 +3,15 @@ ETL: daily market capitalization per symbol -> `marketcap` (size-factor input).
 
 Resolves each universe symbol to its CoinGecko id (manual map > cached
 auto-resolution in `coingecko_ids` > scored disambiguation), then fetches daily
-market-cap history from the CoinGecko API (requires a key in .keys). The size
-factor in risk_model/factor_returns.py ranks universe names by this market cap.
+market-cap history from the CoinGecko API (requires COINGECKO_KEY in the
+repo-root .env). The size factor in risk_model/factor_returns.py ranks
+universe names by this market cap.
 
 Incremental: cached id resolutions are reused and existing mcap rows are
 extended rather than refetched.
 
 Usage:
-    python etl/marketcap.py             # run AFTER etl/universe.py; needs .keys
+    python etl/marketcap.py    # run AFTER etl/universe.py; needs .env key
 """
 
 import sys
@@ -22,7 +23,6 @@ import aiohttp
 import asyncio
 import time
 import logging
-import json
 from typing import Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from dbutil import (
@@ -194,34 +194,23 @@ ID_BLOCKLIST_SUBSTRINGS = ['binance-peg', 'wrapped', 'bridged', 'wormhole',
 
 
 _KEYS_HELP = (
-    "Create a '.keys' file at the repo root with your (free) CoinGecko Demo "
-    "API key:\n"
-    '  {\n    "coingecko_api_key": "CG-..."\n  }\n'
+    "Add your (free) CoinGecko Demo API key to the gitignored '.env' file at "
+    "the repo root:\n"
+    "  COINGECKO_KEY=CG-...\n"
     "Get a key at https://www.coingecko.com/en/developers/dashboard"
 )
 
 
 def load_api_key():
-    """Load the CoinGecko API key from the .keys file at the repo root.
+    """Load the CoinGecko API key (COINGECKO_KEY) from the repo-root .env.
 
     Returns the key string, or None after printing an actionable message when
-    the file is missing, unreadable, not valid JSON, or has no key set.
+    the file or the key is missing.
     """
-    path = Path('.keys')
-    if not path.exists():
-        print(f"Missing '{path}' file.\n{_KEYS_HELP}")
-        return None
-    try:
-        keys = json.loads(path.read_text())
-    except json.JSONDecodeError as e:
-        print(f"'{path}' is not valid JSON ({e}).\n{_KEYS_HELP}")
-        return None
-    except OSError as e:
-        print(f"Could not read '{path}': {e}")
-        return None
-    key = (keys.get('coingecko_api_key') or '').strip()
+    from config import load_env_key
+    key = load_env_key('COINGECKO_KEY')
     if not key:
-        print(f"'{path}' has no 'coingecko_api_key' set.\n{_KEYS_HELP}")
+        print(f"No COINGECKO_KEY found in .env.\n{_KEYS_HELP}")
         return None
     return key
 
