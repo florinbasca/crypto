@@ -181,6 +181,55 @@ dollar+factor-neutral portfolio. The LLM only ever sees compressed
 diagnostics and emits DSL JSON — evaluation, windows and promotion are fixed
 code it cannot touch.
 
+### What a signal is
+
+A candidate signal is a small **program** in a bounded DSL: an arithmetic
+expression over whitelisted feature columns, optionally gated by conditions —
+e.g. *"annualized funding divided by its rolling vol, z-scored, active only
+when funding just moved"*:
+
+```json
+{"expression": ["cs_zscore", ["div", ["col", "fr_annualized"],
+                              ["roll_std", ["col", "fr_rate_zscore"], 36]]],
+ "conditions": [["abs_gt", ["col", "fr_rate_change"], 0.001]]}
+```
+
+The program compiles to a value per (10-min bar, coin), which is then
+demeaned + z-scored **across the ~130-coin cross-section** at every bar and
+clipped to ±3. A signal is never "BTC will go up" — it is a *ranking of
+coins against each other* at each moment (long the top, short the bottom,
+~0 net in signal space). It is judged against the **forward residual return
+over the next 36 bars (6h)** — market/size/momentum/vol moves stripped out —
+so it must predict coin-specific mispricing, not beta. The traded direction
+is fixed on TRAIN, never on the scoring window.
+
+### The walk-forward windows
+
+Each **roll** = TRAIN 5mo (fit + diagnostics) → SELECT 1mo (the ONLY window
+the search reward sees) → OOS 1mo (traded by the promoted book; the search
+never sees it), advancing one month at a time from `discovery.start_date`
+(2023-08) until OOS reaches `discovery.end_date` — e.g. roll 0 trains
+Aug–Dec 2023, selects on Jan 2024, trades Feb 2024. Purge+embargo bars are
+dropped at every boundary so forward targets cannot leak. Stitching all OOS
+months end-to-end gives the system's equity curve.
+
+### How the search selects ("survivors")
+
+Within a roll, the search runs a fixed number of generations. Each
+generation: the LLM proposes a batch of new programs (per feature family,
+allocated by a UCB bandit) → each is compiled, causality-checked and scored
+into one **reward** (SELECT-month IC t-stat + cost-aware Sharpe, minus
+penalties for turnover, complexity, train/select instability, similarity) →
+the population is then **culled to the top `search.survivors` (12)**, with a
+diversity rule that skips near-duplicates (signal corr > 0.8). The 12 that
+remain are the *survivors* — the parents the LLM mutates next generation.
+The next roll re-tests them from scratch on its own windows; surviving twice
+in a row is what the `min_rolls_survived` promotion gate measures. Hierarchy
+of trust: tried → survivor (one roll, could be luck) → persistent survivor
+(two fresh select months) → **promoted** (persistent + FDR/deflation
+significance + uncorrelated with the book) — only promoted signals ever
+trade OOS.
+
 ### Run discovery
 
 ```bash
