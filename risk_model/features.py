@@ -1241,15 +1241,24 @@ def process_symbol(symbol: str, xs_df: Optional[pd.DataFrame] = None) -> Optiona
         return None
 
 
+def spaces_feature_columns() -> set:
+    """Feature columns referenced by the space library (research/lib/spaces)."""
+    from research.lib.spaces import SPACES
+    return {c for sp in SPACES for c in sp.columns}
+
+
 def _process_and_save(args: Tuple) -> Tuple[str, int, Dict[str, float]]:
     """Worker: compute features for a symbol, append to the features table.
 
     Returns (symbol, n_rows, per-feature NaN share) for the coverage report.
     """
-    symbol, xs_df = args
+    symbol, xs_df, keep_cols = args
     features_df = process_symbol(symbol, xs_df=xs_df)
     if features_df is None or features_df.empty:
         return symbol, 0, {}
+    if keep_cols:
+        cols = [c for c in features_df.columns if c in keep_cols]
+        features_df = features_df[['timestamp', 'symbol'] + cols]
     nan_share = features_df.drop(columns=['timestamp', 'symbol']).isna().mean().to_dict()
     save_data('features', features_df, mode='append',
               datetime_columns=['timestamp'], use_file_lock=True)
@@ -1257,8 +1266,20 @@ def _process_and_save(args: Tuple) -> Tuple[str, int, Dict[str, float]]:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Feature panel generation')
+    parser.add_argument('--spaces-only', action='store_true',
+                        help='Persist only the feature columns referenced by the '
+                             'space library (research/lib/spaces.py) - a smaller '
+                             'panel for a faster signal-research loop. Compute is '
+                             'mostly unchanged; the win is table width, disk and '
+                             'downstream scan IO. Run the full build when '
+                             'developing NEW feature columns.')
+    args = parser.parse_args()
+    keep_cols = spaces_feature_columns() if args.spaces_only else None
+
     print("=" * 60)
-    print("Feature Generation")
+    print("Feature Generation" + (" (spaces-only columns)" if keep_cols else ""))
     print(f"Base frequency: {BASE_FREQUENCY} | Workers: {MAX_WORKERS}")
     print("=" * 60)
 
@@ -1284,7 +1305,7 @@ def main():
 
     delete_table('features')
 
-    work_items = [(sym, xs_slices.get(sym)) for sym in symbols]
+    work_items = [(sym, xs_slices.get(sym), keep_cols) for sym in symbols]
     results = parallel_map(_process_and_save, work_items, max_workers=MAX_WORKERS,
                            desc="Features", show_progress=True)
 

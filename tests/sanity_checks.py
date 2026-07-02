@@ -429,6 +429,113 @@ check("schema: all space feature columns produced", len(missing_feats) == 0,
       f"missing: {missing_feats[:8]}")
 
 # ---------------------------------------------------------------------------
+# 14. Funding-PnL accrual: a settlement stamp maps to the bar whose forward
+#     interval (t, t+1bar] contains it, and longs PAY positive rates
+#     (mirrors the exact reindex expression in walk_forward._backtest_window)
+# ---------------------------------------------------------------------------
+bars = pd.date_range('2024-01-01 00:10', periods=144, freq=BASE_FREQUENCY)
+fund_wide = pd.DataFrame({'AAA': [0.0010], 'BBB': [-0.0005]},
+                         index=pd.DatetimeIndex([pd.Timestamp('2024-01-01 08:00')]))
+fund_cols = pd.Index(['AAA', 'BBB'])
+fund_all = fund_wide.reindex(index=bars + pd.Timedelta(BASE_FREQUENCY),
+                             columns=fund_cols).to_numpy()
+i_hit = list(bars).index(pd.Timestamp('2024-01-01 07:50'))
+check("funding: settlement lands on the bar holding through it",
+      np.isfinite(fund_all[i_hit]).all()
+      and np.isnan(fund_all[i_hit + 1]).all()
+      and np.isnan(fund_all[i_hit - 1]).all())
+w_fund = np.array([0.5, -0.5])   # long AAA (pays +10bp/1x), short BBB (rate<0: short pays)
+pnl_fund = -float(w_fund @ np.nan_to_num(fund_all[i_hit], nan=0.0))
+check("funding: long pays positive rate, short pays negative rate",
+      np.isclose(pnl_fund, -(0.5 * 0.0010) - (0.5 * 0.0005)),
+      f"(pnl {pnl_fund:+.5f})")
+
+# ---------------------------------------------------------------------------
+# 15. Execution-derived selection speed floor (min_holding_lag_bars: 'auto')
+# ---------------------------------------------------------------------------
+import research.portfolio.walk_forward as wfmod
+
+nominal_rate, kappa_eff = wfmod.effective_fill_rate()
+gp_cfg = wfmod.PORT.get('gp_trading', {})
+budget_ann = wfmod.PORT.get('max_annual_turnover')
+per_bar_budget = budget_ann / (wfmod.BARS_PER_DAY * 365) if budget_ann else np.inf
+exp_kappa = max(nominal_rate, 1e-9)
+if gp_cfg.get('discount_at_realized_rate', True) and np.isfinite(per_bar_budget):
+    exp_kappa = max(min(exp_kappa,
+                        per_bar_budget / max(wfmod.PORT['gross_leverage'], 1e-9)),
+                    1e-9)
+check("fill rate: kappa = min(GP rate, budget-allowed rate)",
+      np.isclose(kappa_eff, exp_kappa),
+      f"(nominal {nominal_rate:.4f}, kappa {kappa_eff:.5f})")
+
+lag_floor = wfmod.resolve_min_holding_lag()
+mhl_cfg = wfmod.WF.get('min_holding_lag_bars')
+if mhl_cfg == 'auto' and gp_cfg.get('enabled'):
+    frac = float(wfmod.WF['min_monetizable_alpha_fraction'])
+    disc = lambda h: h / (h + 1.0 / kappa_eff)
+    check("speed floor: smallest lag whose aim discount clears the fraction",
+          lag_floor >= 1 and disc(lag_floor) >= frac
+          and (lag_floor == 1 or disc(lag_floor - 1) < frac),
+          f"(floor {lag_floor} bars, discount {disc(lag_floor):.3f} >= {frac})")
+else:
+    check("speed floor: manual config passthrough",
+          lag_floor == int(mhl_cfg or 0), f"(floor {lag_floor})")
+
+# ---------------------------------------------------------------------------
+# 16. Point-in-time universe membership: spell evolution + interval mask
+# ---------------------------------------------------------------------------
+from etl.universe import evolve_membership
+from research.signals.evaluate import universe_member_mask
+
+seed_date = pd.Timestamp('2023-01-01')
+mem0, n_new0, _ = evolve_membership(None, {'AAA', 'BBB'}, '2025-06-01', seed_date)
+check("membership: initial cohort seeded from the data start",
+      n_new0 == 2 and (mem0['valid_from'] == seed_date).all()
+      and mem0['valid_to'].isna().all())
+
+mem1, n_new1, n_closed1 = evolve_membership(mem0, {'AAA', 'CCC'},
+                                            '2025-07-01', seed_date)
+check("membership: delisting closes / listing opens spells",
+      n_new1 == 1 and n_closed1 == 1
+      and mem1.loc[mem1['symbol'] == 'BBB', 'valid_to'].notna().all()
+      and mem1.loc[mem1['symbol'] == 'AAA', 'valid_to'].isna().all())
+
+mem2, n_new2, _ = evolve_membership(mem1, {'AAA', 'BBB', 'CCC'},
+                                    '2025-09-01', seed_date)
+check("membership: relisting opens a second spell",
+      n_new2 == 1 and (mem2['symbol'] == 'BBB').sum() == 2)
+
+mask_panel = pd.DataFrame({
+    'timestamp': pd.to_datetime(['2025-06-15', '2025-08-01', '2025-10-01',
+                                 '2025-06-15', '2024-01-01']),
+    'symbol': ['BBB', 'BBB', 'BBB', 'CCC', 'AAA'],
+})
+mem_mask = universe_member_mask(mask_panel, mem2)
+check("membership: interval mask (member / delisted gap / relisted)",
+      list(mem_mask) == [True, False, True, False, True],
+      f"(got {list(mem_mask)})")
+
+# ---------------------------------------------------------------------------
+# 17. Factor VIF: independent factors ~ 1, a collinear factor blows up
+# ---------------------------------------------------------------------------
+from risk_model.residual_returns import factor_vif, FACTOR_COLS as _VIF_COLS
+
+rngf = np.random.default_rng(11)
+n_vif = 5000
+ind_factors = pd.DataFrame({c: rngf.normal(size=n_vif) for c in _VIF_COLS})
+vif_ind = factor_vif(ind_factors)
+check("vif: independent factors ~ 1",
+      bool(vif_ind) and all(v < 1.2 for v in vif_ind.values()),
+      f"({ {k: round(v, 2) for k, v in vif_ind.items()} })")
+
+col_factors = ind_factors.copy()
+col_factors[_VIF_COLS[1]] = (col_factors[_VIF_COLS[0]] * 0.98
+                             + rngf.normal(0, 0.05, n_vif))
+vif_col = factor_vif(col_factors)
+check("vif: collinear factor detected", max(vif_col.values()) > 10,
+      f"(max VIF {max(vif_col.values()):.1f})")
+
+# ---------------------------------------------------------------------------
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURES: {FAILURES}")

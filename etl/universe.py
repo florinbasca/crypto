@@ -10,13 +10,16 @@ then keeps the top `universe.max_candidates` by Hyperliquid 24h notional
 volume among the AVAILABLE names - so dead candidates don't consume slots.
 
 The result is the CANDIDATE list used by the downloaders, factor model,
-research, and portfolio. There is no monthly membership gate: the backtest
-uses this full candidate universe at every timestamp, with missing history
-naturally producing NaNs.
+research, and portfolio (missing history naturally produces NaNs). Each run
+also updates `universe_membership` - a point-in-time interval table
+[symbol, valid_from, valid_to] of candidate spells - so membership becomes
+genuinely point-in-time as snapshots accrue (see update_membership_history).
 
-Caveat (documented, unavoidable without historical listing dates): using
-today's Hyperliquid listing as the candidate filter conditions the backtest
-on current tradability.
+Caveat (documented, unavoidable without historical listing dates): history
+BEFORE the first snapshot is seeded as "member since the data start", so the
+backtest there is still conditioned on the Hyperliquid listing as of that
+first snapshot. Use walk_forward.min_listing_age_days to bound the
+sensitivity to newly listed (survivor-biased) names.
 """
 
 import sys
@@ -31,7 +34,7 @@ import pandas as pd
 import requests
 from dateutil.relativedelta import relativedelta
 
-from dbutil import save_data
+from dbutil import load_data, save_data, table_exists
 from config import get, get_data_start_date
 
 BASE_URL = 'https://data.binance.vision'
@@ -158,10 +161,68 @@ def build_universe() -> pd.DataFrame:
                'fetched_at']]
 
 
+def evolve_membership(mem, current_symbols, as_of, seed_from) -> tuple:
+    """Pure membership-spell evolution (no IO): -> (mem, n_new, n_closed).
+
+    One row per spell: [symbol, valid_from, valid_to] (valid_to = NaT while
+    open). mem=None seeds the initial cohort from `seed_from` (historical HL
+    listing dates are unavailable, so pre-snapshot history keeps the legacy
+    "current set at every timestamp" assumption). Subsequent calls OPEN a
+    spell for newly appeared candidates and CLOSE the spell of names that
+    dropped out (delisted, or pushed out of the volume-capped top
+    `universe.max_candidates`); a later re-listing opens a new spell.
+    """
+    as_of = pd.Timestamp(as_of).normalize()
+    current = set(current_symbols)
+
+    if mem is None or mem.empty:
+        seeded = pd.DataFrame({
+            'symbol': sorted(current),
+            'valid_from': pd.Timestamp(seed_from),
+            'valid_to': pd.NaT,
+        })
+        return seeded, len(seeded), 0
+
+    mem = mem.copy()
+    mem['valid_from'] = pd.to_datetime(mem['valid_from'])
+    mem['valid_to'] = pd.to_datetime(mem['valid_to'])
+    open_mask = mem['valid_to'].isna()
+    open_syms = set(mem.loc[open_mask, 'symbol'])
+    closed = sorted(open_syms - current)
+    if closed:
+        mem.loc[open_mask & mem['symbol'].isin(closed), 'valid_to'] = as_of
+    new = sorted(current - open_syms)
+    if new:
+        mem = pd.concat([mem, pd.DataFrame({
+            'symbol': new, 'valid_from': as_of, 'valid_to': pd.NaT,
+        })], ignore_index=True)
+    mem = mem.sort_values(['symbol', 'valid_from']).reset_index(drop=True)
+    return mem, len(new), len(closed)
+
+
+def update_membership_history(current_symbols, as_of) -> pd.DataFrame:
+    """Maintain the point-in-time `universe_membership` interval table.
+
+    IO wrapper around `evolve_membership` (see its docstring for semantics).
+    Consumed automatically by research/signals/evaluate.py
+    (universe_member_mask) and the walk-forward DataContext.
+    """
+    mem = load_data('universe_membership') if table_exists('universe_membership') \
+        else None
+    mem, n_new, n_closed = evolve_membership(
+        mem, current_symbols, as_of, get_data_start_date())
+    save_data('universe_membership', mem, mode='overwrite',
+              datetime_columns=['valid_from', 'valid_to'])
+    print(f"universe_membership: {len(mem)} spells "
+          f"({n_new} opened, {n_closed} closed this run)")
+    return mem
+
+
 def main():
     df = build_universe()
     save_data(table_name='universe', data=df, mode='overwrite',
               datetime_columns=['fetched_at'])
+    update_membership_history(df['symbol'], df['fetched_at'].iloc[0])
 
     print(f"\nSaved {len(df)} candidate symbols to 'universe' table "
           f"(all validated to have Binance spot data)")

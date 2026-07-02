@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import logging
 from concurrent.futures import as_completed
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -57,6 +58,24 @@ MAX_WORKERS = get('compute.residual_workers', 4)
 
 ACCEPT_MIN_VAR_REDUCTION = get('risk_model.acceptance.min_variance_reduction', 0.05)
 ACCEPT_MAX_CORR = get('risk_model.acceptance.max_residual_raw_corr', 0.95)
+ACCEPT_MAX_VIF = get('risk_model.acceptance.max_vif', 10.0)
+
+
+def factor_vif(factors: pd.DataFrame) -> Dict[str, float]:
+    """Variance-inflation factor per factor column: VIF_j = 1/(1 - R2_j) of
+    factor j regressed on the others = diag of the inverse correlation matrix.
+    Collinear factors (VIF above the config threshold) make the per-name betas
+    unstable and the hedge noisy - warn before anything is built on them."""
+    cols = [c for c in FACTOR_COLS if c in factors.columns]
+    sub = factors[cols].dropna()
+    if len(sub) < 100 or len(cols) < 2:
+        return {}
+    corr = np.corrcoef(sub.values, rowvar=False)
+    try:
+        inv = np.linalg.inv(corr)
+    except np.linalg.LinAlgError:
+        return {c: np.inf for c in cols}
+    return {c: float(inv[i, i]) for i, c in enumerate(cols)}
 
 
 def exponential_weights(n: int, halflife_bars: float) -> np.ndarray:
@@ -256,6 +275,15 @@ def main():
     factors[present_factor_cols] = factors[present_factor_cols].replace(
         [np.inf, -np.inf], np.nan
     )
+
+    # Factor collinearity check (warn-only): collinear factor returns make the
+    # per-name betas unstable regardless of how good each factor looks alone.
+    vifs = factor_vif(factors)
+    for name, v in vifs.items():
+        level = logging.warning if v > ACCEPT_MAX_VIF else logging.info
+        level(f"  VIF {name}: {v:.2f}"
+              + (f"  (> {ACCEPT_MAX_VIF:.0f}: collinear - consider dropping/"
+                 f"re-specifying this factor)" if v > ACCEPT_MAX_VIF else ""))
 
     close_wide = px.pivot_table(index='timestamp', columns='symbol', values='close',
                                 aggfunc='last').sort_index()

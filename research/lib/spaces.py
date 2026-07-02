@@ -155,10 +155,14 @@ SPACES = [
        'return kurtosis: tail-risk premium'),
 
     # --- cross-sectional / basket-relative context
+    # NOTE: cross-sectionally CONSTANT columns (cs_dispersion_1h, cs_breadth_sma,
+    # mk_market_move_z, mk_market_vol_1d, tm_*) are regime CONDITIONERS, not
+    # spaces: evaluate.py z-scores each cross-section, and the z-score of a
+    # constant is identically zero, so such a "signal" can never rank names and
+    # only wastes evaluation slots. Use them as interaction terms if a
+    # regime-conditioned hypothesis is ever added.
     _S('cluster_relative_value', 'cs_cluster_rel_z', 'cross_sectional',
        'value relative to its correlation cluster (the statarb basket)'),
-    _S('dispersion', 'cs_dispersion_1h', 'cross_sectional',
-       'cross-sectional return dispersion regime'),
 
     # --- market-structure / lead-lag
     _S('lag_response', 'mk_lag_response_gap', 'market_structure',
@@ -290,10 +294,6 @@ SPACES = [
     # --- additional market-structure / lead-lag
     _S('market_correlation', 'mk_corr_market_1d', 'market_structure',
        '1d correlation to the market factor'),
-    _S('market_move', 'mk_market_move_z', 'market_structure',
-       'standardized market move: beta-response context'),
-    _S('market_vol', 'mk_market_vol_1d', 'market_structure',
-       '1d market volatility regime'),
     _S('lag_corr_short', 'mk_lag_corr_short', 'market_structure',
        'short-window lagged correlation to market'),
     _S('lag_corr_long', 'mk_lag_corr_long', 'market_structure',
@@ -337,8 +337,6 @@ SPACES = [
        'cross-sectional market-cap rank (size context)'),
     _S('funding_cross_z', 'cs_funding_z', 'cross_sectional',
        'cross-sectional funding z: relative crowding'),
-    _S('breadth', 'cs_breadth_sma', 'cross_sectional',
-       'cross-sectional breadth regime'),
     _S('xs_return_reversal_fast', 'cs_ret_rank_1h', 'cross_sectional',
        '1h cross-sectional return rank (fast reversal)'),
     _S('relvol_per_size', 'cs_rel_volume', 'cross_sectional',

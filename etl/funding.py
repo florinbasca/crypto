@@ -5,8 +5,12 @@ Downloads historical funding rate data from Binance Data Vision (free, no API ke
 Data is available from 2020-01 for major perpetuals.
 
 IMPORTANT: Funding rates are settled every 8h (or 4h for some contracts).
-The rate is KNOWN at settlement time, so we use calc_time as the timestamp.
-To avoid look-ahead bias in features, we must shift by 1 period when using as a signal.
+The rate is KNOWN at settlement time, so calc_time is the timestamp. Under
+the pipeline's bar-end convention a value stamped T is knowable at bar T
+(features may use data through bar t INCLUSIVE; forward targets start at
+t+1), so NO extra shift is applied downstream - features_futures.py aligns
+with a right-labeled/right-closed resample and the truncation test in
+tests/sanity_checks.py enforces causality.
 """
 
 import sys

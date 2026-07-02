@@ -7,11 +7,13 @@ Architecture (2026-06):
 - Raw data: 1-minute Binance spot klines, from `data.start_date` onward.
 - Base panel: 10-minute bars ('10min'). All features/signals/residuals on this grid.
 - Horizons: multi-period forward residual targets at 10min / 1h / 1d.
-- Universe: Hyperliquid-tradeable perps (no stablecoins), full current
-  candidate set used at every timestamp.
-- Risk model: market (equal-weight) + size (small-minus-big) factor model.
-  Residual[t] = r[t] - beta_mkt*f_mkt[t] - beta_size*f_size[t], causal daily betas.
-- Portfolio: Ledoit-Wolf shrunk covariance MVO, dollar/market/size-neutral.
+- Universe: Hyperliquid-tradeable perps (no stablecoins); point-in-time
+  membership spells recorded by etl/universe.py (pre-snapshot history seeded
+  from the data start).
+- Risk model: market (equal-weight) + size / momentum / vol (rank-weighted
+  spreads). Residual[t] = r[t] - sum_f beta_f * factor_f[t], causal daily betas.
+- Portfolio: rank/equal-weight sizing (Ledoit-Wolf MVO benchmark), dollar +
+  factor-beta neutral, net of trading costs and perp funding accrual.
 """
 
 import math
@@ -221,6 +223,10 @@ config = {
         'acceptance': {
             'min_variance_reduction': 0.05,   # var(res)/var(raw) must be <= 1 - this
             'max_residual_raw_corr': 0.95,    # corr(res, raw) must be below this
+            # Factor collinearity: variance-inflation factor of each factor's
+            # returns vs the others. Collinear factors make betas unstable and
+            # the hedge noisy. Warn-only (does not fail the build).
+            'max_vif': 10.0,
         },
     },
 
@@ -354,12 +360,13 @@ config = {
         'min_assets_per_timestamp': 10,
         'min_universe_fraction': 0.4,               # also >= this * universe.max_candidates names
         'compute_on_full_history': True,
-        # Forward IC lags (bars). Lags 1/3 are below walk_forward
-        # min_holding_lag_bars (6) so they are never *selected*, but they anchor
-        # the per-signal IC(tau) decay curve the portfolio layer fits - kept as
-        # anchors, not dropped. The 6..432 body gives ~1h-to-3d term-structure
-        # resolution. Cost scales ~linearly in lag count (target build is cached,
-        # but lag_metrics still runs per lag per signal).
+        # Forward IC lags (bars). Short lags sit below the walk-forward
+        # selection speed floor so they are never *selected*; they are kept to
+        # resolve each signal's IC(tau) decay diagnostics (evaluate.py /
+        # signal_lab). The portfolio layer does NOT fit a decay curve - it pins
+        # each signal to its single strongest selectable lag. The 6..432 body
+        # gives ~1h-to-3d term-structure resolution. Cost scales ~linearly in
+        # lag count (target build is cached, but lag_metrics runs per lag).
         'decay_lag_grid': [1, 3, 6, 12, 18, 24, 36, 48, 72, 96, 144, 216, 288, 432],
         'liquidity_window_bars': 144,
     },
@@ -370,6 +377,14 @@ config = {
         'end_date': '2026-06-01',        # Last complete month of data
         'train_months': 6,
         'test_days': 30,
+
+        # Survivorship sensitivity gate: exclude names whose FIRST data bar is
+        # within this many days of the test day. The universe is conditioned on
+        # today's HL listing (historical listing dates are unavailable), and
+        # newly listed names are both survivor-biased and pump-phase-prone;
+        # re-running the backtest with e.g. 90 here bounds how much of the PnL
+        # depends on them. 0 = off (default; production behaviour).
+        'min_listing_age_days': 0,
 
         # Per-window signal selection (training data only).
         # IC t-stats use Newey-West HAC on the daily-IC series (cross-sectional
@@ -405,24 +420,24 @@ config = {
         'min_net_sharpe_threshold': 0.0,
         'max_correlation_threshold': 0.50,
         'max_signal_turnover': 1.0,      # Max avg turnover per rebalance cycle
-        # Minimum directly-observed holding lag (bars) a signal may be selected
-        # at. Matches signal speed to the book's rebalance speed: a 10-min alpha
-        # is unmonetizable through a book that rebalances every few hours. 0 = off.
-        # The book/horizon sweep couples this with gp trade_urgency + turnover.
-        # At 0 the selector favours 1-bar signals whose ~2bp/bar raw edge cannot
-        # clear a round-trip cost, so the portfolio no_trade_band rejects them and
-        # bar coverage collapses (window-0: 45 selected but only ~20% of bars
-        # traded). A small positive floor matches signal speed to the book's
-        # rebalance speed and keeps signals whose horizon edge actually pays for a
-        # round trip. Kept at 6 bars (1h): on the FULL 22-window run, lag 6 has
-        # gross Sharpe +0.36 vs -0.10 at lag 36 - the crypto cross-sectional edge
-        # lives in the short-horizon signals, and slowing the selection throws it
-        # away. (An 8-window sweep suggested the opposite, but it sampled only the
-        # bad early melt-up window and did not generalize - do not trust it.)
-        # Lowered to 3 bars (30min) to admit faster signals now that the futures
-        # OI/positioning leak is fixed (etl/futures.py bar-end labeling) - re-verify
-        # the lag-3 vs lag-6 gross Sharpe on the full 22-window run after rebuilding.
-        'min_holding_lag_bars': 3,
+        # Minimum holding lag (bars) a signal may be selected at - the speed
+        # match between signal decay and how fast the book actually trades.
+        # 'auto' (default) DERIVES the floor from the execution layer: the
+        # backtest discounts each bucket's alpha by h/(h + 1/kappa) at the
+        # effective fill rate kappa (GP trade rate capped by the
+        # max_annual_turnover budget), so 'auto' admits only lags that retain
+        # at least min_monetizable_alpha_fraction of their alpha after that
+        # discount (h >= f/(1-f) * 1/kappa). One knob set - trade_urgency plus
+        # the turnover budget - moves selection AND execution together, so the
+        # selector can no longer spend slots on fast signals the executor then
+        # scales to ~1%. An integer keeps a manual floor in bars (0 = off).
+        'min_holding_lag_bars': 'auto',
+        # Fraction of a signal's alpha that must survive the aim discount for
+        # its lag to be selectable under 'auto'. At the current budget
+        # (100x/yr, gross 1) 1/kappa ~ 526 bars, so 0.15 -> floor ~ 93 bars
+        # (~15.5h). Lower it to admit faster signals; raising
+        # max_annual_turnover / trade_urgency lowers the floor automatically.
+        'min_monetizable_alpha_fraction': 0.15,
         'max_signals_per_window': 15,    # Per holding-lag bucket
         # Do not keep trading a stale selection when the current window finds
         # no statistically defensible candidates.
@@ -447,9 +462,6 @@ config = {
         'require_recent_third': True,    # latest third must retain pooled IC sign
         'min_liquid_ic_ratio': 0.3,      # |IC on liquid half| >= ratio * |IC|
 
-        # Lockbox: final months excluded from every research iteration;
-        # evaluate ONCE (--lockbox) right before any live decision.
-        'lockbox_months': 6,
         # Execution-fragility stress: also report PnL with weights applied
         # one bar late (decided at t-1, earn bar t)
         'implementation_lag_bars': 1,
@@ -559,6 +571,14 @@ config = {
         # Set to 2.0 (optimistic maker/low-slippage) to test whether the strategy
         # clears costs at the cheap end - MUST reflect actually-achievable execution.
         'cost_bps': 2.0,
+        # Accrue perp funding on held positions in the walk-forward backtest: at
+        # each settlement stamp the book earns -sum(w_i * rate_i) (longs PAY a
+        # positive rate, shorts receive). Rates come from the funding_rates table
+        # (Binance USDT-perp, a proxy for Hyperliquid funding). Several signal
+        # families tilt the book BY funding (short crowded-carry names), so this
+        # term is correlated with the alpha and must not be ignored.
+        # False -> price PnL minus trading costs only (legacy behaviour).
+        'funding_pnl': True,
         'residual_vol_window_days': 10,      # Per-asset residual vol for Grinold alpha scaling
         # Grinold IC shrinkage: realized IC is noisy/non-stationary, so the alpha
         # scale uses (1 - ic_shrink) * IC. 0 = trust IC fully; 0.5 = halve it
@@ -707,6 +727,19 @@ def validate_config() -> None:
     ranking_weights = config['walk_forward']['candidate_ranking']['score_weights']
     if not ranking_weights or any(weight < 0 for weight in ranking_weights.values()):
         raise ValueError("ranking score weights must be non-negative and non-empty")
+
+    wf = config['walk_forward']
+    mhl = wf.get('min_holding_lag_bars', 0)
+    if mhl == 'auto':
+        frac = float(wf.get('min_monetizable_alpha_fraction', 0.0))
+        if not 0.0 < frac < 1.0:
+            raise ValueError(
+                "walk_forward.min_monetizable_alpha_fraction must be in (0, 1) "
+                "when min_holding_lag_bars is 'auto'")
+    elif not isinstance(mhl, int) or mhl < 0:
+        raise ValueError(
+            "walk_forward.min_holding_lag_bars must be 'auto' or a "
+            "non-negative integer")
 
     port = config['portfolio']
     if port.get('weight_scheme', 'equal_weight') not in ('equal_weight', 'mvo'):

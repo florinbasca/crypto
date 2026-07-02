@@ -20,7 +20,7 @@ uv run python etl/universe.py        # Hyperliquid perp candidates (~130, no sta
 uv run python etl/prices_raw.py      # 1m Binance spot klines, last 3y (~big download)
 uv run python etl/prices.py          # resample 1m -> 10min `prices` table
 uv run python etl/marketcap.py       # daily mcap (CoinGecko, needs .keys) - size factor
-uv run python etl/funding.py         # perp funding rates (optional, funding features)
+uv run python etl/funding.py         # perp funding rates (funding features + backtest funding accrual)
 uv run python etl/futures.py         # OI / positioning metrics (optional)
 
 # 2. Risk model
@@ -28,6 +28,7 @@ uv run python risk_model/factor_returns.py    # market (EW) + size/momentum/vol 
 uv run python risk_model/residual_returns.py  # causal betas, residuals, fwd targets
                                               # (prints acceptance checks - must PASS)
 uv run python risk_model/features.py          # ~170-column feature panel
+                                              # (--spaces-only: persist only space-referenced columns)
 
 # 3. Signals
 uv run python research/signals/evaluate.py   # score the spaces (research/lib/spaces.py) x lag grid
@@ -79,9 +80,9 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
 - **Targets**: `fwd_res_{10min,1h,1d}[t]` = sum of single-bar residuals over
   bars t+1..t+p. Bar-end timestamps throughout; a signal at t may use data
   through bar t (forward targets start at t+1, so no overlap).
-- **Signals**: ~135 curated cross-sectional **spaces** (`research/lib/spaces.py`),
+- **Signals**: ~130 curated cross-sectional **spaces** (`research/lib/spaces.py`),
   each one named economic hypothesis (residual-reversion, liquidity, order-flow,
-  funding, OI, positioning, vol-structure, …). Each is scored against the 8-lag
+  funding, OI, positioning, vol-structure, …). Each is scored against the 14-lag
   forward grid on an hourly screening grid; only compact aggregates are persisted
   (`signal_daily_stats`, `signal_metrics`) — raw per-bar values are recomputed on
   demand. See **Signals: generation & selection** below.
@@ -103,25 +104,26 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
     gross leverage 1, and trade partially toward the aim portfolio at a
     cost-responsive Garleanu-Pedersen rate; liquidity-aware per-name multipliers
     (trailing ADV) make illiquid names cost more and fill slower.
-  - *Test*: backtested on RAW forward returns; realized factor exposures are
-    reported as the market-neutrality check, alongside a half-alpha diagnostic
-    (`cost / expected gross alpha`, ~0.5 at the optimum).
+  - *Test*: backtested on RAW forward returns, net of trading costs AND perp
+    funding accrued on held positions at settlement stamps; realized factor
+    exposures are reported as the market-neutrality check, alongside a
+    half-alpha diagnostic (`cost / expected gross alpha`, ~0.5 at the optimum).
 
 ## Signals: generation & selection
 
 **Generation** (`research/signals/evaluate.py`):
 
 - The signal universe is the curated **spaces** in `research/lib/spaces.py` —
-  ~135 cross-sectional hypotheses across 14 economic themes (residual-reversion,
+  ~130 cross-sectional hypotheses across 14 economic themes (residual-reversion,
   funding, market-structure, open-interest, order-flow, factor-loading, liquidity,
   cross-sectional, vol-structure, momentum, efficiency, fundamental, positioning,
   volume). Each space is one
   vectorized expression over feature columns; add one = add one `_S(...)` line.
 - Each signal is computed at full 10-min resolution, smoothed, and
   cross-sectionally z-scored, then scored by **rank IC** against the forward
-  residual targets at every lag in the 8-lag grid `[1,3,6,18,36,72,144,288]`
-  bars, on a non-overlapping hourly screening grid (overlap would inflate IC
-  t-stats).
+  residual targets at every lag in the 14-lag grid
+  `signals.decay_lag_grid` (1..432 bars, ~10min to 3d), on a non-overlapping
+  hourly screening grid (overlap would inflate IC t-stats).
 - Only compact per-day aggregates (`signal_daily_stats`) and whole-period
   diagnostics (`signal_metrics`) are stored — the raw panels are recomputed on
   demand. Incremental: re-running only re-evaluates new/changed signals.
@@ -134,7 +136,11 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
    clearly-spurious tail.
 3. **Threshold gates** — IC floor, ICIR, daily-return Sharpe, turnover, IC
    stability across window thirds, recent-third sign, liquid-half IC, minimum
-   holding lag.
+   holding lag. The holding-lag floor is *derived from the execution layer*
+   (`min_holding_lag_bars: 'auto'`): a lag must retain at least
+   `min_monetizable_alpha_fraction` of its alpha after the Garleanu-Pedersen
+   aim discount at the book's effective fill rate, so the selector cannot
+   spend slots on signals the (turnover-budgeted) executor then scales to ~0.
 4. **Standardized composite ranking**, then a **per-theme cap** + **greedy
    de-correlation** on daily returns, bucketed by holding lag.
 
@@ -165,26 +171,32 @@ See `research/signals/README.md`.
 
 How far the backtested numbers should be trusted out of sample:
 
-- **No point-in-time universe.** Candidates are *today's* Hyperliquid listing,
-  so the backtest is conditioned on names that survived to now
+- **Partially point-in-time universe.** Candidates are *today's* Hyperliquid
+  listing, so history is conditioned on names that survived to now
   (survivorship / tradability bias); historical listing/delisting dates aren't
-  available. (Membership within that set is monthly point-in-time.)
+  available. Each `etl/universe.py` run now records membership spells in
+  `universe_membership` (symbol, valid_from, valid_to), so membership becomes
+  genuinely point-in-time as snapshots accrue — but everything before the
+  first snapshot is still seeded as "member since the data start".
+  `walk_forward.min_listing_age_days` (off by default) excludes names newly
+  listed at each test day, bounding how much PnL depends on them.
 - **Market data only.** Inputs are crypto prices plus market-cap, funding, and
   open-interest — no fundamentals, on-chain, order-book/L2, sentiment/news, or
   macro data. The entire edge is price-derived.
 - **Approximate transaction costs.** A 2 bps/side base cost is charged on
   turnover, scaled per name by a trailing-ADV liquidity multiplier (illiquid
-  names cost more, fill slower). The model is still cross-sectional and does
-  *not* use realized execution data, calibrated impact curves, capacity caps,
-  perp funding, or short-borrow costs, and assumes fills at 10-min bar stamps.
-  Real-world costs are almost certainly higher.
+  names cost more, fill slower), and perp funding on held positions is accrued
+  at settlement stamps (Binance USDT-perp rates as a Hyperliquid proxy; longs
+  pay positive rates). The model still does *not* use realized execution data,
+  calibrated impact curves, or capacity caps, and assumes fills at 10-min bar
+  stamps. Real-world costs are almost certainly higher.
 - **Single short sample / regime.** ~3 years of one asset class, no
   out-of-regime or crisis validation — and crypto regimes shift fast.
 - **Four-factor risk model.** Market, size, momentum and vol are hedged; other
   systematic exposures (liquidity, sector/meme) still stay in the residual (only
   partly addressed by the soft cluster penalty).
-- **Multiple testing.** ~135 spaces x 8 lags are screened; per-window FDR + gates
-  mitigate but do not eliminate the risk of selecting overfit signals.
+- **Multiple testing.** ~130 spaces x 14 lags are screened; per-window FDR +
+  gates mitigate but do not eliminate the risk of selecting overfit signals.
 
 ## License
 

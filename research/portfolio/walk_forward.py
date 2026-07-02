@@ -23,8 +23,9 @@ Per rolling window (train_months -> test_days):
    net-destructive on this low-breadth, negatively-skewed book.
 5. BACKTEST at asset level on RAW forward returns (the honest test - the
    neutrality constraints, not the residual bookkeeping, must do the hedging),
-   with per-side costs on turnover. Realized factor exposures are tracked and
-   reported - this is the market-neutrality acceptance check.
+   with per-side costs on turnover and perp funding accrued on held positions
+   at settlement stamps (longs pay positive rates). Realized factor exposures
+   are tracked and reported - this is the market-neutrality acceptance check.
 
 Outputs: wf_portfolio_returns, wf_portfolio_windows, wf_portfolio_exposures.
 """
@@ -177,6 +178,56 @@ def gp_trade_rate(cost_bps: float, gp: dict, legacy_halflife: float) -> float:
     return float(omega / (1.0 + omega))
 
 
+def effective_fill_rate() -> Tuple[float, float]:
+    """(nominal per-bar trade rate, effective fill rate kappa).
+
+    The nominal rate is the GP cost-responsive trade-toward-aim rate; kappa is
+    the rate at which the book can ACTUALLY close the gap to the aim once the
+    hard `max_annual_turnover` budget is accounted for (at realistic settings
+    the budget binds long before the nominal rate). This one quantity drives
+    BOTH the aim discount in `_backtest_window` and the selection speed floor
+    (`resolve_min_holding_lag`), so the two layers cannot disagree about how
+    fast alpha can be monetized.
+    """
+    gp = PORT.get('gp_trading', {})
+    nominal = gp_trade_rate(PORT['cost_bps'], gp,
+                            PORT['weight_smoothing_halflife'])
+    kappa = max(nominal, 1e-9)
+    max_ann_to = PORT.get('max_annual_turnover')
+    per_bar_budget = (max_ann_to / (BARS_PER_DAY * 365)
+                      if max_ann_to else np.inf)
+    if gp.get('discount_at_realized_rate', True) and np.isfinite(per_bar_budget):
+        realized = per_bar_budget / max(PORT['gross_leverage'], 1e-9)
+        kappa = max(min(kappa, realized), 1e-9)
+    return nominal, kappa
+
+
+def resolve_min_holding_lag() -> int:
+    """Selection speed floor (bars). 'auto' derives it from execution speed.
+
+    The backtest discounts each bucket's alpha by h/(h + 1/kappa) (Garleanu-
+    Pedersen aim discount at the effective fill rate). A signal whose holding
+    lag retains less than `min_monetizable_alpha_fraction` of its alpha after
+    that discount enters the composite at near-zero scale, so selecting it
+    wastes a slot on a signal the executor then ignores. 'auto' solves
+    h/(h + 1/kappa) >= f  =>  h >= f/(1-f) * (1/kappa): the floor moves WITH
+    the turnover budget / trade urgency instead of being an independently
+    tuned knob that can contradict them. An integer config value keeps a
+    manual floor (0 = off); with gp_trading disabled no aim discount is
+    modeled, so 'auto' resolves to 0.
+    """
+    cfg = WF.get('min_holding_lag_bars', 0)
+    if cfg != 'auto':
+        return int(cfg or 0)
+    if not PORT.get('gp_trading', {}).get('enabled', False):
+        return 0
+    frac = float(WF.get('min_monetizable_alpha_fraction', 0.0))
+    if not 0.0 < frac < 1.0:
+        return 0
+    _, kappa = effective_fill_rate()
+    return int(np.ceil(frac / (1.0 - frac) / kappa))
+
+
 def liquidity_multipliers(adv: pd.Series, cfg: dict) -> Tuple[pd.Series, pd.Series]:
     """Per-name (cost_mult, speed_mult) from trailing dollar-volume (ADV).
 
@@ -260,6 +311,15 @@ class SignalSelector:
         self.last_candidate_stats = pd.DataFrame()
         self.last_rets = pd.DataFrame()   # selected signals' training daily returns
         self.last_selection_counts: Dict[str, int] = {}
+        # Speed floor derived from the execution layer (or the manual config
+        # value); resolved once - it is a pure function of config.
+        self.min_holding_lag = resolve_min_holding_lag()
+        nominal, kappa = effective_fill_rate()
+        logging.info(
+            f"Selection speed floor: holding lag >= {self.min_holding_lag} bars "
+            f"(min_holding_lag_bars={WF.get('min_holding_lag_bars', 0)!r}; "
+            f"trade rate nominal {nominal:.4f}/bar, effective fill rate "
+            f"{kappa:.5f}/bar -> 1/kappa = {1.0 / kappa:.0f} bars)")
 
     def _daily_slice(self, horizon: str, start: pd.Timestamp,
                      end: pd.Timestamp,
@@ -489,8 +549,8 @@ class SignalSelector:
         # the net edge to at least break even after cost_bps/side.
         if WF.get('min_net_sharpe_threshold') is not None:
             gates &= (stats['sharpe_net'] >= WF['min_net_sharpe_threshold'])
-        if WF.get('min_holding_lag_bars', 0) > 0:
-            gates &= (stats['holding_lag'] >= WF['min_holding_lag_bars'])
+        if self.min_holding_lag > 0:
+            gates &= (stats['holding_lag'] >= self.min_holding_lag)
         if WF.get('require_recent_third', True):
             gates &= stats['recent_third_consistent']
         liq_ratio = WF.get('min_liquid_ic_ratio', 0.0)
@@ -720,14 +780,16 @@ class DataContext:
             return {column: cond} if cond else {}
 
         def _wide_panel(table_name: str, value_col: str,
-                        time_col: str = 'timestamp') -> pd.DataFrame:
+                        time_col: str = 'timestamp',
+                        pad_end: Optional[pd.Timedelta] = None) -> pd.DataFrame:
             lf = _scan(table_name)
             if lf is None:
                 return pd.DataFrame()
             if start is not None:
                 lf = lf.filter(pl.col(time_col) >= start)
             if end is not None:
-                lf = lf.filter(pl.col(time_col) < end)
+                lf = lf.filter(pl.col(time_col) <
+                               (end + pad_end if pad_end is not None else end))
             df = lf.select([time_col, 'symbol', value_col]).collect()
             if df.is_empty():
                 return pd.DataFrame()
@@ -755,6 +817,31 @@ class DataContext:
             raise RuntimeError("universe table is empty - run etl/universe.py first")
         self.membership = set(candidates['symbol'])
 
+        # Point-in-time membership intervals when available (etl/universe.py
+        # maintains universe_membership); the static current set is the
+        # fallback. The initial cohort is seeded from the data start, so
+        # behaviour only diverges once listing/delisting snapshots accrue.
+        self.membership_intervals = None
+        self._members_cache: Dict[pd.Timestamp, set] = {}
+        mem = load_universe_membership()
+        if (mem is not None and 'valid_from' in mem.columns
+                and 'valid_to' in mem.columns):
+            self.membership_intervals = mem[['symbol', 'valid_from', 'valid_to']]
+
+        # First data bar per name (proxy for listing date), from the FULL
+        # residual history - the context window is warmup-trimmed, so its own
+        # first rows would fake every name as newly listed. Feeds the
+        # walk_forward.min_listing_age_days survivorship sensitivity gate.
+        self.first_bar = None
+        if int(WF.get('min_listing_age_days', 0) or 0) > 0:
+            lf = _scan('residual_returns')
+            if lf is not None:
+                fb = (lf.group_by('symbol')
+                        .agg(pl.col('timestamp').min().alias('first_bar'))
+                        .collect().to_pandas())
+                self.first_bar = pd.to_datetime(
+                    fb.set_index('symbol')['first_bar'])
+
         # Per-name dollar-volume panel (for liquidity-aware costs / trade speed).
         # quote_asset_volume is the bar's $ traded; ADV is a trailing mean of it.
         # Optional: if absent the backtest falls back to flat costs / scalar speed.
@@ -768,11 +855,41 @@ class DataContext:
                 logging.warning(f"liquidity_aware: no dollar-volume panel ({e}); "
                                 "falling back to flat costs / scalar trade speed")
 
+        # Funding-rate panel (settlement stamp x symbol) for the funding-PnL
+        # accrual. Padded one bar past the context end: a settlement at exactly
+        # test_end belongs to the last bar's forward interval (t, t+1bar].
+        # Optional - missing table -> price PnL only, with a warning.
+        self.funding_wide = None
+        if PORT.get('funding_pnl'):
+            try:
+                fw = _wide_panel('funding_rates', 'funding_rate',
+                                 pad_end=pd.Timedelta(BASE_FREQUENCY))
+                if not fw.empty:
+                    self.funding_wide = fw
+                else:
+                    logging.warning("funding_pnl enabled but funding_rates is "
+                                    "empty - backtest will accrue NO funding")
+            except Exception as e:
+                logging.warning(f"funding_pnl: no funding panel ({e}); "
+                                "backtest will accrue NO funding")
+
         logging.info(f"Panels: {self.res_wide.shape[0]:,} bars x "
                      f"{self.res_wide.shape[1]} symbols")
 
     def members_at(self, ts: pd.Timestamp) -> set:
-        return self.membership
+        """Candidate set at `ts`: point-in-time interval lookup when the
+        universe_membership table exists, else the static current set."""
+        if self.membership_intervals is None:
+            return self.membership
+        day = ts.normalize()
+        cached = self._members_cache.get(day)
+        if cached is None:
+            m = self.membership_intervals
+            ok = (m['valid_from'] <= ts) & (m['valid_to'].isna() |
+                                            (ts < m['valid_to']))
+            cached = set(m.loc[ok, 'symbol'])
+            self._members_cache[day] = cached
+        return cached
 
     def betas_for_day(self, day: pd.Timestamp) -> pd.DataFrame:
         """Latest betas at or before `day` per symbol (estimated pre-`day`)."""
@@ -972,7 +1089,7 @@ class WalkForwardPortfolio:
             return res
 
         res.oos_returns = bt_returns[[
-            'gross_return', 'net_return', 'net_return_lag1',
+            'gross_return', 'net_return', 'net_return_lag1', 'funding_pnl',
             'turnover', 'gross_exposure', 'net_exposure',
             'mkt_exposure', 'size_exposure', 'n_positions',
         ] + EXTRA_EXPOSURE_COLS]
@@ -1010,7 +1127,8 @@ class WalkForwardPortfolio:
             if bench is not None and not bench.empty:
                 res.oos_returns_bench = bench[[
                     'gross_return', 'net_return', 'net_return_lag1',
-                    'turnover', 'gross_exposure', 'mkt_exposure', 'size_exposure',
+                    'funding_pnl', 'turnover', 'gross_exposure',
+                    'mkt_exposure', 'size_exposure',
                 ]]
                 std_b = bench['net_return'].std()
                 res.oos_sharpe_bench = (float(bench['net_return'].mean() / std_b *
@@ -1113,6 +1231,11 @@ class WalkForwardPortfolio:
         cov_window = pd.Timedelta(days=PORT['cov_window_days'])
         vol_window = pd.Timedelta(days=PORT['residual_vol_window_days'])
         impl_lag = int(WF.get('implementation_lag_bars', 1))
+        # Survivorship sensitivity gate (walk_forward.min_listing_age_days):
+        # names whose first data bar is younger than this at the test day are
+        # not investable. 0 -> off.
+        min_age_days = int(WF.get('min_listing_age_days', 0) or 0)
+        min_age = pd.Timedelta(days=min_age_days)
 
         # Per-bucket per-bar alpha scale: (1 - ic_shrink) * IC_b / sqrt(h_b),
         # times the Garleanu-Pedersen aim-portfolio discount h/(h + 1/kappa):
@@ -1120,16 +1243,11 @@ class WalkForwardPortfolio:
         # costs. ic_shrink pulls the noisy realized IC toward 0 (Grinold & Kahn
         #) so IC swings don't whipsaw the book.
         gp_on = bool(gp.get('enabled', False))
-        kappa = max(smooth_alpha, 1e-9)
-        # The aim discount must use the rate at which the book ACTUALLY fills, not
-        # the nominal trade rate. When the turnover budget binds, the book only
-        # closes ~per_bar_budget/gross of the gap each bar - far below smooth_alpha
-        # - so discounting at the nominal rate over-sizes alpha the book can never
-        # capture. Cap kappa at the realized fill rate (no-op when turnover is
-        # ample, since then per_bar_budget/gross >= smooth_alpha).
-        if gp.get('discount_at_realized_rate', True) and np.isfinite(per_bar_to_budget):
-            realized_rate = per_bar_to_budget / max(gross_target, 1e-9)
-            kappa = max(min(kappa, realized_rate), 1e-9)
+        # Effective fill rate kappa: the GP trade rate capped at the rate the
+        # turnover budget actually allows - the same quantity that derives the
+        # selection speed floor (see effective_fill_rate / resolve_min_holding_lag),
+        # so selection and execution price alpha decay identically.
+        _, kappa = effective_fill_rate()
         ic_shrink = float(PORT.get('ic_shrink', 0.0))
         ic_keep = max(0.0, 1.0 - ic_shrink)
         # Two scales per bucket from the same (1 - ic_shrink) * IC_b / sqrt(h_b)
@@ -1151,6 +1269,16 @@ class WalkForwardPortfolio:
             raw = ic_keep * bucket_ic.get(b, 0.0) / np.sqrt(h_b)
             ic_scale_raw[b] = raw
             ic_scale[b] = raw * (h_b / (h_b + 1.0 / kappa)) if gp_on else raw
+        # Observability: how hard the execution layer scales each bucket. Logged
+        # for the production scheme only (identical for the benchmark foil).
+        if gp_on and self._weight_scheme == self.weight_scheme:
+            disc = {b: max(bucket_h.get(b, 1.0), 1.0)
+                    / (max(bucket_h.get(b, 1.0), 1.0) + 1.0 / kappa)
+                    for b in composites}
+            logging.info(
+                "  aim discounts (1/kappa=%.0f bars): %s",
+                1.0 / kappa,
+                ", ".join(f"{b}:{d:.3f}" for b, d in disc.items()))
 
         cluster_cfg = PORT.get('cluster_penalty', {})
 
@@ -1195,6 +1323,17 @@ class WalkForwardPortfolio:
         fwd_row_positions = fwd_index.get_indexer(bars)
         fwd_columns = self.ctx.fwd_raw_wide.columns
         fwd_values_all = self.ctx.fwd_raw_wide.to_numpy(copy=False)
+        # Funding accrual: a settlement inside the bar's forward interval
+        # (t, t+1bar] is paid by the book held over that interval (w_new at t),
+        # so the funding row for bar t is looked up at stamp t + 1 bar. Columns
+        # follow fwd_columns so fwd_col_positions indexes both panels. NaN
+        # (no settlement at that stamp / no rate for that name) pays nothing.
+        fund_on = self.ctx.funding_wide is not None
+        funding_values_all = (
+            self.ctx.funding_wide.reindex(
+                index=bars + pd.Timedelta(BASE_FREQUENCY),
+                columns=fwd_columns).to_numpy()
+            if fund_on else None)
         target_valid = False
         w_target = pd.Series(dtype=float)
         alpha = pd.Series(dtype=float)
@@ -1241,6 +1380,10 @@ class WalkForwardPortfolio:
                 cov_assets = valid_counts[
                     valid_counts >= PORT['cov_min_observations']
                 ].index
+                if min_age_days > 0 and self.ctx.first_bar is not None:
+                    fb = self.ctx.first_bar.reindex(cov_assets)
+                    old_enough = fb.notna() & (fb <= day - min_age)
+                    cov_assets = cov_assets[old_enough.to_numpy()]
                 betas = self.ctx.betas_for_day(day)
                 vol_hist = self.ctx.res_wide[(self.ctx.res_wide.index < day) &
                                              (self.ctx.res_wide.index >= day - vol_window)]
@@ -1430,6 +1573,9 @@ class WalkForwardPortfolio:
             # the cap; gross still floats below the aim. Then re-neutralize.
             gap = float(np.abs(target_values - w_prev_values).sum())
             a_eff = min(smooth_alpha, per_bar_to_budget / gap) if gap > 1e-12 else smooth_alpha
+            # Which mechanism sets the trade speed this bar (observability):
+            # True -> the hard turnover budget, False -> the GP rate itself.
+            budget_bound = gap > 1e-12 and per_bar_to_budget / gap < smooth_alpha
             # Liquidity-aware trade SPEED: liquid names fill toward the aim
             # faster, illiquid ones slower (impact persists -> trade slowly).
             # Per-name rate a_i = clip(a_eff * speed_mult_i, 0, 1); re-throttle
@@ -1478,8 +1624,15 @@ class WalkForwardPortfolio:
             if valid_fwd_cols.any():
                 vals = fwd_values_all[fwd_row, fwd_col_positions[valid_fwd_cols]]
                 fwd_values[valid_fwd_cols] = np.nan_to_num(vals, nan=0.0)
+            # Perp funding exchanged inside this bar's forward interval:
+            # longs PAY a positive rate, shorts receive -> pnl = -(w . rate).
+            fund_values = np.zeros(len(target_index), dtype=float)
+            if fund_on and valid_fwd_cols.any():
+                fv = funding_values_all[i, fwd_col_positions[valid_fwd_cols]]
+                fund_values[valid_fwd_cols] = np.nan_to_num(fv, nan=0.0)
+            funding_pnl = -float(w_new_values @ fund_values)
             gross_ret = float(w_new_values @ fwd_values)
-            net_ret = gross_ret - trade_cost
+            net_ret = gross_ret - trade_cost + funding_pnl
             # Expected (model) per-bar gross alpha for the half-alpha diagnostic
             # (costs should consume ~half of it at the optimum).
             exp_alpha = float(alpha_values @ w_new_values)
@@ -1493,7 +1646,8 @@ class WalkForwardPortfolio:
                 valid_hist = hist_pos >= 0
                 if valid_hist.any():
                     lag_values[valid_hist] = hist_values[hist_pos[valid_hist]]
-                lag_ret = float(lag_values @ fwd_values) - trade_cost
+                lag_ret = (float(lag_values @ fwd_values) - trade_cost
+                           - float(lag_values @ fund_values))
             else:
                 lag_ret = np.nan
 
@@ -1502,6 +1656,7 @@ class WalkForwardPortfolio:
 
             row = {'timestamp': ts, 'gross_return': gross_ret,
                    'net_return': net_ret, 'net_return_lag1': lag_ret,
+                   'funding_pnl': funding_pnl,
                    'turnover': float(turnover), 'trade_cost': trade_cost,
                    'exp_alpha': exp_alpha,
                    'gross_exposure': float(np.abs(w_new_values).sum()),
@@ -1530,6 +1685,8 @@ class WalkForwardPortfolio:
                 'gross': float(np.abs(w_new_values).sum()),
                 'n_positions': int(nz.sum()),
                 'n_at_cap': n_capped,
+                'trade_rate': float(a_eff),
+                'budget_bound': bool(budget_bound),
                 'cov_eig_top_share': cov_eig_top_share,
                 'cov_condition': cov_condition,
                 'n_clusters': n_clusters_day,
@@ -1550,6 +1707,17 @@ class WalkForwardPortfolio:
         if not rows:
             return None
 
+        # Binding-constraint summary (production scheme): if the turnover budget
+        # binds on ~all bars, the GP trade_urgency knob is inert and the budget
+        # alone sets the book's speed - worth knowing before tuning either.
+        if risk_rows and self._weight_scheme == self.weight_scheme:
+            n_bound = sum(1 for r in risk_rows if r['budget_bound'])
+            rates = np.array([r['trade_rate'] for r in risk_rows], dtype=float)
+            logging.info(
+                f"  trade speed: nominal {smooth_alpha:.4f}/bar, median "
+                f"effective {float(np.median(rates)):.5f}/bar; turnover budget "
+                f"binding on {n_bound / len(risk_rows):.0%} of bars")
+
         # Materialize per-bar weights (vectorized: repeat each bar's timestamp
         # across its held names) and the per-bar risk table for persistence.
         if weight_rows:
@@ -1567,17 +1735,11 @@ class WalkForwardPortfolio:
 
     # ---------------- driver ----------------
 
-    def run(self, include_lockbox: bool = False) -> pd.DataFrame:
+    def run(self) -> pd.DataFrame:
         from tqdm import tqdm
 
         full_start = pd.to_datetime(WF['start_date'])
         full_end = pd.to_datetime(WF['end_date'])
-        lockbox = int(WF.get('lockbox_months', 0))
-        if lockbox and not include_lockbox:
-            full_end = full_end - pd.DateOffset(months=lockbox)
-            logging.info(f"LOCKBOX: holding out the final {lockbox} months "
-                         f"(test ends {full_end.date()}). Run --lockbox ONCE "
-                         f"before any live decision.")
         train_months = WF['train_months']
         test_days = WF['test_days']
 
@@ -1676,6 +1838,10 @@ class WalkForwardPortfolio:
         print(f"Avg |size exp|:     {avg_size:.4f}  (size-neutrality check, ~0)")
         print(f"Avg gross:          {avg_gross:.4f}")
         print(f"Avg turnover/bar:   {avg_to:.4f}")
+        if 'funding_pnl' in returns.columns:
+            ann_funding = returns['funding_pnl'].mean() * ppy
+            print(f"Funding PnL (ann.): {ann_funding * 100:+.1f}%  "
+                  f"(perp funding on held positions; included in net)")
 
         # Benchmark (foil) sizing: same selection/alpha/neutrality, different
         # risk model. production-minus-benchmark = the value the production risk
@@ -1842,9 +2008,6 @@ class WalkForwardPortfolio:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Walk-forward market-neutral portfolio')
-    parser.add_argument('--lockbox', action='store_true',
-                        help='Include the held-out lockbox months (run ONCE, '
-                             'right before a live decision)')
     parser.add_argument('--no-benchmark', action='store_true',
                         help='Skip the benchmark (foil) sizing pass '
                              '(faster production-only run)')
@@ -1854,7 +2017,7 @@ def main():
     if args.no_benchmark:
         wf.compare_benchmark = False
     # run() checkpoints each window to the DB (wf_portfolio_*) as it traverses.
-    returns = wf.run(include_lockbox=args.lockbox)
+    returns = wf.run()
     if returns.empty:
         print("No portfolio produced: no window had defensible tradable signals")
         return

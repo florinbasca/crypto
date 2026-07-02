@@ -35,10 +35,12 @@ All configuration values MUST be in `config.py`. Never hardcode:
 - `dbutil.py` - Parquet/Polars storage interface (per-table Parquet datasets
   under `db/`; tables with a `symbol` column are stored one file per symbol).
   Same public API as before (save_data/load_data/iter_data_batches/…)
-- `etl/` - universe (Hyperliquid candidates), prices (1m raw -> 10min panel),
-  marketcap, funding, futures
-- `risk_model/` - factor_returns (market EW + size SMB), residual_returns
-  (causal betas + multi-horizon targets), features (10min feature panel)
+- `etl/` - universe (Hyperliquid candidates + point-in-time
+  universe_membership spells), prices (1m raw -> 10min panel), marketcap,
+  funding, futures
+- `risk_model/` - factor_returns (market EW + size/momentum/vol rank-weighted
+  spreads), residual_returns (causal betas + multi-horizon targets), features
+  (10min feature panel)
 - `research/` - lib/spaces (cross-sectional statarb spaces), lib/portfolio_opt
   (Ledoit-Wolf MVO + rank/equal-weight sizing), signals/evaluate (multi-horizon IC + daily aggregates),
   signals/signal_lab (KEEP/KILL scorecard)
@@ -63,6 +65,11 @@ All configuration values MUST be in `config.py`. Never hardcode:
 - Base frequency 10min (144 bars/day); horizons 10min / 1h / 1d
 - Signals are cross-sectional; predictions target forward RESIDUAL returns
 - Final backtest PnL uses RAW returns - neutrality constraints do the hedging;
-  realized factor exposures are the acceptance check (~0)
-- Universe: ~130 Hyperliquid-tradeable candidates, no stablecoins; full current
-  candidate set is used at every timestamp
+  realized factor exposures are the acceptance check (~0). Net PnL also
+  accrues perp funding on held positions at settlement stamps.
+- Universe: ~130 Hyperliquid-tradeable candidates, no stablecoins. Membership
+  is point-in-time where universe_membership spells exist; pre-snapshot
+  history is seeded as member-since-data-start.
+- The walk-forward selection speed floor is DERIVED from the execution layer
+  (min_holding_lag_bars: 'auto'); do not hand-tune selection speed and the
+  turnover budget independently.

@@ -166,7 +166,8 @@ def _daily_rank_weights(char_wide: pd.DataFrame, unique_dates: pd.DatetimeIndex,
         row = row[np.isfinite(row)]
         if len(row) < 2:
             continue
-        centered = row.rank(method='first') - row.rank(method='first').mean()
+        ranks = row.rank(method='first')
+        centered = ranks - ranks.mean()
         w = -centered if low_is_long else centered
         pos_sum = w[w > 0].sum()
         neg_sum = -w[w < 0].sum()
@@ -183,7 +184,8 @@ def _factor_from_weights(returns: pd.DataFrame, dates: pd.DatetimeIndex,
     """Apply daily long/short weights intraday -> (factor_return, n_members).
 
     Each side is renormalized per bar over names with a valid return so missing
-    bars cannot break dollar neutrality.
+    bars cannot break dollar neutrality. n counts the names with a valid return
+    in EACH bar (diagnostic column, per-bar resolution).
     """
     factor = pd.Series(np.nan, index=returns.index)
     n = pd.Series(0, index=returns.index)
@@ -205,7 +207,7 @@ def _factor_from_weights(returns: pd.DataFrame, dates: pd.DatetimeIndex,
         long_ret = r_day.mul(w_pos, axis=1).sum(axis=1) / pos_norm.replace(0, np.nan)
         short_ret = r_day.mul(w_neg, axis=1).sum(axis=1) / neg_norm.replace(0, np.nan)
         factor.loc[in_day] = (long_ret - short_ret).values
-        n.loc[in_day] = int(avail.any(axis=0).sum())
+        n.loc[in_day] = avail.sum(axis=1).values
     return factor, n
 
 
