@@ -1,4 +1,4 @@
-# Crypto Stat-Arb: Market-Neutral Residual Prediction
+# Crypto Stat-Arb: Factor-Neutral Strategy
 
 Cross-sectional stat-arb on ~100 Hyperliquid-tradeable crypto names.
 1-minute Binance spot data (last 3 years) -> 10-minute base panel ->
@@ -257,6 +257,27 @@ gemini) and a **fresh start** (the discovery tables are cleared first). Flags:
 All knobs live in `config.py` under `discovery.*` (families/input space, DSL
 bounds, search budget, reward weights, promotion gates, backtest, LLM
 provider/model/prices).
+
+### LLM vs random proposer
+
+The LLM fills exactly one slot — *which programs to try next*; everything
+else (compile, causality, scoring, selection, promotion, backtest) is
+deterministic code either way. `--proposer random` is the pure-code
+alternative (grammar sampling + mutation of survivors, bit-reproducible from
+the seed, free). The LLM's edge is a *prior*: it spends the small evaluation
+budget on economically plausible programs and turns diagnostic shapes
+(U-shaped bins, regime-only IC) into matching expressions/gates — but that
+is an empirical claim, so verify it before paying for it:
+
+```bash
+uv run research/signals/agent/run_discovery.py --proposer random --max-rolls 5   # control ($0)
+uv run research/signals/agent/run_discovery.py --proposer llm    --max-rolls 5   # same rolls, LLM
+```
+
+Compare mean/best reward and survivor t-stats per roll in `discovery_ledger`
+(or `inspect_discovery.py` after each run). If the LLM doesn't clearly beat
+random at your search budget, drop it — a wrong LLM can never corrupt
+results (the harness owns all correctness), only waste budget.
 
 ### Review what was generated
 
