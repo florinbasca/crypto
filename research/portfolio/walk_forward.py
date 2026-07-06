@@ -676,7 +676,9 @@ class SignalSelector:
         cols = [s for s in selected if s in rets.columns]
         if len(cols) < 2:
             return float(len(selected))
-        c = rets[cols].corr().fillna(0.0).values
+        # to_numpy(copy=True): under pandas copy-on-write, .values can be a
+        # read-only view and fill_diagonal would raise.
+        c = rets[cols].corr().fillna(0.0).to_numpy(copy=True)
         np.fill_diagonal(c, 1.0)
         ev = np.clip(np.linalg.eigvalsh(c), 0.0, None)
         denom = float((ev ** 2).sum())
@@ -749,7 +751,8 @@ class SignalSelector:
         sign = dict(zip(stats['signal_name'], stats['sign']))
         ic = dict(zip(stats['signal_name'], stats['ic_mean'].abs()))
         signed = rets[cols].mul([sign.get(c, 1.0) for c in cols], axis=1)
-        C = signed.corr().fillna(0.0).values
+        # copy=True: read-only under pandas copy-on-write (see _effective_breadth)
+        C = signed.corr().fillna(0.0).to_numpy(copy=True)
         np.fill_diagonal(C, 1.0)
         shrink = float(cfg.get('corr_shrink', 0.5))
         C = (1.0 - shrink) * C + shrink * np.eye(len(cols))

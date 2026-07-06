@@ -481,6 +481,15 @@ else:
     check("speed floor: manual config passthrough",
           lag_floor == int(mhl_cfg or 0), f"(floor {lag_floor})")
 
+# corr().values can be READ-ONLY under pandas copy-on-write; breadth /
+# combination must take writable copies before fill_diagonal (regression:
+# ValueError "underlying array is read-only" crashed select_decay).
+rets_cow = pd.DataFrame(rng.normal(size=(60, 3)), columns=list('abc'),
+                        index=pd.date_range('2024-01-01', periods=60))
+eb_cow = wfmod.SignalSelector._effective_breadth(rets_cow, list('abc'))
+check("selector: effective breadth CoW-safe", 1.0 <= eb_cow <= 3.0,
+      f"(effN {eb_cow:.2f})")
+
 # ---------------------------------------------------------------------------
 # 16. Point-in-time universe membership: spell evolution + interval mask
 # ---------------------------------------------------------------------------
