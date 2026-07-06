@@ -25,6 +25,7 @@ Feature groups:
   res_ residual dynamics + spread state   ou_  OU on CUMULATIVE residual
   fl_  factor loadings (market/size)      cap_ market-cap derived
   cs_  cross-sectional (panel phase)      fr_/oi_/pos_  futures-derived
+  sn_  per-symbol seasonality profiles    ll_  leader (BTC) lead-lag, slow
 """
 
 import sys
@@ -704,6 +705,128 @@ def calculate_cap_features(df: pd.DataFrame, mcap_series: Optional[pd.Series],
 
 
 # ============================================================================
+# Per-Symbol Seasonality (trailing same-bucket residual stats)
+# ============================================================================
+
+SN_FEATURE_NAMES = ['sn_tod_res', 'sn_tod_vol_ratio', 'sn_dow_res']
+
+
+def calculate_seasonality_features(df: pd.DataFrame, residual_series: pd.Series,
+                                   config: Dict) -> Dict[str, pd.Series]:
+    """Per-symbol time-of-day / day-of-week residual seasonality.
+
+    Unlike the tm_ sin/cos encodings (identical across names, conditioners
+    only), these are each name's OWN trailing seasonal profile, so they vary
+    cross-sectionally and work as direct signals:
+
+      sn_tod_res       trailing mean residual in the same HOUR-of-day bucket
+                       over the past tod_days days
+      sn_tod_vol_ratio same-hour trailing mean |residual| over the all-hours
+                       trailing mean (this name's intraday vol profile)
+      sn_dow_res       trailing mean of the FULL-day residual sum on the same
+                       day-of-week over the past dow_weeks weeks, mapped onto
+                       the current day's bars. Completed days only: the
+                       same-weekday series is shifted one observation, so the
+                       running (partial) current day never feeds its own value.
+
+    All trailing through bar t - causal under the truncation test.
+    """
+    features = _nan_series(df, SN_FEATURE_NAMES)
+    sn = config['seasonality']
+    res = residual_series
+    if res.notna().sum() < 100:
+        return features
+
+    ts = pd.to_datetime(df['timestamp'])
+    bars_per_hour = max(1, BARS_PER_DAY // 24)
+    hour = ts.dt.hour.values
+
+    tod_w = int(sn['tod_days']) * bars_per_hour
+    tod_min = int(sn['min_days']) * bars_per_hour
+    by_hour = res.groupby(hour)
+    features['sn_tod_res'] = by_hour.transform(
+        lambda x: x.rolling(tod_w, min_periods=tod_min).mean())
+
+    abs_res = res.abs()
+    tod_vol = abs_res.groupby(hour).transform(
+        lambda x: x.rolling(tod_w, min_periods=tod_min).mean())
+    all_vol = abs_res.rolling(int(sn['tod_days']) * BARS_PER_DAY,
+                              min_periods=int(sn['min_days']) * BARS_PER_DAY).mean()
+    features['sn_tod_vol_ratio'] = tod_vol / (all_vol + 1e-12)
+
+    # Day-of-week on completed days: daily sums grouped by weekday, rolling
+    # mean of the last dow_weeks same-weekday days, shifted one same-weekday
+    # observation (yesterday-and-back only), then mapped back to bars.
+    date = ts.dt.normalize()
+    daily = res.groupby(date.values).sum(min_count=1)
+    dow = pd.Series(pd.DatetimeIndex(daily.index).dayofweek, index=daily.index)
+    dow_mean = daily.groupby(dow.values).transform(
+        lambda x: x.rolling(int(sn['dow_weeks']),
+                            min_periods=int(sn['dow_min_weeks'])).mean().shift(1))
+    features['sn_dow_res'] = pd.Series(date.map(dow_mean).values, index=df.index)
+
+    return features
+
+
+# ============================================================================
+# Leader Lead-Lag (vs a single leader asset, slow horizons)
+# ============================================================================
+
+def leadlag_feature_names(config: Dict) -> List[str]:
+    ll = config['lead_lag']
+    return (['ll_leader_beta', 'll_lag_corr']
+            + [f'll_leader_gap_{int(w)}b' for w in ll['gap_windows_bars']])
+
+
+def calculate_leadlag_features(df: pd.DataFrame, symbol: str,
+                               leader_close: Optional[pd.Series],
+                               config: Dict) -> Dict[str, pd.Series]:
+    """Lead-lag vs a single leader asset (config lead_lag.leader_symbol, BTC).
+
+    Complements mk_* (market factor, 30min window) with SLOW leader dynamics:
+
+      ll_leader_beta      7d rolling beta of own returns on leader returns
+      ll_leader_gap_{w}b  beta-scaled leader move over w bars minus own move -
+                          the share of the leader's multi-hour move this name
+                          has NOT yet matched (positive = expected catch-up)
+      ll_lag_corr         rolling corr of own bar return with the leader's
+                          PRECEDING lag_bars move: how much of a delayed
+                          follower this name is
+
+    Leader bar t is knowable at t (bar-end stamps). The leader symbol itself
+    returns NaN (self-reference is degenerate).
+    """
+    ll = config['lead_lag']
+    features = _nan_series(df, leadlag_feature_names(config))
+    if leader_close is None or symbol == ll['leader_symbol']:
+        return features
+
+    ts = pd.to_datetime(df['timestamp'])
+    lead = pd.Series(leader_close.reindex(ts).values, index=df.index)
+    lead_ret = lead.pct_change()
+    own_ret = df['close'].pct_change()
+
+    bw = int(ll['beta_window_bars'])
+    cov = own_ret.rolling(bw, min_periods=bw // 2).cov(lead_ret)
+    var = lead_ret.rolling(bw, min_periods=bw // 2).var()
+    beta = cov / (var + 1e-18)
+    features['ll_leader_beta'] = beta
+
+    for w in ll['gap_windows_bars']:
+        w = int(w)
+        lead_move = lead_ret.rolling(w, min_periods=w).sum()
+        own_move = own_ret.rolling(w, min_periods=w).sum()
+        features[f'll_leader_gap_{w}b'] = beta * lead_move - own_move
+
+    lead_lagged = lead_ret.rolling(int(ll['lag_bars']),
+                                   min_periods=int(ll['lag_bars'])).sum().shift(1)
+    cw = int(ll['lag_corr_window_bars'])
+    features['ll_lag_corr'] = own_ret.rolling(cw, min_periods=cw // 2).corr(lead_lagged)
+
+    return features
+
+
+# ============================================================================
 # Residual Dynamics
 # ============================================================================
 
@@ -1101,7 +1224,8 @@ def calculate_all_features(df: pd.DataFrame, config: Dict, symbol: str,
                            factors_df: Optional[pd.DataFrame] = None,
                            intrabar_df: Optional[pd.DataFrame] = None,
                            mcap_series: Optional[pd.Series] = None,
-                           xs_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                           xs_df: Optional[pd.DataFrame] = None,
+                           leader_close: Optional[pd.Series] = None) -> pd.DataFrame:
     feature_dfs = [df[['timestamp', 'symbol']].copy()]
 
     feature_dfs.append(pd.DataFrame(calculate_efficiency_features(df, config), index=df.index))
@@ -1126,6 +1250,10 @@ def calculate_all_features(df: pd.DataFrame, config: Dict, symbol: str,
         calculate_ou_process_features(df, residual_series, config), index=df.index))
     feature_dfs.append(pd.DataFrame(
         calculate_factor_loading_features(df, loadings_df, config), index=df.index))
+    feature_dfs.append(pd.DataFrame(
+        calculate_seasonality_features(df, residual_series, config), index=df.index))
+    feature_dfs.append(pd.DataFrame(
+        calculate_leadlag_features(df, symbol, leader_close, config), index=df.index))
 
     # Intra-bar features (precomputed on the 1m data, merged by timestamp)
     ib = pd.DataFrame(_nan_series(df, IB_FEATURE_NAMES), index=df.index)
@@ -1195,6 +1323,28 @@ def _load_factors() -> Optional[pd.DataFrame]:
     return _FACTORS_CACHE
 
 
+_LEADER_CACHE: Optional[pd.Series] = None
+_LEADER_LOADED = False
+
+
+def _load_leader_close() -> Optional[pd.Series]:
+    """Per-process cached leader close series (features.lead_lag.leader_symbol).
+    None (with a one-time warning) when the leader has no price history."""
+    global _LEADER_CACHE, _LEADER_LOADED
+    if not _LEADER_LOADED:
+        _LEADER_LOADED = True
+        sym = FEATURE_CONFIG['lead_lag']['leader_symbol']
+        px = load_data('prices', filters={'symbol': sym},
+                       columns=['timestamp', 'close'])
+        if px is None or px.empty:
+            logging.warning(f"lead_lag: no prices for leader '{sym}' - "
+                            "ll_ features will be NaN")
+        else:
+            px['timestamp'] = pd.to_datetime(px['timestamp'])
+            _LEADER_CACHE = px.set_index('timestamp')['close'].sort_index()
+    return _LEADER_CACHE
+
+
 def process_symbol(symbol: str, xs_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
     """Compute the full feature panel for one symbol."""
     try:
@@ -1235,7 +1385,8 @@ def process_symbol(symbol: str, xs_df: Optional[pd.DataFrame] = None) -> Optiona
                                       factors_df=factors_df,
                                       intrabar_df=intrabar_df,
                                       mcap_series=mcap_series,
-                                      xs_df=xs_df)
+                                      xs_df=xs_df,
+                                      leader_close=_load_leader_close())
     except Exception as e:
         logging.error(f"Error processing {symbol}: {e}")
         return None

@@ -362,6 +362,20 @@ SPACES = [
     # --- additional liquidity
     _S('max_intrabar_move', 'ib_max_move_1m', 'liquidity',
        'largest 1-minute intrabar move: jump / illiquidity'),
+
+    # --- per-symbol seasonality (slow: profiles move over days/weeks - the
+    #     speed that survives realistic per-side costs)
+    _S('tod_seasonality', 'sn_tod_res', 'seasonality',
+       'own time-of-day residual profile persists day over day'),
+    _S('dow_seasonality', 'sn_dow_res', 'seasonality',
+       'own day-of-week residual profile persists week over week'),
+
+    # --- leader (BTC) lead-lag at slow horizons (complements the 30min
+    #     market-factor mk_lag_response_gap)
+    _S('leader_gap_6h', 'll_leader_gap_36b', 'lead_lag',
+       'beta-scaled BTC move over 6h not yet matched: expected catch-up'),
+    _S('leader_gap_1d', 'll_leader_gap_144b', 'lead_lag',
+       'beta-scaled BTC move over 1d not yet matched: expected catch-up'),
 ]
 
 
@@ -387,6 +401,20 @@ def compute_space_raw(space: SpaceDef, features: pd.DataFrame) -> pd.Series:
         return features[c[0]] / (features[c[1]].abs() + 1e-9)
     if space.op == 'diff':
         return features[c[0]] - features.groupby('symbol', sort=False)[c[0]].shift(space.lag)
+    if space.op == 'dsl':
+        # Promoted discovery candidate (research/lib/discovered.py): compile
+        # its DSL program on the feature frame. compile_candidate requires
+        # (symbol, timestamp)-sorted input (rolling operators) - both callers
+        # (evaluate._load_features, walk_forward.composite_scores) sort that
+        # way. Its output is already cross-sectionally z-scored; evaluate's
+        # final z-score on top is idempotent in distribution, so a discovered
+        # signal's numbers mean the same thing as a curated space's.
+        from research.signals.agent.generation import compile_candidate
+        sig = compile_candidate(space.candidate,
+                                features[['timestamp', 'symbol'] + list(c)])
+        aligned = features[['timestamp', 'symbol']].merge(
+            sig, on=['timestamp', 'symbol'], how='left')
+        return pd.Series(aligned['signal'].values, index=features.index)
     raise ValueError(f"unknown space op: {space.op}")
 
 

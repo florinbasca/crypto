@@ -36,6 +36,16 @@ uv run python research/signals/evaluate.py   # score the spaces (research/lib/sp
 
 # 4. Backtest
 uv run python research/portfolio/walk_forward.py    # monthly-retrain walk-forward selection + market-neutral backtest
+
+# 5. (optional) agentic signal discovery - one multi-lag search for NEW
+#    signals over the feature panel (each candidate pinned to its best
+#    horizon on TRAIN). Promoted candidates automatically enter the registry
+#    as disc_* signals: re-run steps 3+4 afterwards and they are scored,
+#    selected and traded alongside the curated spaces (each only from its
+#    promotion date). See "Using the agentic signal generator" below.
+uv run python research/signals/agent/run_discovery.py --ml-probe
+uv run python research/signals/evaluate.py           # picks up disc_* incrementally
+uv run python research/portfolio/walk_forward.py     # disc_* enter selection
 ```
 
 Each stage reads the tables the previous one writes, so run in order. If
@@ -98,10 +108,11 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
   - *Size* (`portfolio.weight_scheme`): default `equal_weight` ranks the
     vol-free combined z-score cross-sectionally (covariance-free; σ enters
     only the MVO, whose risk term justifies it); `mvo` uses the
-    shrunk-covariance optimizer and is available as an optional benchmark foil
-    (`benchmark_scheme`, off by default — the 22-window comparison measured it
-    net-destructive on this low-breadth, negatively-skewed book: −1.23 vs
-    +0.11 net Sharpe). Both impose dollar / market / size / momentum /
+    shrunk-covariance optimizer and runs as the benchmark foil
+    (`benchmark_scheme`, currently re-enabled to re-answer EW-vs-MVO under
+    the 5 bps + participation regime; the zero-cost 22-window comparison
+    measured it net-destructive on this low-breadth, negatively-skewed book:
+    −1.23 vs +0.11 net Sharpe). Both impose dollar / market / size / momentum /
     vol-beta neutrality within `neutrality_band`, a 5% position cap, gross
     leverage 1 scaled by expected-edge-vs-cost (`edge_scaled_gross`), and trade
     toward the aim portfolio at a cost-responsive Garleanu-Pedersen rate;
@@ -151,7 +162,13 @@ restores the fixed lookback):
    clearly-spurious tail.
 3. **Threshold gates** — IC floor, ICIR, daily-return Sharpe, turnover, IC
    stability across window thirds, recent-third sign, liquid-half IC, minimum
-   holding lag. The holding-lag floor is *derived from the execution layer*
+   holding lag. The IC floor carries an **economics override**
+   (`min_ic_net_sharpe_override`): a signal whose training net Sharpe (after
+   amortized costs, traded direction) is strong passes the gate regardless of
+   |IC| magnitude — measured at 5 bps, the only net-viable sleeve
+   (funding/positioning carry: tiny per-stamp IC, microscopic turnover,
+   net Sharpe +0.8..+1.2) was otherwise vetoed by an IC-strength floor
+   calibrated at zero cost. The holding-lag floor is *derived from the execution layer*
    (`min_holding_lag_bars: 'auto'`): a lag must retain at least
    `min_monetizable_alpha_fraction` of its alpha after the Garleanu-Pedersen
    aim discount at the book's effective fill rate, so the selector cannot
@@ -217,10 +234,15 @@ The program compiles to a value per (10-min bar, coin), which is then
 demeaned + z-scored **across the ~130-coin cross-section** at every bar and
 clipped to ±3. A signal is never "BTC will go up" — it is a *ranking of
 coins against each other* at each moment (long the top, short the bottom,
-~0 net in signal space). It is judged against the **forward residual return
-over the next 36 bars (6h)** — market/size/momentum/vol moves stripped out —
-so it must predict coin-specific mispricing, not beta. The traded direction
-is fixed on TRAIN, never on the scoring window.
+~0 net in signal space). It is judged against **forward residual returns**
+— market/size/momentum/vol moves stripped out — so it must predict
+coin-specific mispricing, not beta. The search is **multi-lag**: each
+candidate is evaluated at every horizon in `discovery.search_lags_bars`
+(default: the full `horizon_lags_bars` grid, 1h/6h/12h/1d) on TRAIN and
+pinned to its strongest one, so fast reversal and slow carry candidates are
+found in the same run with no horizon prior. The traded direction AND the
+lag are fixed on TRAIN, never on the scoring window (the lag search adds no
+select-window multiplicity to the FDR/deflation gates).
 
 ### The walk-forward windows
 
@@ -266,8 +288,12 @@ gemini) and a **fresh start** (the discovery tables are cleared first). Flags:
 
 - `--proposer random|llm|anthropic|gemini` — `random` is the no-API baseline
   / control experiment (the LLM must beat it to be earning its cost)
-- `--ml-probe` — also fit a gradient-boosting ceiling per roll: how much
-  predictability the feature set contains at all
+- `--ml-probe` — also fit a gradient-boosting ceiling per roll **per lag**:
+  where (if anywhere) does the feature set contain predictability at all
+- `--target-lag BARS` — RESTRICT the search to one horizon (one of
+  `discovery.horizon_lags_bars`); output tables get a `_h<lag>` suffix.
+  Rarely needed: the default multi-lag search covers the whole grid in one
+  run and pins each candidate to its own best horizon.
 - `--no-fresh` — keep existing discovery tables; `--no-save` — dry run
 - Each roll's search is seeded with the previous roll's survivors, which
   re-earn survival on the new windows — that is what makes the
@@ -316,6 +342,29 @@ PnL), `discovery_llm_usage`.
 Synthetic end-to-end checks (planted signal found, look-ahead caught, noise
 promotes nothing, reproducibility): `uv run python tests/discovery_checks.py`.
 
+### From discovery to the portfolio walk-forward
+
+Promoted candidates flow into the production pipeline **automatically**
+(`research/lib/discovered.py`; toggle `signals.include_discovered`): every row
+of the promotions table(s) — including `_h<lag>` lag-sweep variants, deduped
+by program hash — becomes a `disc_<family>_<hash>` entry in the same registry
+as the curated spaces. So after a discovery run:
+
+```bash
+uv run python research/signals/evaluate.py           # scores disc_* (incremental)
+uv run python research/portfolio/walk_forward.py     # they enter selection + the backtest
+```
+
+and the walk-forward selects/trades them under exactly the same FDR, gates,
+costs and participation cap as everything else. One honesty rule
+(`walk_forward.respect_signal_valid_from`): each discovered signal is only
+selectable in windows whose training end is at or after its **promotion
+date** — its expression was chosen by a search that saw data up to that roll,
+so earlier windows would be trading a formula chosen with future knowledge.
+The discovery system's own stitched OOS curve remains the cleanest read on
+the search itself; the walk-forward answers whether the promoted book earns a
+slot in the production portfolio.
+
 
 ## Limitations
 
@@ -333,17 +382,21 @@ How far the backtested numbers should be trusted out of sample:
 - **Market data only.** Inputs are crypto prices plus market-cap, funding, and
   open-interest — no fundamentals, on-chain, order-book/L2, sentiment/news, or
   macro data. The entire edge is price-derived.
-- **Zero-fee maker execution is assumed.** `portfolio.cost_bps = 0` models
-  pure-maker execution at Hyperliquid's top volume tiers (verified: perp maker
-  fee is 0.000% at tier 4+, >$500M 14-day volume, plus maker rebates by maker
-  volume share; below that tier maker is 0.4–1.5 bps and taker 2.4–4.5 bps).
-  Perp funding on held positions is still accrued at settlement stamps
-  (Binance USDT-perp rates as a Hyperliquid proxy; longs pay positive rates).
-  The model does *not* price passive-fill risk (missed fills, adverse
-  selection), spread crossing, impact, or capacity, and assumes fills at
-  10-min bar stamps — the 1-bar-lag Sharpe is the closest stress for this.
-  Re-run with cost_bps 0.4–1.5 (lower-tier maker) or 2.4+ (taker) before
-  trusting any number at real size.
+- **Costs: conservative 5 bps/side + volume-participation cap.**
+  `portfolio.cost_bps = 5.0` is a deliberately conservative all-in per-side
+  assumption (for reference, Hyperliquid perp maker is 0.000% at tier 4+ and
+  0.4–1.5 bps below; taker 2.4–4.5 bps). Signals are scored NET of this cost
+  (selection amortizes it by the Garleanu-Pedersen fill factor so it prices
+  the turnover the executor actually trades), and the backtest additionally
+  enforces `portfolio.participation`: no name trades more than 10% of its
+  trailing 10-bar average $ volume per bar at the configured
+  `book_size_usd` — re-run at several book sizes for a capacity curve. Perp
+  funding on held positions is accrued at settlement stamps (Binance
+  USDT-perp rates as a Hyperliquid proxy; longs pay positive rates). The
+  model still does *not* price passive-fill risk (missed fills, adverse
+  selection) or nonlinear impact, and assumes fills at 10-min bar stamps —
+  the 1-bar-lag Sharpe is the closest stress for this. Set cost_bps to 0
+  to model pure top-tier maker execution.
 - **Single short sample / regime.** ~3 years of one asset class, no
   out-of-regime or crisis validation — and crypto regimes shift fast.
 - **Four-factor risk model.** Market, size, momentum and vol are hedged; other

@@ -366,9 +366,135 @@ if promoted:
 print(f"(end-to-end block: {time.perf_counter() - t0:,.1f}s)")
 
 # ---------------------------------------------------------------------------
+# 5b. Multi-lag search: each candidate is pinned (on TRAIN) to the horizon
+#     where its effect actually lives - fast effects to fast lags, slow
+#     effects to slow lags - in ONE search over the full lag grid.
+# ---------------------------------------------------------------------------
+print("--- 5b. multi-lag search pins candidates to their true horizon ---")
+CFG_ML = test_cfg()
+CFG_ML['horizon_lags_bars'] = [6, 36]
+CFG_ML['search_lags_bars'] = 'all'
+CFG_ML['search'] = {**CFG_ML['search'], 'n_generations': 0}  # seeds only
+
+
+def make_slow_panel(plant=0.01, seed=33, k=20):
+    """vol_noise (WHITE noise) predicts the residual k=20 bars ahead: zero
+    signal inside a 6-bar forward window, real signal inside a 36-bar one -
+    the cleanest fast/slow horizon separation (a persistent AR state would
+    echo into every horizon)."""
+    r = np.random.default_rng(seed)
+    n_bars = N_DAYS * BPD
+    ts = pd.date_range('2024-01-01', periods=n_bars, freq='10min')
+    frames = []
+    for i in range(N_SYM):
+        w = r.normal(size=n_bars)
+        res_ret = r.normal(0, 1e-2, n_bars)
+        res_ret[k:] += plant * w[:-k]
+        frames.append(pd.DataFrame({
+            'timestamp': ts, 'symbol': f'S{i:02d}',
+            'res_zscore': r.normal(size=n_bars),
+            'res_mom': r.normal(size=n_bars),
+            'vol_ratio': np.abs(r.normal(size=n_bars)) + 0.5,
+            'vol_noise': w,
+            'residual_return': res_ret,
+            'raw_return': res_ret,
+            'is_liquid': i < N_SYM // 2,
+        }))
+    panel = pd.concat(frames, ignore_index=True)
+    panel = panel.sort_values(['symbol', 'timestamp']).reset_index(drop=True)
+    return data_mod.attach_targets(panel, [6, 36])
+
+
+fast_seed = gen.Candidate(name='fast_probe', family='residual_shape',
+                          expression=('col', 'res_zscore'))
+slow_seed = gen.Candidate(name='slow_probe', family='volatility_regime',
+                          expression=('col', 'vol_noise'))
+
+fast_panel_ml = data_mod.attach_targets(make_panel(plant=0.002, seed=31), [36])
+led_fast = search_mod.DiscoveryLedger(None)
+pop_fast = search_mod.run_search(
+    fast_panel_ml, ROLL, family_cols,
+    gen.RandomProposer(dsl_cfg=CFG_ML['dsl'], mutation_prob=0.6),
+    led_fast, CFG_ML, seed_candidates=[fast_seed])
+e_fast = next(s for s in pop_fast if s['candidate'].hash == fast_seed.hash)
+check("multi-lag: fast planted effect pinned to the 6-bar lag",
+      e_fast['target_lag'] == 6,
+      f"(chose {e_fast['target_lag']}, t {e_fast['metrics_select']['ic_tstat']:.1f})")
+
+slow_panel_ml = make_slow_panel()
+led_slow = search_mod.DiscoveryLedger(None)
+pop_slow = search_mod.run_search(
+    slow_panel_ml, ROLL, family_cols,
+    gen.RandomProposer(dsl_cfg=CFG_ML['dsl'], mutation_prob=0.6),
+    led_slow, CFG_ML, seed_candidates=[slow_seed])
+e_slow = next(s for s in pop_slow if s['candidate'].hash == slow_seed.hash)
+check("multi-lag: slow planted effect pinned to the 36-bar lag",
+      e_slow['target_lag'] == 36,
+      f"(chose {e_slow['target_lag']}, t {e_slow['metrics_select']['ic_tstat']:.1f})")
+check("multi-lag: slow effect is real at its lag",
+      e_slow['metrics_select']['ic_tstat'] > 2,
+      f"(select t {e_slow['metrics_select']['ic_tstat']:.1f})")
+check("multi-lag: ledger records the chosen lag",
+      set(led_fast.to_frame()['target_lag']) == {6}
+      and set(led_slow.to_frame()['target_lag']) == {36})
+
+# ---------------------------------------------------------------------------
+# 5c. ML probe robustness: degenerate feature columns (all-NaN / constant in
+#     the training slice, e.g. futures columns before their data starts) must
+#     be dropped, not crash sklearn's binner ("window shape cannot be larger
+#     than input array shape").
+# ---------------------------------------------------------------------------
+print("--- 5c. ml probe on degenerate columns ---")
+probe_panel = fast_panel_ml.copy()
+probe_panel['dead_all_nan'] = np.nan
+probe_panel['dead_constant'] = 1.0
+probe_cols = ['res_zscore', 'res_mom', 'vol_ratio', 'vol_noise',
+              'dead_all_nan', 'dead_constant']
+try:
+    probe = search_mod.run_ml_probe(probe_panel, ROLL, probe_cols, CFG_ML)
+    m6 = probe['metrics_by_lag'].get(6, {})
+    check("ml probe: survives all-NaN + constant columns",
+          np.isfinite(m6.get('ic_mean', np.nan)),
+          f"(ic {m6.get('ic_mean', float('nan')):.4f})")
+    check("ml probe: one metrics entry per search lag",
+          set(probe['metrics_by_lag']) == {6, 36})
+    check("ml probe: planted effect visible in the ceiling",
+          m6.get('ic_tstat', 0.0) > 2, f"(t {m6.get('ic_tstat', 0.0):.1f})")
+except Exception as e:
+    check("ml probe: survives all-NaN + constant columns", False, f"({e})")
+
+# ---------------------------------------------------------------------------
 # 6. Proposer providers + cost tracking (no API calls: clients are lazy)
 # ---------------------------------------------------------------------------
 print("--- 6. providers + cost tracking ---")
+
+
+class _BrokenSDKProposer(gen.GeminiProposer):
+    """Simulates a missing SDK: _complete raises ImportError."""
+    def __init__(self):
+        pass
+    provider = 'gemini'
+    llm_cfg = {'candidates_per_call': 8}
+    usage = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0}
+
+    def _prompt(self, *args, **kwargs):
+        return 'x'
+
+    def _complete(self, prompt):
+        raise ImportError("cannot import name 'genai' from 'google'")
+
+
+try:
+    _BrokenSDKProposer().propose(4, 'residual_shape', {}, [], {}, rng)
+    check("providers: missing SDK aborts the run (fail fast)", False,
+          "(no exception raised)")
+except SystemExit as e:
+    check("providers: missing SDK aborts the run (fail fast)",
+          'uv add google-genai' in str(e), f"({e})")
+except Exception as e:
+    check("providers: missing SDK aborts the run (fail fast)", False,
+          f"(wrong exception: {type(e).__name__}: {e})")
+
 check("providers: 'random' -> RandomProposer",
       isinstance(gen.make_proposer('random'), gen.RandomProposer))
 check("providers: explicit 'gemini' -> GeminiProposer",

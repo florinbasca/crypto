@@ -708,6 +708,16 @@ class _ApiProposer(Proposer):
             items = _parse_json_array(text)
         except RuntimeError:
             raise   # missing/invalid .env key - fail fast, not N empty batches
+        except ImportError as e:
+            # Missing SDK is a broken environment, not a transient API hiccup:
+            # abort instead of degrading to an all-empty search (128 empty
+            # batches per roll, zero candidates, zero cost - looks like a run,
+            # finds nothing by construction).
+            raise SystemExit(
+                f"{self.provider} proposer cannot import its SDK ({e}). "
+                f"Install it ('uv add google-genai' for gemini, "
+                f"'uv add anthropic' for anthropic) or run with "
+                f"--proposer random.") from e
         except Exception as e:
             snippet = text[:200].replace('\n', ' ') if text else '(no text)'
             logging.warning(f"{self.provider} proposer failed ({e}); "

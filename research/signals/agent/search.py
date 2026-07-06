@@ -15,9 +15,13 @@ loop that decides what gets tried next.
   surface, the dedup index, the honest trial count behind the deflation
   haircut, and the memory behind the N-consecutive-rolls persistence gate.
 - run_search(): the per-roll evolutionary loop with a UCB bandit over
-  candidate families. Traded sign is fixed on TRAIN (never SELECT).
+  candidate families. MULTI-LAG: each candidate is evaluated at every lag in
+  discovery.search_lags_bars on TRAIN and pinned to its strongest one there;
+  traded sign AND lag are fixed on TRAIN (never SELECT), so the lag search
+  adds no select-window multiplicity.
 - run_ml_probe(): gradient-boosting ceiling estimator on ALL resolved
-  primitives - how much predictability does the feature set contain at all?
+  primitives, per search lag - where (if anywhere) does the feature set
+  contain predictability at all?
 """
 
 import logging
@@ -225,7 +229,8 @@ class DiscoveryLedger:
 
     def record(self, roll_id: int, generation: int, cand: Candidate,
                direction: int, train_metrics: dict, select_metrics: dict,
-               reward: float, terms: dict) -> None:
+               reward: float, terms: dict,
+               target_lag: Optional[int] = None) -> None:
         row = {
             'roll_id': int(roll_id),
             'generation': int(generation),
@@ -234,6 +239,7 @@ class DiscoveryLedger:
             'family': cand.family,
             'candidate_json': cand.to_json(),
             'direction': int(direction),
+            'target_lag': int(target_lag) if target_lag is not None else -1,
             'reward': float(reward),
             'survivor': False,
             'promoted': False,
@@ -368,8 +374,14 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     cfg = cfg or get('discovery', {})
     search_cfg = cfg['search']
     rng = np.random.default_rng(int(search_cfg['seed']) + roll.roll_id)
-    lag = int(cfg['target_lag_bars'])
-    tcol = target_col(lag)
+    # Multi-lag search: every candidate is evaluated at EVERY search lag on
+    # TRAIN and pinned to the strongest one (|IC t-stat|), so one run finds
+    # signals wherever on the speed spectrum they live. target_lag_bars stays
+    # the reference lag for the proposer diagnostics only.
+    from research.signals.agent.data import resolve_search_lags
+    search_lags = resolve_search_lags(cfg)
+    diag_lag = int(cfg['target_lag_bars'])
+    diag_tcol = target_col(diag_lag)
     min_assets = int(cfg['min_assets_per_timestamp'])
     cost_bps = cfg['backtest']['cost_bps']
     if cost_bps is None:
@@ -385,7 +397,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     from research.signals.agent.data import (all_family_columns,
                                              build_diagnostics)
     allowed_cols = all_family_columns(family_columns)
-    diagnostics = build_diagnostics(train, family_columns, tcol, lag, cfg)
+    diagnostics = build_diagnostics(train, family_columns, diag_tcol,
+                                    diag_lag, cfg)
 
     families = [f for f, cols in family_columns.items() if cols]
     bandit = {f: {'n': 0, 'sum': 0.0} for f in families}
@@ -406,7 +419,18 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         if sig.empty:
             return
 
-        m_train = evaluate_window(sig, train, tcol, lag, min_assets, cost_bps)
+        # Best lag chosen on TRAIN only (strongest |IC t-stat| across the
+        # search grid); SELECT is then scored ONCE, at that lag - the lag
+        # search adds no select-window multiplicity (the FDR/deflation gates
+        # keep operating on one select t-stat per candidate).
+        m_by_lag = {
+            lag_i: evaluate_window(sig, train, target_col(lag_i), lag_i,
+                                   min_assets, cost_bps)
+            for lag_i in search_lags
+        }
+        lag = max(m_by_lag, key=lambda l: abs(m_by_lag[l]['ic_tstat']))
+        m_train = m_by_lag[lag]
+        tcol = target_col(lag)
         # Traded sign is fixed on TRAIN, never on SELECT.
         direction = 1 if m_train['ic_mean'] >= 0 else -1
         if direction < 0:
@@ -422,12 +446,13 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         rwd, terms = compute_reward(m_train, m_select, cand,
                                     similarity, cfg['reward'])
         ledger.record(roll.roll_id, gen, cand, direction,
-                      m_train, m_select, rwd, terms)
+                      m_train, m_select, rwd, terms, target_lag=lag)
         if cand.family in bandit:
             bandit[cand.family]['n'] += 1
             bandit[cand.family]['sum'] += rwd
         population.append({
             'candidate': cand, 'direction': direction,
+            'target_lag': int(lag),
             'reward': rwd, 'metrics_train': m_train,
             'metrics_select': m_select,
             'signal_select': sig_select.reset_index(drop=True),
@@ -461,6 +486,11 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                      f"best reward "
                      f"{max((s['reward'] for s in population), default=0):.3f}")
 
+    lag_mix: Dict[int, int] = {}
+    for s in population:
+        lag_mix[s['target_lag']] = lag_mix.get(s['target_lag'], 0) + 1
+    logging.info(f"roll {roll.roll_id}: survivor lag mix "
+                 f"{dict(sorted(lag_mix.items()))} (bars)")
     ledger.mark_survivors(roll.roll_id,
                           [s['candidate'].hash for s in population])
     return population
@@ -473,45 +503,69 @@ def run_search(panel: pd.DataFrame, roll: Roll,
 def run_ml_probe(panel: pd.DataFrame, roll: Roll, feature_cols: List[str],
                  cfg: Optional[dict] = None) -> dict:
     """Gradient boosting on ALL resolved primitives, fit on TRAIN, scored on
-    SELECT: the predictability ceiling of the feature set. If this finds
-    nothing, the DSL search is digging in barren ground."""
+    SELECT, at EVERY search lag: the predictability ceiling of the feature
+    set per horizon. If a lag's ceiling is ~0, the DSL search is digging in
+    barren ground at that speed - this is the cheap map of where (if
+    anywhere) alpha lives before the search spends its budget."""
     from sklearn.ensemble import HistGradientBoostingRegressor
+    from research.signals.agent.data import resolve_search_lags
 
     cfg = cfg or get('discovery', {})
     ml_cfg = cfg['ml_probe']
-    lag = int(cfg['target_lag_bars'])
-    tcol = target_col(lag)
     pb = purge_bars(cfg)
 
     roll_panel = slice_window(panel, roll.train_start, roll.oos_start, 0)
     train = slice_window(roll_panel, roll.train_start, roll.select_start, pb)
     select = slice_window(roll_panel, roll.select_start, roll.oos_start, pb)
-
     cols = [c for c in feature_cols if c in train.columns]
-    tr = train.dropna(subset=[tcol])
-    tr = tr[tr[cols].notna().any(axis=1)]
-    cap = int(ml_cfg['subsample_rows'])
-    if len(tr) > cap:
-        tr = tr.sort_values('timestamp').tail(cap)   # recent-biased
-    if tr.empty:
-        return {'metrics': empty_metrics(), 'model': None}
 
-    model = HistGradientBoostingRegressor(
-        max_iter=int(ml_cfg['max_iter']),
-        max_depth=int(ml_cfg['max_depth']),
-        learning_rate=float(ml_cfg['learning_rate']),
-        min_samples_leaf=int(ml_cfg['min_samples_leaf']),
-        l2_regularization=float(ml_cfg['l2_regularization']),
-        random_state=int(cfg['search']['seed']),
-    )
-    model.fit(tr[cols].values, tr[tcol].values)
+    metrics_by_lag: Dict[int, dict] = {}
+    n_train_rows = 0
+    degenerate_logged = False
+    for lag in resolve_search_lags(cfg):
+        tcol = target_col(lag)
+        tr = train.dropna(subset=[tcol])
+        tr = tr[tr[cols].notna().any(axis=1)]
+        cap = int(ml_cfg['subsample_rows'])
+        if len(tr) > cap:
+            tr = tr.sort_values('timestamp').tail(cap)   # recent-biased
+        if tr.empty:
+            metrics_by_lag[lag] = empty_metrics()
+            continue
+        n_train_rows = max(n_train_rows, len(tr))
 
-    sel = select[select[cols].notna().any(axis=1)]
-    sig = sel[['timestamp', 'symbol']].copy()
-    sig['signal'] = model.predict(sel[cols].values)
-    g = sig.groupby('timestamp')['signal']
-    sig['signal'] = ((sig['signal'] - g.transform('mean'))
-                     / (g.transform('std') + 1e-10)).clip(-3, 3)
+        # HistGradientBoosting's binner crashes on columns with < 2 distinct
+        # non-NaN values (all-NaN or constant in this training slice - e.g.
+        # futures columns before their data starts). Drop them per window;
+        # they carry no information for the fit anyway.
+        nun = tr[cols].nunique(dropna=True)
+        use_cols = [c for c in cols if nun.get(c, 0) >= 2]
+        if not use_cols:
+            metrics_by_lag[lag] = empty_metrics()
+            continue
+        if len(use_cols) < len(cols) and not degenerate_logged:
+            dropped = sorted(set(cols) - set(use_cols))
+            logging.info(f"ml probe: dropped {len(dropped)} degenerate "
+                         f"columns (all-NaN/constant in train): {dropped}")
+            degenerate_logged = True
 
-    metrics = evaluate_window(sig.dropna(subset=['signal']), select, tcol, lag)
-    return {'metrics': metrics, 'model': model, 'n_train_rows': len(tr)}
+        model = HistGradientBoostingRegressor(
+            max_iter=int(ml_cfg['max_iter']),
+            max_depth=int(ml_cfg['max_depth']),
+            learning_rate=float(ml_cfg['learning_rate']),
+            min_samples_leaf=int(ml_cfg['min_samples_leaf']),
+            l2_regularization=float(ml_cfg['l2_regularization']),
+            random_state=int(cfg['search']['seed']),
+        )
+        model.fit(tr[use_cols].values, tr[tcol].values)
+
+        sel = select[select[use_cols].notna().any(axis=1)]
+        sig = sel[['timestamp', 'symbol']].copy()
+        sig['signal'] = model.predict(sel[use_cols].values)
+        g = sig.groupby('timestamp')['signal']
+        sig['signal'] = ((sig['signal'] - g.transform('mean'))
+                         / (g.transform('std') + 1e-10)).clip(-3, 3)
+        metrics_by_lag[lag] = evaluate_window(
+            sig.dropna(subset=['signal']), select, tcol, lag)
+
+    return {'metrics_by_lag': metrics_by_lag, 'n_train_rows': n_train_rows}

@@ -19,7 +19,13 @@ baseline / control experiment; --no-fresh keeps existing tables.
 Usage:
     python research/signals/agent/run_discovery.py
         [--proposer random|llm|anthropic|gemini] [--max-rolls N]
-        [--ml-probe] [--no-fresh] [--no-save]
+        [--ml-probe] [--no-fresh] [--no-save] [--target-lag BARS]
+
+The search is MULTI-LAG by default: every candidate is evaluated at every lag
+in discovery.search_lags_bars ('all' -> the horizon_lags_bars grid) on TRAIN
+and pinned to its strongest horizon there, so one run finds signals wherever
+on the speed spectrum they live. --target-lag restricts to a single lag
+(writes to _h<lag>-suffixed tables) for focused runs.
 """
 
 import sys
@@ -82,9 +88,33 @@ def main():
                              'fresh start: tables cleared before running)')
     parser.add_argument('--no-save', action='store_true',
                         help='Do not persist ledger/promotions/returns')
+    parser.add_argument('--target-lag', type=int, default=0,
+                        help='RESTRICT the search to one lag (must be in '
+                             'discovery.horizon_lags_bars); output tables get '
+                             'a _h<lag> suffix. Default 0 = multi-lag: every '
+                             'candidate is scored at every lag in '
+                             'discovery.search_lags_bars and pinned to its '
+                             'strongest one on TRAIN - one run searches the '
+                             'whole speed spectrum.')
     args = parser.parse_args()
 
     cfg = get('discovery')
+    if args.target_lag:
+        allowed = [int(x) for x in cfg['horizon_lags_bars']]
+        if args.target_lag not in allowed:
+            raise SystemExit(
+                f"--target-lag {args.target_lag} is not in "
+                f"discovery.horizon_lags_bars {allowed}: the panel only "
+                "builds forward targets for those lags (add it there first)")
+        # Shallow copy: this run scores at the override lag only and writes
+        # to suffixed tables; the global config object stays untouched.
+        cfg = {**cfg,
+               'search_lags_bars': [int(args.target_lag)],
+               'target_lag_bars': int(args.target_lag),
+               'tables': {k: f"{v}_h{args.target_lag}"
+                          for k, v in cfg['tables'].items()}}
+        print(f"Target-lag override: search restricted to {args.target_lag} "
+              f"bars, tables suffixed _h{args.target_lag}")
     tables = cfg['tables']
     save = not args.no_save
     fresh = not args.no_fresh
@@ -132,9 +162,10 @@ def main():
 
         if args.ml_probe:
             probe = search_mod.run_ml_probe(panel, roll, feature_cols, cfg)
-            m = probe['metrics']
-            print(f"ML ceiling: IC {m['ic_mean']:.4f} "
-                  f"(t={m['ic_tstat']:.2f}, net Sharpe {m['net_sharpe']:.2f})")
+            for lag_i, m in sorted(probe['metrics_by_lag'].items()):
+                print(f"ML ceiling @ {lag_i:>3d} bars: IC {m['ic_mean']:.4f} "
+                      f"(t={m['ic_tstat']:.2f}, "
+                      f"net Sharpe {m['net_sharpe']:.2f})")
 
         if not seeds and roll.roll_id > 0:
             # resumed/partial runs: recover the previous roll's survivors
@@ -186,12 +217,15 @@ def main():
             promo_rows.append({
                 'roll_id': roll.roll_id, 'cand_hash': c.hash, 'name': c.name,
                 'family': c.family, 'direction': p['direction'],
+                'target_lag': int(p.get('target_lag', 0) or 0),
                 'candidate_json': c.to_json(),
                 'select_ic_tstat': p['metrics_select']['ic_tstat'],
                 'reward': p['reward'],
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
             })
-            print(f"  + {c.name} ({c.family}) t={p['metrics_select']['ic_tstat']:.2f}")
+            print(f"  + {c.name} ({c.family}) "
+                  f"t={p['metrics_select']['ic_tstat']:.2f} "
+                  f"@ {p.get('target_lag', '?')} bars")
 
         result = bt.backtest_oos(panel, roll, book, cfg)
         result['roll_id'] = roll.roll_id

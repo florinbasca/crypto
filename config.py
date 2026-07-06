@@ -297,6 +297,32 @@ config = {
             'supply_inflation_days': 30,            # mcap growth minus price return
         },
 
+        # Per-symbol seasonality (sn_): trailing same-bucket RESIDUAL stats.
+        # Unlike the tm_ sin/cos encodings (cross-sectionally constant), these
+        # differ per name - each symbol's own time-of-day / day-of-week
+        # residual profile - so they work as direct cross-sectional signals.
+        # Slow by construction (profiles move over days/weeks), which is the
+        # kind of alpha that survives realistic costs.
+        'seasonality': {
+            'tod_days': 20,                         # trailing days per hour-of-day bucket
+            'min_days': 5,                          # min same-bucket days before non-NaN
+            'dow_weeks': 8,                         # trailing same-weekday days (1/week)
+            'dow_min_weeks': 2,                     # min same-weekday days before non-NaN
+        },
+
+        # Leader lead-lag (ll_): slow catch-up gaps vs a single leader asset
+        # (BTC), complementing mk_* which uses the EW market factor at a 30min
+        # window. ll_leader_gap_{w}b = rolling-beta-scaled leader move over w
+        # bars minus own move - the share of the leader's multi-hour move this
+        # name has NOT yet matched. The leader symbol itself gets NaN.
+        'lead_lag': {
+            'leader_symbol': 'BTC',
+            'gap_windows_bars': [36, 144],          # 6h and 1d catch-up gaps
+            'beta_window_bars': 1008,               # 7d rolling beta to the leader
+            'lag_corr_window_bars': 1008,           # 7d corr with the LAGGED leader move
+            'lag_bars': 6,                          # leader lead measured at 1h
+        },
+
         # Cross-sectional (panel) features computed in the main process
         'cross_section': {
             'rel_volume_window': 144,
@@ -355,6 +381,13 @@ config = {
     'signals': {
         'spaces': {'smoothing_halflife': 3},        # light EWM on each space's raw value
         'smoothing_halflife': 3,
+        # Bridge promoted discovery candidates into the signal registry as
+        # disc_* entries (research/lib/discovered.py): after run_discovery,
+        # evaluate.py scores them and walk_forward.py selects/trades them
+        # alongside the curated spaces - no manual translation. Each carries
+        # valid_from = its promotion date (see
+        # walk_forward.respect_signal_valid_from). False = curated spaces only.
+        'include_discovered': True,
         # Per-lag smoothing: a signal scored at forward lag L is smoothed at
         # the halflife of the smallest bucket with max_lag >= L (list of
         # [max_lag, halflife] in bars; lags beyond the last bound use the last
@@ -397,9 +430,21 @@ config = {
         # bars of TRAIN before SELECT and of SELECT before OOS so no forward
         # target leaks across a boundary.
         'embargo_bars': 12,
-        # Forward residual-return target lags (bars at base_frequency).
-        # target_lag_bars is the primary lag the reward is computed on.
-        'horizon_lags_bars': [6, 36, 144],
+        # Forward residual-return target lags (bars at base_frequency): the
+        # grid the panel builds targets for AND the default search space.
+        'horizon_lags_bars': [6, 36, 72, 144],
+        # Lags the search scores candidates at. 'all' (default) = the full
+        # horizon_lags_bars grid: each candidate is evaluated at every lag on
+        # TRAIN and pinned to its strongest one - the search is NOT
+        # constrained to a single speed; fast reversal and slow carry
+        # candidates are found in the same run. The lag choice happens on
+        # TRAIN only (SELECT is scored once, at the chosen lag), so it adds
+        # no select-window multiplicity to the FDR/deflation gates. An
+        # explicit sublist restricts the search (run_discovery --target-lag N
+        # is the CLI shorthand for [N]).
+        'search_lags_bars': 'all',
+        # Reference lag for the proposer's compressed diagnostics (the
+        # per-feature IC view the LLM sees) - NOT a constraint on scoring.
         'target_lag_bars': 36,
         'min_assets_per_timestamp': 10,
         'liquidity_window_bars': 144,    # trailing $vol window for the liquid-half flag
@@ -413,6 +458,11 @@ config = {
             'derivatives':       ['fr_', 'oi_', 'pos_'],
             'cross_sectional':   ['cs_'],
             'factor_context':    ['fl_', 'mk_'],
+            # Slow-alpha families added for the 5bps cost regime: per-symbol
+            # seasonality profiles and leader (BTC) catch-up gaps. Both move
+            # over hours-to-weeks, exactly the speed that survives costs.
+            'seasonality':       ['sn_'],
+            'lead_lag':          ['ll_'],
         },
         'max_features_per_family': 12,   # cap resolved columns per family
         # DSL bounds (hypothesis space)
@@ -425,13 +475,18 @@ config = {
         # Evolutionary search (per roll). Budget = n_generations * batch_size.
         'search': {
             'seed': 7,
-            'n_generations': 8,
-            'batch_size': 16,
+            'n_generations': 16,
+            'batch_size': 32,
             'survivors': 12,                 # population carried between generations
             'mutation_prob': 0.6,            # mutate a parent vs sample fresh
             'diversity_max_corr': 0.8,       # survivor de-correlation ceiling
             'bandit_ucb_c': 1.0,             # family-bandit exploration constant
         },
+        # Search budget note: 16 gens x 32 batch ~ 500 trials/roll (the
+        # "expanded" regime; was 8 x 16 ~ 128). The deflation haircut in
+        # promotion scales with sqrt(2 ln n_trials) from the ledger, so a
+        # bigger search honestly raises the promotion bar rather than
+        # overfitting the select window.
         # Reward = sum_k weight_k * term_k / scale_k, SELECT window only.
         # Scales are FIXED constants (not batch-relative) so rewards are
         # comparable across generations, rolls and resumed runs.
@@ -558,6 +613,15 @@ config = {
         # 'rolling': legacy fixed 6-month lookback stepping forward monthly.
         'train_window': 'expanding',
 
+        # Honor per-signal valid_from dates in selection: a discovered
+        # (disc_*) signal's expression was chosen by a search that saw data up
+        # to its promotion roll, so it is only selectable in windows whose
+        # training end is at or after that date - earlier windows would trade
+        # a formula chosen with future knowledge. Curated spaces have no
+        # valid_from and are unaffected. False = select from full history
+        # (in-sample-ish for disc_* signals; useful only as an upper bound).
+        'respect_signal_valid_from': True,
+
         # Survivorship sensitivity gate: exclude names whose FIRST data bar is
         # within this many days of the test day. The universe is conditioned on
         # today's HL listing (historical listing dates are unavailable), and
@@ -584,24 +648,61 @@ config = {
         # set's IR proxy (mean OOS IC x sqrt(breadth)): it lifts OOS IC
         # 0.013 -> 0.014 (86% sign-correct) while keeping ~43 signals. Higher
         # floors raise per-signal IC but breadth collapses (0.03 -> ~7 signals).
+        # NOTE: that sweep ran at zero cost; see the override below.
         'min_ic': 0.01,
+        # Economics override on the IC floor (walk_forward.ic_gate): a signal
+        # whose training-window net Sharpe (after amortized costs, traded
+        # direction) is at least this value passes the IC gate regardless of
+        # |IC| magnitude. Measured at 5bps, the only net-viable sleeve
+        # (funding/positioning carry: |ic0| ~0.003-0.005, turnover
+        # 0.04-0.13/rebalance, training sharpe_net +0.8..+1.2, IC t-stats
+        # 4-5) was being vetoed by the 0.01 strength floor while cost-dead
+        # high-IC reversal signals passed it. IC is a proxy for economic
+        # relevance; sharpe_net measures it directly - when they disagree and
+        # net is strong, net wins. FDR and the stability/recent-third/
+        # turnover/gross-Sharpe gates still apply. None = strict IC floor.
+        'min_ic_net_sharpe_override': 0.5,
         'min_icir': 0.02,
         # Annualized Sharpe of the signal's own GROSS daily returns - the
         # standalone track-record floor a signal must clear to be selected.
         'min_sharpe_threshold': 0.3,
         # Cost-aware economic floor: annualized Sharpe of the signal's own daily
-        # returns AFTER paying portfolio.cost_bps/side on its rebalance turnover,
-        # traded in its selected direction. Gross IC/Sharpe ignore costs, so a
-        # high-gross-IC short-horizon signal whose few-bp edge cannot clear a
-        # round trip was being selected and then losing money in the book (the
-        # 22-window run showed standalone net edge negative across every bucket
-        # while gross looked like a +2 Sharpe). 0.0 = require net break-even;
-        # None = disable (revert to gross-only selection).
+        # returns AFTER paying the (amortized - see selection_cost_amortization)
+        # per-side cost on its rebalance turnover, traded in its selected
+        # direction. Gross IC/Sharpe ignore costs, so a high-gross-IC
+        # short-horizon signal whose few-bp edge cannot clear a round trip was
+        # being selected and then losing money in the book. 0.0 = require net
+        # break-even. (History: at 5bps this gate was briefly loosened to -1.0
+        # to restore breadth when the IC floor had no economics override; the
+        # 28-window attribution then showed the signals admitted in the
+        # (-1, 0) band had ~zero OOS IC and diluted the one working sleeve -
+        # beta_size_drift_short: 13 windows, train IC 0.005 -> OOS 0.000.
+        # With min_ic_net_sharpe_override as the principled entry path for
+        # strong-economics signals, the loose band only admits the OOS-dead
+        # middle, so the gate is back at break-even.) sharpe_net also drives
+        # candidate ranking. None = disable (revert to gross-only selection).
         'min_net_sharpe_threshold': 0.0,
+        # Amortize the per-side cost charged to a signal's own turnover in
+        # selection (sharpe_net / net_ret_mean) by the Garleanu-Pedersen fill
+        # factor h/(h + 1/kappa) at the signal's holding lag h - the SAME
+        # factor that discounts the alpha side in the backtest. The screening
+        # backtest re-optimizes stamp by stamp; the real book fills toward the
+        # aim at the effective rate kappa and never executes that full aim
+        # turnover within one holding period. Charging the unamortized cost
+        # priced signals well above realized trading (realized book turnover
+        # ran ~an order of magnitude below standalone replication). Only
+        # active while portfolio.gp_trading models an aim fill (mirrors
+        # ic_scale). False = charge the full standalone-replication cost.
+        'selection_cost_amortization': True,
         'max_correlation_threshold': 0.50,
         'max_signal_turnover': 1.0,      # Max avg turnover per rebalance cycle
         # Minimum holding lag (bars) a signal may be selected at - the speed
         # match between signal decay and how fast the book actually trades.
+        # The floor is compared against each signal's TURNOVER-IMPLIED
+        # persistence (scoring lag / per-rebalance turnover, see
+        # portfolio.cost_holding), not the raw lag: a carry signal scored at
+        # 6 bars with turnover 0.04 reshuffles over ~150 bars and IS fillable
+        # by a slow book.
         # 'auto' (default) DERIVES the floor from the execution layer: the
         # backtest discounts each bucket's alpha by h/(h + 1/kappa) at the
         # effective fill rate kappa (GP trade rate capped by the
@@ -658,6 +759,19 @@ config = {
         'signal_combination': {
             'enabled': True,
             'corr_shrink': 0.5,
+            # Strength vector for w ~ C^-1 . strength:
+            #  'net_sharpe' (default) - each signal's training NET Sharpe
+            #    (after amortized costs, traded direction), clipped at 0:
+            #    weight by measured after-cost value.
+            #  'ic' - legacy |training IC| (Grinold's gross-IR optimum).
+            # |IC| is per-stamp correctness with NO cost content: it weighted
+            # churny co-signals (IC 0.01, net ~0) 2.5x over the OOS-proven
+            # funding sleeve (IC 0.004, net ~+1), keeping the composite aim
+            # jittery (turnover budget pinned on 89% of bars, -8.6%/yr costs)
+            # and overriding the sleeve's funding tilt (paying -1.7%/yr
+            # funding instead of collecting). A sleeve-weighted aim barely
+            # moves, so costs also fall without touching the budget.
+            'basis': 'net_sharpe',
         },
 
         # Standardized composite ranking of candidate signals
@@ -678,26 +792,30 @@ config = {
 
     # Portfolio construction: shrunk-covariance MVO, market-neutral
     'portfolio': {
-        # Production position sizing. 'equal_weight' = covariance-free rank book
-        # (dollar/factor-neutral, per-name capped, gross-1); 'mvo' = Ledoit-Wolf
-        # shrunk-covariance MVO. The walk-forward EW-vs-MVO comparison found the
-        # LW covariance weighting net-destructive on this low-breadth,
-        # negatively-skewed (residual_reversion-heavy) book - rank sizing matched
-        # the alpha's ordering without concentrating risk on its bad tails - so
-        # rank sizing is the default. See research/portfolio/walk_forward.py.
-        'weight_scheme': 'equal_weight',
+        # Production position sizing. 'mvo' = Ledoit-Wolf shrunk-covariance
+        # MVO; 'equal_weight' = covariance-free rank book. History: rank
+        # sizing was production after a zero-cost 22-window test measured MVO
+        # net-destructive (-1.23 vs +0.11) on the old broad fast book. Under
+        # the 5bps regime the foil comparison FLIPPED (MVO -1.90 vs rank
+        # -3.14 on identical alpha/selection), so MVO is production again and
+        # rank sizing runs as the foil.
+        'weight_scheme': 'mvo',
         # Foil sizing scheme run alongside the production book each window for
-        # monitoring (persisted to wf_portfolio_returns_bench). '' disables it.
-        # Off by default: the EW-vs-MVO question is ANSWERED on this book (MVO
-        # net Sharpe -1.23 vs +0.11 on identical alpha, 22-window run) - the
-        # foil pass only doubled backtest runtime to re-answer it. Set to 'mvo'
-        # to re-run the comparison after material risk-model changes.
-        'benchmark_scheme': '',
+        # monitoring (persisted to wf_portfolio_returns_bench). '' disables it
+        # (the foil pass roughly doubles backtest runtime).
+        'benchmark_scheme': 'equal_weight',
         'cov_window_days': 30,               # Trailing window for residual covariance
         'cov_min_observations': 1008,        # Min bars (7d) for a valid covariance
         'shrinkage': 'ledoit_wolf',          # 'ledoit_wolf' or float in [0,1] (mvo only)
         'gross_leverage': 1.0,               # Sum |w| target
-        'max_position': 0.05,                # Per-name cap (fraction of gross)
+        # Per-name cap (fraction of gross). At 0.50 the book may concentrate
+        # in as few as 2 names; the neutrality constraints and the
+        # volume-participation cap are then the effective diversification /
+        # capacity limits. (Was 0.05, which forced >=20 nonzero positions -
+        # with the no-trade band zeroing most names' alpha at realistic
+        # costs, that spread gross onto weak-alpha names just to satisfy the
+        # cap.)
+        'max_position': 0.50,
         'neutrality': ['dollar', 'market', 'size', 'momentum', 'vol'],  # Constrained exposures B'w
         # Neutrality BANDS: each exposure is held within +/- band rather than at
         # exactly zero. Bands give the optimizer slack to retain alpha and cut
@@ -712,13 +830,20 @@ config = {
             'vol':      0.10,
         },
         'weight_smoothing_halflife': 6,      # legacy fixed EWM rate (fallback only)
-        # HARD turnover budget (x gross per year); None -> uncapped. With
-        # cost_bps = 0 (top-tier maker execution) there is no fee rationale for
-        # a budget, and the measured alpha decays within hours - throttling the
-        # fill to days destroyed transmission (the 100x/yr run deployed only
-        # ~0.58 gross and had cost/alpha > 1 in most windows). Set a number to
-        # model capacity- or operationally-constrained execution.
-        'max_annual_turnover': None,
+        # HARD turnover budget (x gross per year); None -> uncapped. At 5bps
+        # the uncapped book churned ~490x/yr and paid 39.6%/yr of costs
+        # against +3.9%/yr gross - the budget is what makes deployment and
+        # trading speed consistent. 100 was chosen from the auto-floor
+        # coupling, NOT from cost arithmetic alone: kappa = budget/(bars/yr),
+        # and the selection speed floor is f/(1-f)/kappa bars of
+        # turnover-implied persistence (min_holding_lag_bars 'auto',
+        # min_monetizable_alpha_fraction 0.15). At 100x/yr the floor is ~93
+        # bars - it admits the OOS-proven funding sleeve (persistence
+        # ~120-200 bars) while excluding churny signals; at 25x/yr the floor
+        # is ~370 bars and excludes EVERYTHING including the sleeve (a
+        # guaranteed-empty book). Worst-case cost at full budget ~8%/yr; the
+        # budget only binds when the aim actually moves.
+        'max_annual_turnover': 100,
         # Garleanu-Pedersen multi-period trading toward the gross-1 aim. Two pieces:
         # 1) TRADE RATE (per bar): the myopic optimal gamma/(gamma+lambda) balance
         #    of off-aim penalty vs quadratic trade cost, made COST-RESPONSIVE:
@@ -731,7 +856,10 @@ config = {
         #    downweighted; slow / persistent alpha is overweighted.
         'gp_trading': {
             'enabled': True,
-            'trade_urgency': 0.8,          # gamma/lambda; LOW = slow trading, low turnover
+            # 0.05 -> ~4.8%/bar fill (was 0.8 -> 44%/bar, tuned for the old
+            # fast book): the book now builds positions over hours, matching
+            # the slow-carry economics the cost/deployment layers price.
+            'trade_urgency': 0.05,         # gamma/lambda; LOW = slow trading, low turnover
             'ref_cost_bps': 5.0,             # cost at which trade_urgency is calibrated
             # Discount the aim at the rate the book ACTUALLY fills (capped by the
             # turnover budget), not the nominal trade rate. Keeps the aim from
@@ -750,16 +878,20 @@ config = {
             'corr_threshold': 0.30,          # Merge names with residual corr above this
             'min_cluster_size': 3,           # Smaller groups are not penalized
         },
-        # Costs: per-side bps applied to turnover. Set to 0.0 = pure-maker
-        # execution at Hyperliquid's top volume tiers (verified 2026-07 against
-        # the official fee docs: perp maker fee is 0.000% at tier 4+, >$500M
-        # 14-day volume, with separate maker REBATES of -0.1..-0.3bp by maker
-        # volume share; below tier 4 maker is 0.4-1.5bp and taker never drops
-        # below 2.4bp). This models fees only - passive fills still carry
-        # adverse-selection/miss risk that no bps number captures; the
-        # implementation-lag stress is the closest proxy. Raise this to test
-        # lower-tier maker (0.4-1.5) or taker (2.4-4.5) execution.
-        'cost_bps': 0.0,
+        # Costs: per-side bps applied to turnover. 5.0 is a deliberately
+        # conservative all-in assumption (fees + spread/adverse selection):
+        # signals are scored NET of this cost (evaluate.py net metrics, the
+        # selector's sharpe_net gate/ranking, the discovery reward's
+        # net_sharpe term all key off it) and the walk-forward backtest pays
+        # it on every unit of turnover. For reference, Hyperliquid fees
+        # (verified 2026-07 against the official fee docs): perp maker is
+        # 0.000% at tier 4+ (>$500M 14-day volume, with maker REBATES of
+        # -0.1..-0.3bp by maker volume share) and 0.4-1.5bp below tier 4;
+        # taker is 2.4-4.5bp. Set to 0.0 to model pure top-tier maker
+        # execution - fees only; passive fills still carry adverse-selection/
+        # miss risk that no bps number captures (the implementation-lag
+        # stress is the closest proxy).
+        'cost_bps': 5.0,
         # Accrue perp funding on held positions in the walk-forward backtest: at
         # each settlement stamp the book earns -sum(w_i * rate_i) (longs PAY a
         # positive rate, shorts receive). Rates come from the funding_rates table
@@ -784,6 +916,19 @@ config = {
         'edge_scaled_gross': {
             'enabled': True,
             'edge_mult': 2.0,
+            # Deployment floor: a multiplier below min_mult snaps to ZERO gross
+            # instead of trading a sliver of book with negative expected
+            # economics. The linear clip alone kept deploying 1e-5..0.1-gross
+            # books whose costs ran 10^3-10^4 x expected alpha (cost_to_alpha
+            # in wf_portfolio_windows) - pure cost bleed. Below the floor the
+            # aim is zeroed and the book unwinds at the GP trade rate.
+            # 0.5 = deploy only at MODEL BREAK-EVEN or better: multiplier =
+            # exp_edge / (edge_mult x rt_cost) with edge_mult 2, so m < 0.5
+            # means expected horizon edge < one round-trip cost - deploying
+            # there is negative expectation by the model's own arithmetic
+            # (measured: the 0.25 floor still bled ~4%/yr of costs against
+            # -0.4%/yr gross). 0.0 = legacy (always deploy pro-rata).
+            'min_mult': 0.5,
         },
         # No-trade zone ("lazy trading"):
         # a name whose expected residual return OVER ITS HOLDING HORIZON
@@ -792,6 +937,23 @@ config = {
         # zeroed (the optimiser won't allocate fresh risk to it). Compared on the
         # holding horizon, not per-bar, so units match the round-trip cost.
         'no_trade_band_mult': 1.0,
+        # Cost-amortization holding period for the no-trade band and
+        # edge-scaled gross: cost is paid per unit TRADED, not per unit time,
+        # so the edge weighed against a round trip must accrue over the bars a
+        # position is actually HELD: h_eff = bucket lag / per-rebalance
+        # turnover (from the selected signals' measured training turnover).
+        # A churny signal (turnover ~1) is unchanged; a slow carry signal
+        # (turnover 0.04) holds a position ~25 rebalances and earns ~25x the
+        # edge per round trip that the raw scoring lag credits it - the old
+        # lag-based accounting vetoed the one OOS-proven sleeve while
+        # green-lighting fast losers. Low turnover <=> persistent z-scores,
+        # so crediting the per-bar edge over the held period is
+        # self-consistent. The GP aim discount keeps the SCORING lag (alpha
+        # decay is a property of the signal, not of turnover).
+        'cost_holding': {
+            'turnover_based': True,
+            'max_holding_bars': 1008,    # 7d cap on the credited holding period
+        },
         # Liquidity-aware costs and trade speed ("Trading Speed", "Multi-Period").
         # Per-name trailing dollar volume (ADV) makes illiquid names cost more to
         # trade and fill toward the aim more slowly; liquid names cheaper/faster.
@@ -805,6 +967,21 @@ config = {
             'speed_exponent': 0.5,           # speed_mult = (adv_i/adv_ref)^exponent
             'min_speed_mult': 0.3,           # clip per-name speed multiplier (illiquid: slower)
             'max_speed_mult': 2.0,           # clip per-name speed multiplier (liquid: faster)
+        },
+        # Volume-participation cap: in any single bar the backtest may not
+        # trade a name by more than max_participation x its trailing
+        # volume_window_bars-bar average $ volume. Weights are fractions of
+        # gross, so book_size_usd converts the $ cap into weight units:
+        #     max |dw_i| = max_participation * avg_$vol_i / book_size_usd.
+        # Names with no volume history get a cap of 0 (not tradeable). The
+        # cap binds VOLUNTARY trades only - names leaving the investable set
+        # are still closed immediately (and pay costs on the full close).
+        # Re-run at several book sizes for a capacity curve.
+        'participation': {
+            'enabled': True,
+            'book_size_usd': 1_000_000,      # notional gross book for $-based caps
+            'max_participation': 0.10,       # max fraction of avg bar $ volume per bar
+            'volume_window_bars': 10,        # trailing window for the average
         },
     },
 
@@ -981,8 +1158,24 @@ def validate_config() -> None:
             "ceil(gross_leverage / max_position) to leave room for neutrality"
         )
     esg = port.get('edge_scaled_gross', {})
-    if esg.get('enabled') and float(esg.get('edge_mult', 0)) <= 0:
-        raise ValueError("portfolio.edge_scaled_gross.edge_mult must be positive")
+    if esg.get('enabled'):
+        if float(esg.get('edge_mult', 0)) <= 0:
+            raise ValueError(
+                "portfolio.edge_scaled_gross.edge_mult must be positive")
+        if not 0.0 <= float(esg.get('min_mult', 0.0)) < 1.0:
+            raise ValueError(
+                "portfolio.edge_scaled_gross.min_mult must be in [0, 1)")
+    part = port.get('participation', {})
+    if part.get('enabled'):
+        if float(part.get('book_size_usd', 0)) <= 0:
+            raise ValueError(
+                "portfolio.participation.book_size_usd must be positive")
+        if not 0.0 < float(part.get('max_participation', 0)) <= 1.0:
+            raise ValueError(
+                "portfolio.participation.max_participation must be in (0, 1]")
+        if int(part.get('volume_window_bars', 0)) < 1:
+            raise ValueError(
+                "portfolio.participation.volume_window_bars must be >= 1")
     lag_smoothing = config['signals'].get('lag_smoothing') or []
     if lag_smoothing:
         bounds = [b for b, _ in lag_smoothing]

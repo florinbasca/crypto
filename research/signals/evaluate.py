@@ -118,9 +118,16 @@ def _nw_tstat(x: np.ndarray, lags='auto') -> float:
 # =============================================================================
 
 def build_registry():
-    """Signal registry {name: info} from the SPACES library (research/lib/spaces.py)."""
+    """Signal registry {name: info}: the curated SPACES library
+    (research/lib/spaces.py) plus every promoted discovery candidate as a
+    disc_* entry (research/lib/discovered.py; toggle with
+    signals.include_discovered). Discovered entries carry valid_from = their
+    promotion date, which the walk-forward selector honours."""
     from research.lib.spaces import build_registry_entries
-    return build_registry_entries()
+    entries = build_registry_entries()
+    from research.lib.discovered import load_discovered_entries
+    entries.update(load_discovered_entries())
+    return entries
 
 
 def signal_feature_columns(signal_def) -> List[str]:

@@ -350,12 +350,14 @@ def make_synth_panel(n_bars, seed=42):
         'beta_size': r.normal(0, 0.3, len(dates)),
         'r_squared': r.uniform(0.3, 0.7, len(dates)),
     })
-    return df, res, factors, loadings
+    leader = pd.Series(100 * np.exp(np.cumsum(r.normal(0, 1e-3, n_bars))),
+                       index=ts)
+    return df, res, factors, loadings, leader
 
 N_FULL, N_TRUNC = 2400, 1800
-df_f, res_f, fac_f, ld_f = make_synth_panel(N_FULL)
+df_f, res_f, fac_f, ld_f, lead_f = make_synth_panel(N_FULL)
 full = calculate_all_features(df_f, FEATURE_CONFIG, 'SYN', res_f, ld_f,
-                              factors_df=fac_f)
+                              factors_df=fac_f, leader_close=lead_f)
 
 df_t = df_f.iloc[:N_TRUNC].copy()
 res_t = res_f.iloc[:N_TRUNC]
@@ -363,7 +365,8 @@ fac_t = fac_f.iloc[:N_TRUNC]
 cutoff_ts = df_t['timestamp'].iloc[-1]
 ld_t = ld_f[ld_f['date'] <= cutoff_ts]
 trunc = calculate_all_features(df_t, FEATURE_CONFIG, 'SYN', res_t, ld_t,
-                               factors_df=fac_t)
+                               factors_df=fac_t,
+                               leader_close=lead_f.iloc[:N_TRUNC])
 
 feat_cols = [c for c in full.columns if c not in ('timestamp', 'symbol')]
 row_full = full.iloc[N_TRUNC - 1][feat_cols].astype(float).values
