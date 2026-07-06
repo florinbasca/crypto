@@ -516,6 +516,38 @@ check("membership: interval mask (member / delisted gap / relisted)",
       f"(got {list(mem_mask)})")
 
 # ---------------------------------------------------------------------------
+# 16b. Per-lag smoothing halflife + edge-scaled gross helpers
+# ---------------------------------------------------------------------------
+from research.signals.evaluate import smoothing_halflife_for_lag
+from research.portfolio.walk_forward import edge_gross_multiplier
+from config import get as _cfg_get
+
+_ls = _cfg_get('signals.lag_smoothing') or []
+if _ls:
+    check("lag smoothing: first bucket for fastest lag",
+          smoothing_halflife_for_lag(1, 0.0) == float(_ls[0][1]))
+    check("lag smoothing: beyond last bound uses last bucket",
+          smoothing_halflife_for_lag(int(_ls[-1][0]) * 10, 0.0)
+          == float(_ls[-1][1]))
+    check("lag smoothing: bucket boundary is inclusive",
+          smoothing_halflife_for_lag(int(_ls[0][0]), 0.0) == float(_ls[0][1]))
+    check("lag smoothing: base halflife is a floor",
+          smoothing_halflife_for_lag(1, 999.0) == 999.0)
+else:
+    check("lag smoothing: disabled -> base halflife",
+          smoothing_halflife_for_lag(144, 3.0) == 3.0)
+
+check("edge gross: free execution -> full gross",
+      edge_gross_multiplier(0.0, 0.0, 2.0) == 1.0
+      and edge_gross_multiplier(-1.0, 0.0, 2.0) == 1.0)
+check("edge gross: edge covers edge_mult round trips -> full",
+      edge_gross_multiplier(4e-4, 2e-4, 2.0) == 1.0)
+check("edge gross: half coverage -> half gross",
+      abs(edge_gross_multiplier(2e-4, 2e-4, 2.0) - 0.5) < 1e-12)
+check("edge gross: negative edge -> zero gross",
+      edge_gross_multiplier(-1e-4, 2e-4, 2.0) == 0.0)
+
+# ---------------------------------------------------------------------------
 # 17. Factor VIF: independent factors ~ 1, a collinear factor blows up
 # ---------------------------------------------------------------------------
 from risk_model.residual_returns import factor_vif, FACTOR_COLS as _VIF_COLS

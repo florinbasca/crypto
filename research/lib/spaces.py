@@ -91,8 +91,17 @@ SPACES = [
        'share of zero-volume bars: thin trading'),
 
     # --- order flow
+    # LESSON (measured on funding): the LEVEL of a slow state variable often
+    # carries the alpha, while z-scoring it against its own short history
+    # destroys it (space_funding_annualized was the library's best net signal;
+    # space_funding_z was net-negative). Where a *_zscore space exists, keep a
+    # level counterpart in the library and let selection decide.
     _S('buy_pressure', 'ms_buy_ratio', 'order_flow',
        'taker buy share: aggressive buying continues then exhausts'),
+    _S('trade_intensity_level', 'ms_trade_intensity', 'order_flow',
+       'trade-count level vs own MA (level counterpart of the z-score)'),
+    _S('avg_trade_size_level', 'ms_avg_trade_size', 'order_flow',
+       'average trade size level: whale-flow level (counterpart of the z)'),
     _S('signed_volume', 'vl_signed_volume_ratio', 'order_flow',
        'order-flow imbalance (signed volume)'),
     _S('trade_intensity', 'ms_trade_intensity_zscore', 'order_flow',
@@ -107,10 +116,14 @@ SPACES = [
     # --- positioning / crowding (contrarian)
     _S('retail_crowding', 'pos_retail_ls_zscore', 'positioning',
        'crowded retail long/short positioning unwinds'),
+    _S('retail_ls_level', 'pos_retail_ls', 'positioning',
+       'retail long/short ratio LEVEL (level counterpart of the z-score)'),
     _S('retail_vs_smart', 'pos_retail_vs_smart', 'positioning',
        'retail vs smart-money positioning divergence'),
     _S('toptrader_positioning', 'pos_toptrader_ls_zscore', 'positioning',
        'top-trader long/short positioning'),
+    _S('toptrader_ls_level', 'pos_toptrader_ls', 'positioning',
+       'top-trader long/short ratio LEVEL (counterpart of the z-score)'),
 
     # --- funding (crypto-native carry / crowding)
     _S('funding_z', 'fr_rate_zscore', 'funding',
@@ -352,32 +365,13 @@ SPACES = [
 ]
 
 
-# Smoothing-halflife variants: many alphas differ mainly by speed. For a few
-# strong base signals (order-flow, funding/OI, residual, market-structure) emit
-# h0 / h12 / h36 variants; the global default (h3) is already covered by the
-# base entry above, so it is not duplicated here. Appended to SPACES so they are
-# ordinary members of the library.
-_SMOOTHING_FAMILIES = [
-    ('residual_displacement', 'res_zscore', 'residual_reversion', 'residual displacement'),
-    ('funding_z', 'fr_rate_zscore', 'funding', 'funding z'),
-    ('signed_volume', 'vl_signed_volume_ratio', 'order_flow', 'signed-volume imbalance'),
-    ('oi_change', 'oi_change_zscore', 'open_interest', 'abnormal OI change'),
-    ('lag_response', 'mk_lag_response_gap', 'market_structure', 'lagged market response'),
-]
-_SMOOTHING_HALFLIVES = (0.0, 12.0, 36.0)
-
-
-def _smoothing_variants():
-    out = []
-    for base, col, theme, desc in _SMOOTHING_FAMILIES:
-        for hl in _SMOOTHING_HALFLIVES:
-            label = 'h0' if hl == 0 else f'h{int(hl)}'
-            out.append(_S(f'{base}_{label}', col, theme,
-                          f'{desc} smoothed at halflife {label}', halflife=hl))
-    return out
-
-
-SPACES = SPACES + _smoothing_variants()
+# NOTE: the explicit smoothing-halflife variant families (space_*_h0/h12/h36)
+# were retired: evaluation now smooths every signal at a halflife matched to
+# the scored lag (signals.lag_smoothing; see evaluate.smoothing_halflife_for_lag),
+# which covers the speed dimension for the WHOLE library instead of five
+# hand-picked bases - and removes 15 near-duplicate entries from the
+# multiple-testing budget. Per-space `halflife=` overrides remain supported
+# (they act as a floor under the per-lag halflife).
 
 
 def compute_space_raw(space: SpaceDef, features: pd.DataFrame) -> pd.Series:

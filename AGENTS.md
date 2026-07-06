@@ -45,7 +45,7 @@ All configuration values MUST be in `config.py`. Never hardcode:
   (Ledoit-Wolf MVO + rank/equal-weight sizing), signals/evaluate (multi-horizon IC + daily aggregates),
   signals/signal_lab (KEEP/KILL scorecard)
 - `research/portfolio/` - walk_forward (walk-forward FDR selection +
-  market-neutral backtest; rank/equal-weight sizing by default, MVO benchmark)
+  market-neutral backtest; rank/equal-weight sizing by default, optional MVO benchmark foil)
 - `research/signals/` - plugin-style experimental signal families and templates
 
 ## Data Flow
@@ -57,7 +57,7 @@ All configuration values MUST be in `config.py`. Never hardcode:
 4. prices + residual_returns + factor_loadings (+ funding/futures) -> features
 5. features + residual_returns -> signal_daily_stats + signal_metrics
 6. signal_daily_stats + features + residuals + betas -> walk-forward
-   market-neutral portfolio, rank/equal-weight sizing (MVO benchmark)
+   market-neutral portfolio, rank/equal-weight sizing (optional MVO benchmark)
    (wf_portfolio_* tables)
 
 ## Important Notes

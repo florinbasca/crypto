@@ -355,19 +355,30 @@ config = {
     'signals': {
         'spaces': {'smoothing_halflife': 3},        # light EWM on each space's raw value
         'smoothing_halflife': 3,
+        # Per-lag smoothing: a signal scored at forward lag L is smoothed at
+        # the halflife of the smallest bucket with max_lag >= L (list of
+        # [max_lag, halflife] in bars; lags beyond the last bound use the last
+        # halflife; the per-space/global base halflife is a floor). Slow lags
+        # tolerate slow signals: measured on this panel, halflife 36 vs 3 cuts
+        # signal turnover ~2.5-3x while keeping 75-85% of the IC - so matching
+        # smoothing to the holding lag roughly doubles gross-per-turnover
+        # exactly where turnover matters. [] disables (single global halflife).
+        'lag_smoothing': [[12, 3], [48, 12], [144, 36], [432, 108]],
         'warmup_days': 10,                          # feature warmup before a test window
         'screening_grid': '1h',                     # IC sampled here (computed at full res)
         'min_assets_per_timestamp': 10,
         'min_universe_fraction': 0.4,               # also >= this * universe.max_candidates names
         'compute_on_full_history': True,
-        # Forward IC lags (bars). Short lags sit below the walk-forward
-        # selection speed floor so they are never *selected*; they are kept to
-        # resolve each signal's IC(tau) decay diagnostics (evaluate.py /
-        # signal_lab). The portfolio layer does NOT fit a decay curve - it pins
-        # each signal to its single strongest selectable lag. The 6..432 body
-        # gives ~1h-to-3d term-structure resolution. Cost scales ~linearly in
-        # lag count (target build is cached, but lag_metrics runs per lag).
-        'decay_lag_grid': [1, 3, 6, 12, 18, 24, 36, 48, 72, 96, 144, 216, 288, 432],
+        # Forward IC lags (bars). Deliberately FEW: every extra lag multiplies
+        # the Bonferroni correction applied to every signal's best-lag p-value
+        # and adds evaluation compute. Chosen from the measured decay of this
+        # library (gross edge strong at <=24 bars, marginal at 48, ~zero beyond
+        # - except funding, which lives at slow lags):
+        #   3 = 30min, 6 = 1h  -> the fast reversal/order-flow/lead-lag core
+        #   24 = 4h            -> the mid-speed body
+        #   144 = 1d           -> the funding/carry sleeve
+        # The portfolio pins each signal to its strongest lag of these four.
+        'decay_lag_grid': [3, 6, 24, 144],
         'liquidity_window_bars': 144,
     },
 
@@ -537,6 +548,15 @@ config = {
         'end_date': '2026-06-01',        # Last complete month of data
         'train_months': 6,
         'test_days': 30,
+        # Training-window mode. 'expanding' (default): every window trains on
+        # ALL data from start_date up to its train_end - this is the monthly
+        # production retrain ("use everything I know so far") and it fixes the
+        # power problem of short windows: by the last window the selector sees
+        # ~2.5 years (~10x the daily-IC observations of a 6-month slice), so
+        # honest signals clear the multiplicity-corrected t-stat bar instead of
+        # dying to it. train_months then only sets the FIRST window's length.
+        # 'rolling': legacy fixed 6-month lookback stepping forward monthly.
+        'train_window': 'expanding',
 
         # Survivorship sensitivity gate: exclude names whose FIRST data bar is
         # within this many days of the test day. The universe is conditioned on
@@ -593,21 +613,22 @@ config = {
         # scales to ~1%. An integer keeps a manual floor in bars (0 = off).
         'min_holding_lag_bars': 'auto',
         # Fraction of a signal's alpha that must survive the aim discount for
-        # its lag to be selectable under 'auto'. At the current budget
-        # (100x/yr, gross 1) 1/kappa ~ 526 bars, so 0.15 -> floor ~ 93 bars
-        # (~15.5h). Lower it to admit faster signals; raising
-        # max_annual_turnover / trade_urgency lowers the floor automatically.
+        # its lag to be selectable under 'auto'. The floor moves with the
+        # execution config: with zero-cost maker execution and no turnover
+        # budget the fill rate kappa ~ 1/bar and the floor resolves to 1 bar
+        # (everything selectable); with taker fees + a tight budget it climbs
+        # into the multi-hour range automatically.
         'min_monetizable_alpha_fraction': 0.15,
-        'max_signals_per_window': 15,    # Per holding-lag bucket
+        'max_signals_per_window': 15,    # TOTAL selected per window (all lags)
         # Do not keep trading a stale selection when the current window finds
         # no statistically defensible candidates.
         'fallback_to_previous': False,
 
         # Direct horizon selection. Forward cumulative-return IC is not an
         # exponential decay curve, so each signal is pinned to the lag with the
-        # strongest HAC t-stat.
+        # strongest HAC t-stat. Execution buckets are the DISTINCT SELECTED
+        # LAGS themselves (each refreshes at its own cadence) - not terciles.
         'horizon_selection': {
-            'n_buckets': 3,
             'min_valid_lags': 1,
             # Allow several decorrelated variants per family. At 1 this capped
             # the whole book at one signal per family, collapsing selection to a
@@ -626,17 +647,14 @@ config = {
         # one bar late (decided at t-1, earn bar t)
         'implementation_lag_bars': 1,
 
-        # Composite weighting by training IC, penalized for turnover.
-        'signal_weighting': {
-            'enabled': True,
-            'risk_aversion': 1.0,
-            'cost_factor': 2.0,
-            'min_weight_ratio': 0.1,
-        },
         # Covariance-aware signal combination (Grinold): composite weights
         # w ~ C^{-1} . IC instead of flat IC-weighting, to exploit signal
         # diversification. corr_shrink pulls the signal-return correlation toward
         # the identity (1.0 = falls back to IC-weighting; 0.0 = full, overfits).
+        # This is the ONLY signal-weighting system (the legacy turnover-
+        # penalized 'signal_weighting' duplicate was removed); when it cannot
+        # run (<2 signals with return history, or disabled) the fallback is
+        # plain |IC|-proportional weights - no extra knobs.
         'signal_combination': {
             'enabled': True,
             'corr_shrink': 0.5,
@@ -670,7 +688,11 @@ config = {
         'weight_scheme': 'equal_weight',
         # Foil sizing scheme run alongside the production book each window for
         # monitoring (persisted to wf_portfolio_returns_bench). '' disables it.
-        'benchmark_scheme': 'mvo',
+        # Off by default: the EW-vs-MVO question is ANSWERED on this book (MVO
+        # net Sharpe -1.23 vs +0.11 on identical alpha, 22-window run) - the
+        # foil pass only doubled backtest runtime to re-answer it. Set to 'mvo'
+        # to re-run the comparison after material risk-model changes.
+        'benchmark_scheme': '',
         'cov_window_days': 30,               # Trailing window for residual covariance
         'cov_min_observations': 1008,        # Min bars (7d) for a valid covariance
         'shrinkage': 'ledoit_wolf',          # 'ledoit_wolf' or float in [0,1] (mvo only)
@@ -690,12 +712,13 @@ config = {
             'vol':      0.10,
         },
         'weight_smoothing_halflife': 6,      # legacy fixed EWM rate (fallback only)
-        # HARD turnover budget. The per-bar trade toward the aim is throttled so
-        # realized turnover never exceeds this many x gross per year - the
-        # dominant cost driver (rebalancing every 10min bar otherwise burns
-        # >1000x/yr and >80% to costs). Caps the voluntary trade; forced
-        # universe-churn closes add a small unavoidable amount. None -> uncapped.
-        'max_annual_turnover': 100,
+        # HARD turnover budget (x gross per year); None -> uncapped. With
+        # cost_bps = 0 (top-tier maker execution) there is no fee rationale for
+        # a budget, and the measured alpha decays within hours - throttling the
+        # fill to days destroyed transmission (the 100x/yr run deployed only
+        # ~0.58 gross and had cost/alpha > 1 in most windows). Set a number to
+        # model capacity- or operationally-constrained execution.
+        'max_annual_turnover': None,
         # Garleanu-Pedersen multi-period trading toward the gross-1 aim. Two pieces:
         # 1) TRADE RATE (per bar): the myopic optimal gamma/(gamma+lambda) balance
         #    of off-aim penalty vs quadratic trade cost, made COST-RESPONSIVE:
@@ -727,10 +750,16 @@ config = {
             'corr_threshold': 0.30,          # Merge names with residual corr above this
             'min_cluster_size': 3,           # Smaller groups are not penalized
         },
-        # Costs: per-side bps applied to turnover (Hyperliquid taker ~2.5-4.5bps + slippage).
-        # Set to 2.0 (optimistic maker/low-slippage) to test whether the strategy
-        # clears costs at the cheap end - MUST reflect actually-achievable execution.
-        'cost_bps': 2.0,
+        # Costs: per-side bps applied to turnover. Set to 0.0 = pure-maker
+        # execution at Hyperliquid's top volume tiers (verified 2026-07 against
+        # the official fee docs: perp maker fee is 0.000% at tier 4+, >$500M
+        # 14-day volume, with separate maker REBATES of -0.1..-0.3bp by maker
+        # volume share; below tier 4 maker is 0.4-1.5bp and taker never drops
+        # below 2.4bp). This models fees only - passive fills still carry
+        # adverse-selection/miss risk that no bps number captures; the
+        # implementation-lag stress is the closest proxy. Raise this to test
+        # lower-tier maker (0.4-1.5) or taker (2.4-4.5) execution.
+        'cost_bps': 0.0,
         # Accrue perp funding on held positions in the walk-forward backtest: at
         # each settlement stamp the book earns -sum(w_i * rate_i) (longs PAY a
         # positive rate, shorts receive). Rates come from the funding_rates table
@@ -744,6 +773,18 @@ config = {
         # scale uses (1 - ic_shrink) * IC. 0 = trust IC fully; 0.5 = halve it
         # (Grinold & Kahn). Applied per bucket.
         'ic_shrink': 0.1,
+        # Edge-scaled gross: the aim book's gross is multiplied by
+        # clip(expected horizon alpha per unit gross /
+        #      (edge_mult x round-trip cost per unit gross), 0, 1),
+        # so the book only deploys full size when the aim's expected edge
+        # covers edge_mult round trips - it shrinks (to zero if need be)
+        # instead of trading a gross-1 book on alpha that cannot pay for
+        # itself (the old run had cost/alpha > 1 in 15/22 windows). With
+        # cost_bps = 0 the multiplier is identically 1 (no cost to clear).
+        'edge_scaled_gross': {
+            'enabled': True,
+            'edge_mult': 2.0,
+        },
         # No-trade zone ("lazy trading"):
         # a name whose expected residual return OVER ITS HOLDING HORIZON
         # (per-bar Grinold alpha * horizon bars) is below no_trade_band_mult *
@@ -912,6 +953,8 @@ def validate_config() -> None:
         raise ValueError("ranking score weights must be non-negative and non-empty")
 
     wf = config['walk_forward']
+    if wf.get('train_window', 'expanding') not in ('expanding', 'rolling'):
+        raise ValueError("walk_forward.train_window must be 'expanding' or 'rolling'")
     mhl = wf.get('min_holding_lag_bars', 0)
     if mhl == 'auto':
         frac = float(wf.get('min_monetizable_alpha_fraction', 0.0))
@@ -937,6 +980,15 @@ def validate_config() -> None:
             "portfolio.min_assets must exceed "
             "ceil(gross_leverage / max_position) to leave room for neutrality"
         )
+    esg = port.get('edge_scaled_gross', {})
+    if esg.get('enabled') and float(esg.get('edge_mult', 0)) <= 0:
+        raise ValueError("portfolio.edge_scaled_gross.edge_mult must be positive")
+    lag_smoothing = config['signals'].get('lag_smoothing') or []
+    if lag_smoothing:
+        bounds = [b for b, _ in lag_smoothing]
+        if bounds != sorted(bounds) or any(hl < 0 for _, hl in lag_smoothing):
+            raise ValueError("signals.lag_smoothing needs ascending max_lag "
+                             "bounds and non-negative halflives")
 
 
 # =============================================================================

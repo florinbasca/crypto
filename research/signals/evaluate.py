@@ -225,32 +225,75 @@ def _smoothing_halflife_for(info: Dict) -> float:
     return float(info.get('smoothing_halflife', SMOOTHING_HALFLIFE) or 0.0)
 
 
-def compute_signal_panel(signal_name: str, registry: Dict,
-                         features: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute one signal at full resolution: raw space value -> EWM smoothing ->
-    cross-sectional z-score, clipped at +-3. Direction applied so higher is
-    always 'better'.
+def smoothing_halflife_for_lag(lag: int, base_halflife: float = 0.0) -> float:
+    """Effective EWM halflife (bars) for a signal scored at forward lag `lag`.
 
-    Returns [timestamp, symbol, signal].
+    Picks the smallest `signals.lag_smoothing` bucket with max_lag >= lag
+    (lags beyond the last bound use the last bucket), floored by the
+    per-space / global base halflife. Rationale: a slow holding lag tolerates
+    a slow signal - measured on this panel, smoothing at halflife 36 vs 3 cuts
+    signal turnover ~2.5-3x while keeping 75-85% of the IC, roughly doubling
+    gross-per-turnover exactly where turnover dominates. Empty config ->
+    base halflife only (legacy single-speed behaviour).
+    """
+    buckets = get('signals.lag_smoothing') or []
+    base = float(base_halflife or 0.0)
+    if not buckets:
+        return base
+    hl = float(buckets[-1][1])
+    for max_lag, bucket_hl in buckets:
+        if lag <= max_lag:
+            hl = float(bucket_hl)
+            break
+    return max(base, hl)
+
+
+def effective_halflife_for(info: Dict, lag: int) -> float:
+    """Per-(signal, lag) smoothing halflife: lag bucket, floored by the
+    space's own halflife. Used by evaluation AND the walk-forward composite
+    recompute, so a signal selected at lag L is traded exactly as scored."""
+    return smoothing_halflife_for_lag(lag, _smoothing_halflife_for(info))
+
+
+def _raw_signal_frame(signal_name: str, registry: Dict,
+                      features: pd.DataFrame) -> pd.DataFrame:
+    """Raw space value x direction at FULL resolution, membership-masked -
+    no smoothing, no normalization. Returns [timestamp, symbol, signal_raw].
+
+    The candidate-universe mask is applied BEFORE the time-series transforms
+    so smoothing and the cross-sectional z-score only ever see symbols we
+    intentionally trade. Missing pre-listing history stays NaN.
     """
     from research.lib.spaces import compute_space_raw
     info = registry[signal_name]
-    raw = compute_space_raw(info['signal_def'], features)
-
     out = features[['timestamp', 'symbol']].copy()
-    out['signal'] = raw * (info.get('direction', 1) or 1)
-
-    # The current candidate-universe mask is applied AFTER full-history
-    # transforms so smoothing, cross-sectional z-score, and evaluation only see
-    # symbols we intentionally trade. Missing pre-listing history stays NaN.
+    out['signal_raw'] = (compute_space_raw(info['signal_def'], features)
+                         * (info.get('direction', 1) or 1))
     if '_is_member' in features.columns:
-        out.loc[~features['_is_member'].to_numpy(), 'signal'] = np.nan
+        out.loc[~features['_is_member'].to_numpy(), 'signal_raw'] = np.nan
+    return out
 
-    halflife = _smoothing_halflife_for(info)
-    if halflife and halflife > 0:
+
+def compute_signal_panel(signal_name: str, registry: Dict,
+                         features: pd.DataFrame,
+                         halflife: Optional[float] = None) -> pd.DataFrame:
+    """
+    Compute one signal at full resolution: raw space value -> EWM smoothing ->
+    cross-sectional z-score, clipped at +-3. Direction applied so higher is
+    always 'better'. `halflife` overrides the space's own smoothing halflife:
+    the walk-forward passes the per-lag effective halflife of the SELECTED lag
+    (effective_halflife_for), so the traded signal matches the scored one.
+
+    Returns [timestamp, symbol, signal].
+    """
+    info = registry[signal_name]
+    out = _raw_signal_frame(signal_name, registry, features).rename(
+        columns={'signal_raw': 'signal'})
+
+    hl = _smoothing_halflife_for(info) if halflife is None else float(halflife)
+    if hl and hl > 0:
         out['signal'] = out.groupby('symbol')['signal'].transform(
-            lambda x: x.ewm(halflife=halflife, min_periods=1).mean())
+            lambda x: x.ewm(halflife=hl, min_periods=1).mean())
 
     # The final cross-sectional normalization is independent at each timestamp.
     # Evaluation only consumes screening-grid stamps, so normalize only those
@@ -915,10 +958,36 @@ def evaluate_signal(signal_name: str,
         return pd.DataFrame(), [{'signal_name': signal_name, 'horizon': '',
                                  'error': 'features empty'}]
 
-    panel = compute_signal_panel(signal_name, _REGISTRY, features)
+    # Per-lag smoothing: each lag is scored on the signal smoothed at ITS OWN
+    # effective halflife (effective_halflife_for). One smoothed variant is
+    # computed per UNIQUE halflife on the full-resolution raw frame, then all
+    # variants are z-scored per screening stamp and merged with the targets in
+    # a single pass.
+    raw = _raw_signal_frame(signal_name, _REGISTRY, features)
+    hl_by_lag = {lag: effective_halflife_for(info, lag) for lag in LAG_GRID}
+    sig_col_by_lag = {lag: f'sig_h{hl_by_lag[lag]:g}' for lag in LAG_GRID}
+    grouped = raw.groupby('symbol', sort=False)['signal_raw']
+    for hl in sorted(set(hl_by_lag.values())):
+        col = f'sig_h{hl:g}'
+        if hl > 0:
+            raw[col] = grouped.transform(
+                lambda x, h=hl: x.ewm(halflife=h, min_periods=1).mean()
+            ).astype(np.float32)
+        else:
+            raw[col] = raw['signal_raw'].astype(np.float32)
+    panel = raw.drop(columns=['signal_raw'])
+    del raw
 
-    # Screening grid only, merged with targets
-    panel = panel[panel['timestamp'].isin(_SCREEN_STAMPS)]
+    # Screening grid only; cross-sectional z-score each smoothed variant
+    panel = panel[panel['timestamp'].isin(_SCREEN_STAMPS)].copy()
+    sig_cols = sorted(set(sig_col_by_lag.values()))
+    by_ts = panel.groupby('timestamp')
+    for col in sig_cols:
+        g = by_ts[col]
+        panel[col] = ((panel[col] - g.transform('mean'))
+                      / (g.transform('std') + 1e-10)).clip(-3, 3)
+    panel = panel.dropna(subset=sig_cols, how='all')
+
     panel = panel.merge(_TARGETS, on=['timestamp', 'symbol'], how='inner')
     if len(panel) < 1000:
         return pd.DataFrame(), [{'signal_name': signal_name, 'horizon': '',
@@ -946,11 +1015,13 @@ def evaluate_signal(signal_name: str,
         stride = _lag_stride(lag)
         h_panel = panel[panel['_stamp_pos'] % stride == 0]
 
-        metric_cols = ['timestamp', 'symbol', 'signal', 'is_liquid',
+        scol = sig_col_by_lag[lag]   # this lag's smoothing-matched variant
+        metric_cols = ['timestamp', 'symbol', scol, 'is_liquid',
                        'liquidity_bucket', tcol]
         if raw_tcol in h_panel.columns:
             metric_cols.append(raw_tcol)
-        h_metric = h_panel[[c for c in metric_cols if c in h_panel.columns]]
+        h_metric = (h_panel[[c for c in metric_cols if c in h_panel.columns]]
+                    .rename(columns={scol: 'signal'}))
         ics, liq_ics, qs, bt, liq_bucket_ics = lag_metrics(
             h_metric, tcol, include_liquidity_buckets=True)
         if ics.empty:

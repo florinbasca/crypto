@@ -54,6 +54,7 @@ from research.lib.portfolio_opt import (shrunk_covariance, solve_constrained_mvo
                                               residual_clusters,
                                               cluster_penalty_matrix)
 from research.signals.evaluate import (build_registry, compute_signal_panel,
+                                      effective_halflife_for,
                                       signal_feature_columns,
                                       load_universe_membership,
                                       universe_member_mask,
@@ -226,6 +227,18 @@ def resolve_min_holding_lag() -> int:
         return 0
     _, kappa = effective_fill_rate()
     return int(np.ceil(frac / (1.0 - frac) / kappa))
+
+
+def edge_gross_multiplier(exp_edge: float, rt_cost: float,
+                          edge_mult: float) -> float:
+    """Gross scale for the aim book: clip(expected horizon edge per unit gross
+    / (edge_mult x round-trip cost per unit gross), 0, 1). Full size only when
+    the aim's expected edge covers edge_mult round trips; shrinks toward zero
+    (instead of trading a full-gross book on alpha that cannot pay for
+    itself). rt_cost <= 0 (free execution) -> always 1."""
+    if rt_cost <= 0:
+        return 1.0
+    return float(np.clip(exp_edge / (edge_mult * rt_cost), 0.0, 1.0))
 
 
 def liquidity_multipliers(adv: pd.Series, cfg: dict) -> Tuple[pd.Series, pd.Series]:
@@ -607,23 +620,22 @@ class SignalSelector:
                         continue
                 selected.append(sig)
             family_counts[family] = family_counts.get(family, 0) + 1
-            if len(selected) >= (WF['max_signals_per_window'] *
-                                 WF['horizon_selection']['n_buckets']):
+            if len(selected) >= WF['max_signals_per_window']:
                 break
 
         sel = stats[stats['signal_name'].isin(selected)].copy()
         sel.attrs['n_candidates'] = n_cand
         self.last_selection_counts['selected'] = len(sel)
 
-        # Direct holding-lag terciles -> execution buckets.
-        n_b = min(WF['horizon_selection']['n_buckets'], len(sel))
-        labels = ['fast', 'mid', 'slow'][:n_b]
-        if n_b >= 2:
-            sel['bucket'] = pd.qcut(sel['holding_lag'].rank(method='first'),
-                                    n_b, labels=labels).astype(str)
-        else:
-            sel['bucket'] = labels[0] if n_b else ''
-
+        # Execution buckets = the DISTINCT SELECTED LAGS. Each bucket's
+        # composite refreshes at its own lag-matched cadence downstream.
+        # (Replaces the old fast/mid/slow terciles, which were RELATIVE: they
+        # split whatever happened to be selected into three "speeds" even when
+        # every selection shared one lag - fabricated distinctions with real
+        # per-bucket bookkeeping. With a 4-lag grid the natural grouping is
+        # the lag itself.)
+        sel['bucket'] = sel['holding_lag'].astype(int).astype(str) + 'b'
+        labels = sorted(sel['bucket'].unique(), key=lambda s: int(s.rstrip('b')))
         buckets = {lab: sel.loc[sel['bucket'] == lab, 'signal_name'].tolist()
                    for lab in labels}
         eff_n = {lab: self._effective_breadth(rets, sigs)
@@ -700,24 +712,16 @@ class SignalSelector:
         return scores.sort_values(ascending=False).index.tolist()
 
     @staticmethod
-    def signal_weights(stats: pd.DataFrame, selected: List[str]) -> Dict[str, float]:
-        """IC-strength weights with an explicit turnover penalty."""
-        cfg = WF.get('signal_weighting', {})
-        if not cfg.get('enabled', False) or not selected:
-            w = 1.0 / max(len(selected), 1)
-            return {s: w for s in selected}
-        turn = dict(zip(stats['signal_name'], stats['avg_turnover']))
+    def _ic_weights(stats: pd.DataFrame, selected: List[str]) -> Dict[str, float]:
+        """|IC|-proportional weights (knob-free fallback when the C^-1.IC
+        combination cannot run); equal weights if every IC is ~0."""
+        if not selected:
+            return {}
         ic = dict(zip(stats['signal_name'], stats['ic_mean'].abs()))
-        raw = {}
-        for s in selected:
-            phi = turn.get(s, 0.5)
-            if not np.isfinite(phi) or phi <= 0:
-                phi = 0.5
-            strength = ic.get(s, 0.0)
-            adj = strength / (1.0 + phi * cfg['cost_factor'] /
-                              cfg['risk_aversion'])
-            raw[s] = max(adj, cfg['min_weight_ratio'] * max(ic.values()))
+        raw = {s: max(float(ic.get(s, 0.0)), 0.0) for s in selected}
         total = sum(raw.values())
+        if total <= 1e-12:
+            return {s: 1.0 / len(selected) for s in selected}
         return {s: v / total for s, v in raw.items()}
 
     @staticmethod
@@ -733,12 +737,14 @@ class SignalSelector:
         identity for stability; negative (anti-)weights are clipped to 0 so a
         noisy correlation can't flip a signal into being shorted. Returns POSITIVE
         per-signal weights summing to 1 (the caller applies each signal's sign).
-        Falls back to signal_weights when disabled or returns are unavailable.
+        This is the ONLY weighting system; when it cannot run (disabled, or
+        fewer than 2 signals with return history) the fallback is plain
+        |IC|-proportional weights (_ic_weights) - no extra parameters.
         """
         cfg = WF.get('signal_combination', {})
         cols = [s for s in selected if rets is not None and s in rets.columns]
         if not cfg.get('enabled', False) or len(cols) < 2:
-            return SignalSelector.signal_weights(stats, selected)
+            return SignalSelector._ic_weights(stats, selected)
 
         sign = dict(zip(stats['signal_name'], stats['sign']))
         ic = dict(zip(stats['signal_name'], stats['ic_mean'].abs()))
@@ -754,7 +760,7 @@ class SignalSelector:
             w = ic_vec
         w = np.clip(w, 0.0, None)
         if w.sum() <= 1e-12:
-            return SignalSelector.signal_weights(stats, selected)
+            return SignalSelector._ic_weights(stats, selected)
         w = w / w.sum()
         out = {s: 0.0 for s in selected}
         out.update({c: float(wi) for c, wi in zip(cols, w)})
@@ -968,9 +974,13 @@ class WalkForwardPortfolio:
                          weights: Dict[str, Dict[str, float]],
                          feat_start: pd.Timestamp,
                          test_start: pd.Timestamp,
-                         test_end: pd.Timestamp) -> Dict[str, pd.DataFrame]:
+                         test_end: pd.Timestamp,
+                         lag_of: Optional[Dict[str, int]] = None
+                         ) -> Dict[str, pd.DataFrame]:
         """Per-horizon composite z-score panel (wide: timestamp x symbol) on the
-        test window. Signals recomputed at full resolution with warmup."""
+        test window. Signals recomputed at full resolution with warmup, each
+        smoothed at the per-lag effective halflife of its SELECTED lag
+        (`lag_of`) so the traded signal matches the one that was scored."""
         all_sigs = sorted({s for sigs in selected.values() for s in sigs})
         if not all_sigs:
             return {}
@@ -991,7 +1001,9 @@ class WalkForwardPortfolio:
 
         panels = {}
         for sig in all_sigs:
-            p = compute_signal_panel(sig, self.registry, features)
+            hl = (effective_halflife_for(self.registry[sig], int(lag_of[sig]))
+                  if lag_of and sig in lag_of else None)
+            p = compute_signal_panel(sig, self.registry, features, halflife=hl)
             p = p[p['timestamp'] >= test_start]
             panels[sig] = p.pivot_table(index='timestamp', columns='symbol',
                                         values='signal', aggfunc='first')
@@ -1077,8 +1089,10 @@ class WalkForwardPortfolio:
             return res
 
         feat_start = train_end - pd.Timedelta(days=WARMUP_DAYS)
+        lag_of = ({} if sel is None or sel.empty else
+                  dict(zip(sel['signal_name'], sel['best_lag'].astype(int))))
         composites = self.composite_scores(selected, weights, feat_start,
-                                           train_end, test_end)
+                                           train_end, test_end, lag_of=lag_of)
         if not composites:
             return res
 
@@ -1288,6 +1302,12 @@ class WalkForwardPortfolio:
         # per-name cost is cost_rate * cost_mult_i (liquidity-aware below).
         no_trade_mult = float(PORT.get('no_trade_band_mult', 0.0))
 
+        # Edge-scaled gross (see edge_gross_multiplier / config
+        # portfolio.edge_scaled_gross): identity when costs are zero.
+        esg_cfg = PORT.get('edge_scaled_gross', {})
+        esg_on = bool(esg_cfg.get('enabled'))
+        esg_mult = float(esg_cfg.get('edge_mult', 2.0))
+
         # Liquidity-aware per-name cost / trade-speed multipliers (ADV-based),
         # refreshed daily alongside cov/betas. Neutral (1.0) when disabled or no
         # dollar-volume panel is available.
@@ -1423,13 +1443,22 @@ class WalkForwardPortfolio:
                 # profitable signal.
                 alpha = pd.Series(0.0, index=assets)
                 alpha_h = pd.Series(0.0, index=assets)
+                # `score_z` is the VOL-FREE combined score (sum of ic_scale * z,
+                # no sigma). It is the ordering basis for the rank/equal-weight
+                # book: sigma belongs in alpha only when a risk term penalizes
+                # sigma^2 (the MVO); ranking on sigma*z just tilts the rank
+                # book's extremes toward the highest-vol names with no
+                # offsetting risk penalty - a pure Sharpe drag.
+                score_z = pd.Series(0.0, index=assets)
                 got_signal = False
                 for h, score in held_scores.items():
                     z = score.reindex(assets)
                     if z.notna().sum() < PORT['min_assets']:
                         continue
-                    sig_z = sigma.reindex(assets) * z.fillna(0.0)
+                    zf = z.fillna(0.0)
+                    sig_z = sigma.reindex(assets) * zf
                     alpha = alpha.add(ic_scale[h] * sig_z, fill_value=0.0)
+                    score_z = score_z.add(ic_scale[h] * zf, fill_value=0.0)
                     alpha_h = alpha_h.add(
                         ic_scale_raw[h] * sig_z * max(bucket_h.get(h, 1.0), 1.0),
                         fill_value=0.0)
@@ -1449,6 +1478,9 @@ class WalkForwardPortfolio:
                           else pd.Series(1.0, index=assets))
                     band = no_trade_mult * cost_rate * cm
                     alpha = alpha.where(alpha_h.abs() >= band, 0.0)
+                    # The rank basis must honour the same gate, or the rank
+                    # book would still allocate to unmonetizable names.
+                    score_z = score_z.where(alpha != 0.0, 0.0)
                     if alpha.abs().sum() < 1e-15:
                         target_valid = False
                         continue
@@ -1474,6 +1506,7 @@ class WalkForwardPortfolio:
                     target_valid = False
                     continue
                 alpha = alpha.reindex(assets).fillna(0.0)
+                score_z = score_z.reindex(assets).fillna(0.0)
 
                 # Constraints: dollar + factor-beta neutrality
                 cons = {'dollar': pd.Series(1.0, index=assets)}
@@ -1503,11 +1536,13 @@ class WalkForwardPortfolio:
                 n_clusters_day = len(clusters) if clusters else 0
                 max_cluster_day = max((len(c) for c in clusters), default=0)
 
-                # Same alpha, neutrality (A), cap and gross for both schemes;
-                # only the risk model differs. 'equal_weight' ignores cov_a and
-                # weights by alpha rank (covariance-free benchmark).
+                # Same neutrality (A), cap and gross for both schemes; only the
+                # sizing basis differs: the rank book orders by the vol-free
+                # score_z (ranks + no risk term -> sigma must NOT enter), the
+                # MVO takes the sigma-scaled Grinold alpha (its risk term
+                # penalizes sigma^2, restoring the correct z/sigma tilt).
                 if self._weight_scheme == 'equal_weight':
-                    w_target = solve_equal_weight(alpha, A,
+                    w_target = solve_equal_weight(score_z, A,
                                                   max_position=cap,
                                                   gross_leverage=gross_target,
                                                   bands=bands)
@@ -1516,6 +1551,21 @@ class WalkForwardPortfolio:
                                                      max_position=cap,
                                                      gross_leverage=gross_target,
                                                      bands=bands)
+                # Edge-scaled gross: shrink the aim when its expected horizon
+                # edge cannot cover edge_mult round trips - never trade a
+                # gross-1 book on alpha that can't pay for itself. Identity
+                # multiplier when costs are zero.
+                if esg_on:
+                    g_t = float(np.abs(w_target.values).sum())
+                    if g_t > 1e-12:
+                        exp_edge = float(alpha_h.reindex(w_target.index)
+                                         .fillna(0.0).values @ w_target.values) / g_t
+                        cm_t = (cost_mult.reindex(w_target.index).fillna(1.0).values
+                                if liq_on else np.ones(len(w_target)))
+                        rt_cost = 2.0 * cost_rate * float(
+                            (np.abs(w_target.values) * cm_t).sum()) / g_t
+                        w_target = w_target * edge_gross_multiplier(
+                            exp_edge, rt_cost, esg_mult)
                 target_index = pd.Index(w_target.index)
                 target_values = w_target.values.astype(float, copy=False)
                 alpha_values = alpha.reindex(target_index).fillna(0.0).values
@@ -1742,7 +1792,13 @@ class WalkForwardPortfolio:
         full_end = pd.to_datetime(WF['end_date'])
         train_months = WF['train_months']
         test_days = WF['test_days']
+        expanding = WF.get('train_window', 'expanding') == 'expanding'
 
+        # Schedule: test windows step forward by test_days. 'expanding' anchors
+        # every training window at full_start (monthly production retrain on
+        # ALL data known so far - by the last window the selector sees the
+        # whole history, ~10x the observations of a rolling 6mo slice);
+        # 'rolling' keeps the legacy fixed train_months lookback.
         schedule = []
         t0 = full_start
         while True:
@@ -1750,11 +1806,12 @@ class WalkForwardPortfolio:
             t2 = t1 + pd.DateOffset(days=test_days)
             if t2 > full_end:
                 break
-            schedule.append((t0, t1, t2))
+            schedule.append((full_start if expanding else t0, t1, t2))
             t0 = t0 + pd.DateOffset(days=test_days)
 
         logging.info(f"Walk-forward: {len(schedule)} windows "
-                     f"({train_months}mo train / {test_days}d test)")
+                     f"({'expanding from ' + str(full_start.date()) if expanding else f'{train_months}mo rolling'}"
+                     f" / {test_days}d test)")
         self._set_context_bounds(schedule)
         self.ctx = None
 
@@ -1858,23 +1915,25 @@ class WalkForwardPortfolio:
                   f"benchmark Sharpe: {b_sharpe:.2f}   "
                   f"(production '{self.weight_scheme}' Sharpe {sharpe:.2f}; "
                   f"production-minus-benchmark = {sharpe - b_sharpe:+.2f})")
-        # Per-window detail as an aligned table. The f/m/s triplets are the
-        # fast/mid/slow holding-lag buckets; top families are abbreviated to the
-        # three largest (full breakdown lives in the notebook's attribution view).
-        order = ['fast', 'mid', 'slow']
-        row = ("  {win:<4}{period:<24}{nsig:>5}{bkt:>10}{hb:>12}{eff:>14}"
+        # Per-window detail as an aligned table. Buckets are the distinct
+        # selected lags ('3b:5' = 5 signals held at the 3-bar lag); top
+        # families are abbreviated to the three largest (full breakdown lives
+        # in the notebook's attribution view).
+        row = ("  {win:<4}{period:<24}{nsig:>5}  {bkt:<20}{eff:>14}"
                "{sr:>8}{bchsr:>8}{rho:>8}{sign:>7}{mkt:>9}  {fam}")
-        print(f"\nPer-window detail (f/m/s = fast/mid/slow buckets; "
-              f"OOS_SR = production '{self.weight_scheme}', "
-              f"BCH_SR = benchmark '{self.benchmark_scheme}'):")
+        print(f"\nPer-window detail (buckets = selected lags; "
+              f"OOS_SR = production '{self.weight_scheme}'"
+              + (f", BCH_SR = benchmark '{self.benchmark_scheme}'"
+                 if self.compare_benchmark else "") + "):")
         print(row.format(win='Win', period='OOS test period', nsig='#sig',
-                         bkt='sigs', hb='h(bars)', eff='effN', sr='OOS_SR',
+                         bkt='lag:sigs', eff='effN', sr='OOS_SR',
                          bchsr='BCH_SR', rho='IC_rho', sign='sign', mkt='|mkt|',
                          fam='top families'))
         for w in self.windows:
-            tri = lambda d, f='{}': '/'.join(f.format(d[b]) if b in d else '-'
-                                             for b in order)
-            sel = {b: len(s) for b, s in w.selected.items()}
+            labs = sorted(w.selected, key=lambda s: int(str(s).rstrip('b') or 0))
+            bkt = ' '.join(f'{b}:{len(w.selected[b])}' for b in labs)
+            eff = '/'.join(f'{w.eff_breadth[b]:.1f}' if b in w.eff_breadth
+                           else '-' for b in labs)
             fam = list(self._selected_family_counts(w).items())
             fam_str = ' '.join(f'{k}:{v}' for k, v in fam[:3])
             if len(fam) > 3:
@@ -1883,10 +1942,9 @@ class WalkForwardPortfolio:
             print(row.format(
                 win=f'W{w.window_idx:02d}',
                 period=f'{w.train_end.date()}-{w.test_end.date()}',
-                nsig=sum(sel.values()),
-                bkt=tri(sel),
-                hb=tri({b: int(v) for b, v in w.bucket_h.items()}),
-                eff=tri({b: v for b, v in w.eff_breadth.items()}, '{:.1f}'),
+                nsig=sum(len(s) for s in w.selected.values()),
+                bkt=bkt or '-',
+                eff=eff or '-',
                 sr=f'{w.oos_sharpe:.2f}',
                 bchsr=(f'{w.oos_sharpe_bench:.2f}'
                        if np.isfinite(w.oos_sharpe_bench) else '-'),

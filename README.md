@@ -3,7 +3,7 @@
 Cross-sectional stat-arb on ~100 Hyperliquid-tradeable crypto names.
 1-minute Binance spot data (last 3 years) -> 10-minute base panel ->
 market+size+momentum+vol factor model -> multi-horizon residual prediction
-(10min / 1h / 1d) -> rank / equal-weight sizing (Ledoit-Wolf MVO kept as a
+(10min / 1h / 1d) -> rank / equal-weight sizing (optional Ledoit-Wolf MVO
 benchmark), dollar / market / size / momentum / vol-beta neutral.
 
 > **Data and keys are not included.** A fresh clone has no data — the `db/`
@@ -35,7 +35,7 @@ uv run python research/signals/evaluate.py   # score the spaces (research/lib/sp
                                               # one signal only: evaluate.py NAME [--no-save]
 
 # 4. Backtest
-uv run python research/portfolio/walk_forward.py    # walk-forward selection + MVO backtest
+uv run python research/portfolio/walk_forward.py    # monthly-retrain walk-forward selection + market-neutral backtest
 ```
 
 Each stage reads the tables the previous one writes, so run in order. If
@@ -80,9 +80,9 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
 - **Targets**: `fwd_res_{10min,1h,1d}[t]` = sum of single-bar residuals over
   bars t+1..t+p. Bar-end timestamps throughout; a signal at t may use data
   through bar t (forward targets start at t+1, so no overlap).
-- **Signals**: ~130 curated cross-sectional **spaces** (`research/lib/spaces.py`),
+- **Signals**: ~120 curated cross-sectional **spaces** (`research/lib/spaces.py`),
   each one named economic hypothesis (residual-reversion, liquidity, order-flow,
-  funding, OI, positioning, vol-structure, …). Each is scored against the 14-lag
+  funding, OI, positioning, vol-structure, …). Each is scored against the 4-lag
   forward grid on an hourly screening grid; only compact aggregates are persisted
   (`signal_daily_stats`, `signal_metrics`) — raw per-bar values are recomputed on
   demand. See **Signals: generation & selection** below.
@@ -95,15 +95,18 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
     cluster-exposure penalty (clusters from trailing residual correlations; the
     Marchenko-Pastur diagnostic shows stable super-noise structure — e.g. a
     meme-coin factor — beyond market+size).
-  - *Size* (`portfolio.weight_scheme`): default `equal_weight` ranks alpha
-    cross-sectionally (covariance-free); `mvo` uses the shrunk-covariance
-    optimizer above and runs as a monitored benchmark. The walk-forward
-    EW-vs-MVO comparison found the covariance weighting net-destructive on this
-    low-breadth, negatively-skewed book, so rank sizing is the default. Both
-    impose exact dollar / market / size / momentum / vol-beta neutrality, 5% position cap,
-    gross leverage 1, and trade partially toward the aim portfolio at a
-    cost-responsive Garleanu-Pedersen rate; liquidity-aware per-name multipliers
-    (trailing ADV) make illiquid names cost more and fill slower.
+  - *Size* (`portfolio.weight_scheme`): default `equal_weight` ranks the
+    vol-free combined z-score cross-sectionally (covariance-free; σ enters
+    only the MVO, whose risk term justifies it); `mvo` uses the
+    shrunk-covariance optimizer and is available as an optional benchmark foil
+    (`benchmark_scheme`, off by default — the 22-window comparison measured it
+    net-destructive on this low-breadth, negatively-skewed book: −1.23 vs
+    +0.11 net Sharpe). Both impose dollar / market / size / momentum /
+    vol-beta neutrality within `neutrality_band`, a 5% position cap, gross
+    leverage 1 scaled by expected-edge-vs-cost (`edge_scaled_gross`), and trade
+    toward the aim portfolio at a cost-responsive Garleanu-Pedersen rate;
+    liquidity-aware per-name multipliers (trailing ADV) make illiquid names
+    cost more and fill slower.
   - *Test*: backtested on RAW forward returns, net of trading costs AND perp
     funding accrued on held positions at settlement stamps; realized factor
     exposures are reported as the market-neutrality check, alongside a
@@ -114,21 +117,33 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
 **Generation** (`research/signals/evaluate.py`):
 
 - The signal universe is the curated **spaces** in `research/lib/spaces.py` —
-  ~130 cross-sectional hypotheses across 14 economic themes (residual-reversion,
+  ~120 cross-sectional hypotheses across 14 economic themes (residual-reversion,
   funding, market-structure, open-interest, order-flow, factor-loading, liquidity,
   cross-sectional, vol-structure, momentum, efficiency, fundamental, positioning,
   volume). Each space is one
   vectorized expression over feature columns; add one = add one `_S(...)` line.
-- Each signal is computed at full 10-min resolution, smoothed, and
-  cross-sectionally z-scored, then scored by **rank IC** against the forward
-  residual targets at every lag in the 14-lag grid
-  `signals.decay_lag_grid` (1..432 bars, ~10min to 3d), on a non-overlapping
-  hourly screening grid (overlap would inflate IC t-stats).
+- Each signal is computed at full 10-min resolution, smoothed **at a halflife
+  matched to the scored lag** (`signals.lag_smoothing`: fast lags get fast
+  smoothing, slow lags slow — measured, this cuts slow-lag turnover 2.5–3x for
+  a ~20% IC give-up), cross-sectionally z-scored, then scored by **rank IC**
+  against the forward residual targets at every lag in the deliberately small
+  4-lag grid `signals.decay_lag_grid` = [3, 6, 24, 144] bars (30min / 1h / 4h /
+  1d — chosen from the measured decay: fast core ≤ 4h, funding at ~1d; every
+  extra lag inflates the Bonferroni correction applied to every signal), on a
+  non-overlapping hourly screening grid (overlap would inflate IC t-stats).
+  The walk-forward recomputes each selected signal at the halflife of its
+  selected lag.
 - Only compact per-day aggregates (`signal_daily_stats`) and whole-period
   diagnostics (`signal_metrics`) are stored — the raw panels are recomputed on
   demand. Incremental: re-running only re-evaluates new/changed signals.
 
-**Selection** (per walk-forward window, train data only — `research/portfolio/walk_forward.py`):
+**Selection** (per walk-forward window, train data only —
+`research/portfolio/walk_forward.py`). Retraining happens every `test_days`
+(monthly), mirroring the production retrain cadence; the training window is
+**expanding** by default (`walk_forward.train_window`): every retrain uses ALL
+data from `start_date` to that window's train end, so later windows select
+from ~10x the observations of the legacy rolling 6-month slice ('rolling'
+restores the fixed lookback):
 
 1. **Best lag per space** — pick the strongest forward lag by HAC IC t-stat,
    Bonferroni-adjusted for searching the grid.
@@ -142,10 +157,14 @@ comparison — all read from the persisted `wf_portfolio_*` tables.
    aim discount at the book's effective fill rate, so the selector cannot
    spend slots on signals the (turnover-budgeted) executor then scales to ~0.
 4. **Standardized composite ranking**, then a **per-theme cap** + **greedy
-   de-correlation** on daily returns, bucketed by holding lag.
+   de-correlation** on daily returns (capped at `max_signals_per_window`
+   total). Execution buckets are the **distinct selected lags** (e.g. `6b`,
+   `144b`) — each bucket's composite refreshes at its own lag-matched cadence.
 
-The selected spaces are recomputed at full resolution on the test window,
-**covariance-aware combined** into per-horizon composites, and handed to the MVO.
+The selected spaces are recomputed at full resolution on the test window
+(each at its selected lag's smoothing halflife), **covariance-aware combined**
+(`C⁻¹·IC`; plain |IC| weights as the knob-free fallback) into per-lag
+composites, and handed to the sizing scheme.
 
 ## Adding your own signal
 
@@ -314,19 +333,23 @@ How far the backtested numbers should be trusted out of sample:
 - **Market data only.** Inputs are crypto prices plus market-cap, funding, and
   open-interest — no fundamentals, on-chain, order-book/L2, sentiment/news, or
   macro data. The entire edge is price-derived.
-- **Approximate transaction costs.** A 2 bps/side base cost is charged on
-  turnover, scaled per name by a trailing-ADV liquidity multiplier (illiquid
-  names cost more, fill slower), and perp funding on held positions is accrued
-  at settlement stamps (Binance USDT-perp rates as a Hyperliquid proxy; longs
-  pay positive rates). The model still does *not* use realized execution data,
-  calibrated impact curves, or capacity caps, and assumes fills at 10-min bar
-  stamps. Real-world costs are almost certainly higher.
+- **Zero-fee maker execution is assumed.** `portfolio.cost_bps = 0` models
+  pure-maker execution at Hyperliquid's top volume tiers (verified: perp maker
+  fee is 0.000% at tier 4+, >$500M 14-day volume, plus maker rebates by maker
+  volume share; below that tier maker is 0.4–1.5 bps and taker 2.4–4.5 bps).
+  Perp funding on held positions is still accrued at settlement stamps
+  (Binance USDT-perp rates as a Hyperliquid proxy; longs pay positive rates).
+  The model does *not* price passive-fill risk (missed fills, adverse
+  selection), spread crossing, impact, or capacity, and assumes fills at
+  10-min bar stamps — the 1-bar-lag Sharpe is the closest stress for this.
+  Re-run with cost_bps 0.4–1.5 (lower-tier maker) or 2.4+ (taker) before
+  trusting any number at real size.
 - **Single short sample / regime.** ~3 years of one asset class, no
   out-of-regime or crisis validation — and crypto regimes shift fast.
 - **Four-factor risk model.** Market, size, momentum and vol are hedged; other
   systematic exposures (liquidity, sector/meme) still stay in the residual (only
   partly addressed by the soft cluster penalty).
-- **Multiple testing.** ~130 spaces x 14 lags are screened; per-window FDR +
+- **Multiple testing.** ~120 spaces x 4 lags are screened; per-window FDR +
   gates mitigate but do not eliminate the risk of selecting overfit signals.
 
 ## License
