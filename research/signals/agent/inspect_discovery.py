@@ -1,22 +1,23 @@
 """
 Inspect what a discovery run generated (read-only; no API, no search).
 
-Reads the four persisted tables and prints a review:
+Reads the three persisted tables and prints a review:
   1. per-roll summary        - trials, survivors, carried-over, promoted
   2. top candidates          - metrics + the actual DSL program + rationale
-  3. promoted book           - everything that made it through the gates
-  4. OOS equity curve        - stitched daily PnL of the promoted book
-  5. LLM usage / cost        - tokens per roll, dollar estimate if priced
+  3. promotions              - everything that made it through the gates
+  4. LLM usage / cost        - tokens per roll, dollar estimate if priced
+
+(Discovery is purely statistical - there is no PnL here. The walk-forward
+is the only money judge.)
 
 Usage:
     python research/signals/agent/inspect_discovery.py [--top N] [--roll N]
-        [--survivors-only] [--expressions] [--curve]
+        [--survivors-only] [--expressions]
 
     --top N            candidates to show (default 10, ranked by reward)
     --roll N           restrict the candidate view to one roll
     --survivors-only   only show search survivors
     --expressions      print the full DSL JSON for each shown candidate
-    --curve            print the full daily OOS PnL table (default: summary)
 """
 
 import sys
@@ -62,14 +63,11 @@ def main():
                         help='Only show search survivors')
     parser.add_argument('--expressions', action='store_true',
                         help='Print full DSL programs (no truncation)')
-    parser.add_argument('--curve', action='store_true',
-                        help='Print the full daily OOS PnL table')
     args = parser.parse_args()
 
     tables = get('discovery.tables')
     led = _load(tables['ledger'])
     promos = _load(tables['promotions'])
-    oos = _load(tables['oos_returns'])
     usage = _load(tables['llm_usage'])
 
     if led.empty:
@@ -108,13 +106,18 @@ def main():
     for _, r in view.iterrows():
         flags = ('PROMOTED' if r['promoted']
                  else 'survivor' if r['survivor'] else '')
+        hl = r.get('half_life_bars')
+        hl_str = (f" | half-life {hl:,.0f}b"
+                  if hl is not None and np.isfinite(hl) else "")
         print(f"\n{r['name']}  [{r['family']}]  roll {r['roll_id']}  "
-              f"dir {r['direction']:+d}  {flags}")
+              f"dir {r['direction']:+d}  best lag {r.get('target_lag', '?')}b"
+              f"  {flags}")
         print(f"      reward {r['reward']:.3f} | select IC "
               f"{r['select_ic_mean']:.4f} (t={r['select_ic_tstat']:.2f}) | "
               f"train t={r['train_ic_tstat']:.2f} | "
-              f"net Sharpe {r['select_net_sharpe']:.2f} | "
-              f"turnover {r['select_turnover']:.2f}")
+              f"ICIR {r.get('select_icir', float('nan')):.3f} | "
+              f"liquid ratio {r.get('select_liquid_ic_ratio', float('nan')):.2f}"
+              f"{hl_str}")
         print(f"      {_fmt_expr(r['candidate_json'], args.expressions)}")
 
     # 3. promoted book -------------------------------------------------------
@@ -125,36 +128,17 @@ def main():
     if promos.empty:
         print("(nothing promoted yet - candidates must survive "
               f"{get('discovery.promotion.min_rolls_survived')} consecutive "
-              "rolls and clear FDR/deflation/orthogonality)")
+              "rolls and clear FDR/deflation/capture/orthogonality)")
     else:
-        cols = ['roll_id', 'name', 'family', 'direction', 'select_ic_tstat',
-                'reward', 'n_trials_at_promotion']
+        cols = ['roll_id', 'name', 'family', 'direction', 'promoted_lags',
+                'half_life_bars', 'capture', 'select_ic_tstat', 'reward',
+                'n_looks_at_promotion', 'n_trials_at_promotion']
         print(promos[[c for c in cols if c in promos.columns]]
               .to_string(index=False))
+        print("\n(PnL lives in the walk-forward - run "
+              "research/portfolio/walk_forward.py)")
 
-    # 4. OOS equity curve ----------------------------------------------------
-    print()
-    print("=" * 76)
-    print("OOS EQUITY CURVE (stitched, the search never saw these months)")
-    print("=" * 76)
-    if oos.empty:
-        print("(no OOS returns - nothing was in the book during any OOS month)")
-    else:
-        daily = oos.groupby('date', as_index=False)[
-            ['gross', 'cost', 'funding', 'net']].sum().sort_values('date')
-        net = daily['net']
-        sharpe = (net.mean() / net.std() * np.sqrt(365)
-                  if len(net) > 2 and net.std() > 0 else 0.0)
-        dd = (net.cumsum() - net.cumsum().cummax()).min()
-        print(f"{len(daily)} days: net {net.sum() * 1e4:,.1f} bps | "
-              f"ann. Sharpe {sharpe:.2f} | max drawdown {dd * 1e4:,.1f} bps | "
-              f"costs {daily['cost'].sum() * 1e4:,.1f} bps | "
-              f"funding {daily['funding'].sum() * 1e4:,.1f} bps")
-        if args.curve:
-            daily['cum_net_bps'] = daily['net'].cumsum() * 1e4
-            print(daily.to_string(index=False))
-
-    # 5. LLM usage -----------------------------------------------------------
+    # 4. LLM usage -----------------------------------------------------------
     print()
     print("=" * 76)
     print("LLM USAGE")

@@ -1,37 +1,20 @@
 """
-Signal Research: multi-horizon evaluation against forward residual returns.
+Signal scoring library: multi-horizon evaluation against forward residual
+returns. No CLI, no persistence - the walk-forward calls score_registry() to
+score the promoted disc_* signals in memory at startup (discovery is the only
+signal source; the hand-curated library and the standalone evaluate.py
+pipeline stage are retired).
 
-For every signal in the generator universe and every configured horizon:
-1. Compute the signal at FULL base-frequency resolution (transforms need the
-   full grid), smooth + cross-sectionally z-score it.
-2. Evaluate at NON-OVERLAPPING horizon stamps on the screening grid
-   (config signals.screening_grid; stride = horizon / grid):
-   - Rank IC per cross-section vs fwd_res_{horizon}. The targets from
-     residual_returns are ALREADY forward sums over bars t+1..t+p - they are
-     consumed directly with NO additional shift. (The previous pipeline
-     double-shifted here and silently measured lag-2 IC. Do not reintroduce.)
-     Overlapping stamps would autocorrelate the IC series and inflate
-     t-stats ~sqrt(stride), making the downstream FDR anti-conservative.
-   - A dollar-neutral leverage-1 backtest at the same stamps.
-   The panel is restricted to the current candidate universe.
-3. Persist compact DAILY aggregates (signal_daily_stats) used by the
-   walk-forward selector, plus whole-period diagnostics (signal_metrics).
-   No giant per-bar signal_values / equity_curves tables.
-
-Usage:
-    python research/signals/evaluate.py [signal_name] [--fresh] [--limit N] [--no-parallel]
-
-    signal_name  one-signal dev mode: refresh and evaluate only that signal.
+Scoring per signal and horizon: compute at FULL base-frequency resolution,
+smooth at a lag-matched halflife, cross-sectionally z-score, then rank-IC and
+a dollar-neutral screening backtest at NON-OVERLAPPING stamps on the
+screening grid. The fwd_* targets are ALREADY forward sums over t+1..t+p -
+consumed with NO additional shift (a double shift here was a real historical
+bug; do not reintroduce). Overlapping stamps would autocorrelate the IC
+series and inflate t-stats ~sqrt(stride).
 """
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import argparse
 import logging
-import os
-import time
 import warnings
 from typing import Dict, List, Optional, Tuple
 
@@ -39,8 +22,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from dbutil import (load_data, save_data, delete_table, delete_rows_where,
-                    delete_rows_in, get_parallel_executor, get_table_columns)
+from dbutil import load_data, get_table_columns
 from config import config as global_config, get, horizon_bars
 
 warnings.filterwarnings('ignore')
@@ -48,8 +30,7 @@ logging.basicConfig(level=logging.WARNING,
                     format=global_config['logging']['format'],
                     datefmt=global_config['logging']['datefmt'])
 
-SCREENING_GRID = os.environ.get('CRYPTO_SIGNAL_SCREENING_GRID',
-                                get('signals.screening_grid', '1h'))
+SCREENING_GRID = get('signals.screening_grid', '1h')
 SMOOTHING_HALFLIFE = get('signals.smoothing_halflife', 3)
 # A cross-section is valid only with enough names: a hard floor AND a fraction
 # of the configured universe size, so quintiles/IC are never measured on a
@@ -71,7 +52,6 @@ LIQ_WINDOW = get('signals.liquidity_window_bars', 144)
 # Stride (in screening-grid steps) per lag: stats must use non-overlapping
 # forward windows, so the stride is the lag measured in grid bars (min 1).
 _GRID_BARS = horizon_bars(SCREENING_GRID)  # screening grid length in base bars
-_TARGET_CACHE_ENV = 'CRYPTO_SIGNAL_EVAL_TARGET_CACHE'
 
 
 def _lag_stride(lag: int) -> int:
@@ -118,11 +98,10 @@ def _nw_tstat(x: np.ndarray, lags='auto') -> float:
 # =============================================================================
 
 def build_registry():
-    """Signal registry {name: info}: the curated SPACES library
-    (research/lib/spaces.py) plus every promoted discovery candidate as a
-    disc_* entry (research/lib/discovered.py; toggle with
-    signals.include_discovered). Discovered entries carry valid_from = their
-    promotion date, which the walk-forward selector honours."""
+    """Signal registry {name: info}: every promoted discovery candidate as
+    a disc_* entry (research/lib/discovered.py) plus any hand-written spaces
+    (research/lib/spaces.py - currently empty by design). Discovered entries
+    carry valid_from = their promotion date, which the selector honours."""
     from research.lib.spaces import build_registry_entries
     entries = build_registry_entries()
     from research.lib.discovered import load_discovered_entries
@@ -870,67 +849,7 @@ def _init_state():
         logging.warning("universe unavailable - evaluating on the full "
                         "feature panel")
 
-    cache_path = os.environ.get(_TARGET_CACHE_ENV)
-    if cache_path and Path(cache_path).exists():
-        cached = pd.read_parquet(cache_path)
-        required = (_required_target_columns() | {'is_liquid', 'liquidity_bucket'})
-        if required.issubset(cached.columns):
-            _set_targets(cached)
-        else:
-            _set_targets(_build_targets())
-    else:
-        _set_targets(_build_targets())
-
-
-def _target_cache_is_compatible(path: Path) -> bool:
-    if not path.exists():
-        return False
-    try:
-        import pyarrow.parquet as pq
-        cols = set(pq.ParquetFile(path).schema_arrow.names)
-    except Exception:
-        try:
-            cols = set(pd.read_parquet(path).columns)
-        except Exception:
-            return False
-    required = (_required_target_columns() | {'is_liquid', 'liquidity_bucket'})
-    return required.issubset(cols)
-
-
-def configure_screening_grid(grid: str) -> None:
-    """Override screening grid for this process and spawned workers."""
-    global SCREENING_GRID, _GRID_BARS, _REGISTRY, _TARGETS, _SCREEN_STAMPS, _GRID_STAMPS
-    if not grid:
-        return
-    SCREENING_GRID = grid
-    _GRID_BARS = horizon_bars(SCREENING_GRID)
-    os.environ['CRYPTO_SIGNAL_SCREENING_GRID'] = grid
-    os.environ.pop(_TARGET_CACHE_ENV, None)
-    _REGISTRY = None
-    _TARGETS = None
-    _SCREEN_STAMPS = None
-    _GRID_STAMPS = None
-
-
-def _prepare_target_cache() -> Optional[Path]:
-    """Materialize targets once so spawned workers do not rebuild them."""
-    cache_env = os.environ.get(_TARGET_CACHE_ENV)
-    if cache_env:
-        cache_path = Path(cache_env)
-        if _target_cache_is_compatible(cache_path):
-            return cache_path
-        os.environ.pop(_TARGET_CACHE_ENV, None)
-    started = time.perf_counter()
-    print("Building shared evaluation data: forward residual targets, "
-          "screening timestamps, and liquid-half flags...", flush=True)
-    _init_state()
-    path = Path(os.environ.get('TMPDIR', '/tmp')) / (
-        f"crypto_signal_eval_targets_{os.getpid()}_{int(time.time())}.parquet")
-    _TARGETS.to_parquet(path, index=False)
-    os.environ[_TARGET_CACHE_ENV] = str(path)
-    print(f"Shared research state ready in "
-          f"{time.perf_counter() - started:,.1f}s", flush=True)
-    return path
+    _set_targets(_build_targets())
 
 
 def _load_features(columns: List[str]) -> pd.DataFrame:
@@ -1178,350 +1097,39 @@ def evaluate_signal(signal_name: str,
     return daily_df, summaries
 
 
-def _error_result(signal_name: str, e: Exception):
-    return signal_name, (pd.DataFrame(),
-                         [{'signal_name': signal_name, 'horizon': '',
-                           'error': str(e)[:200]}])
-
-
-def _evaluate_group_worker(args: Tuple[Tuple[str, ...], List[str]]):
-    """Evaluate all signals sharing one feature-column set on a single load.
-
-    Signals cluster by their input columns (every lookback variant of a
-    transform reads the same features), so loading per GROUP instead of per
-    signal cuts feature-table reads ~30x.
-    """
-    columns, signal_names = args
-    try:
-        _init_state()
-        features = _load_features(list(columns))
-    except Exception as e:
-        return [_error_result(s, e) for s in signal_names]
-
-    results = []
-    for name in signal_names:
-        try:
-            results.append((name, evaluate_signal(name, features)))
-        except Exception as e:
-            results.append(_error_result(name, e))
-    return results
-
-
-def _batch_signal_groups(
-    groups: Dict[Tuple[str, ...], List[str]],
-    max_columns: int,
-    max_signals: int = 0,
-) -> List[Tuple[Tuple[str, ...], List[str]]]:
-    """Greedily pack compatible groups into bounded feature-column batches.
-
-    The old exact-column grouping still scanned the 15M-row features table once
-    per group (425 scans in the current universe). Packing groups that share
-    columns reduces that to roughly a few dozen scans without loading the full
-    167-column table into memory.
-    """
-    batches: List[Tuple[set, List[str]]] = []
-    ordered = sorted(groups.items(),
-                     key=lambda item: (-len(item[0]), -len(item[1]), item[0]))
-    for columns, names in ordered:
-        needed = set(columns)
-        limit = max(max_columns, len(needed))
-        best_idx = None
-        best_score = None
-        for idx, (batch_columns, batch_names) in enumerate(batches):
-            union = batch_columns | needed
-            if len(union) > limit:
-                continue
-            score = (len(batch_columns & needed), -len(union), -len(batch_names))
-            if best_score is None or score > best_score:
-                best_idx, best_score = idx, score
-        if best_idx is None:
-            batches.append((set(needed), list(names)))
-        else:
-            batches[best_idx][0].update(needed)
-            batches[best_idx][1].extend(names)
-    packed = []
-    for columns, names in batches:
-        names = sorted(names)
-        chunk = max_signals if max_signals > 0 else len(names)
-        for start in range(0, len(names), chunk):
-            packed.append((tuple(sorted(columns)), names[start:start + chunk]))
-    return packed
-
-
 # =============================================================================
-# Runner
+# In-memory scoring for the walk-forward
 # =============================================================================
 
-def _processed_signals() -> set:
-    try:
-        existing = load_data('signal_metrics', columns=['signal_name'])
-        if existing is not None and not existing.empty:
-            return set(existing['signal_name'].unique())
-    except Exception:
-        pass
-    return set()
-
-
-def _flush(daily_buffer: list, summary_buffer: list):
-    # Delete-then-append per signal_name so a re-flush *replaces* rather than
-    # *adds*. This makes the writer crash-atomic: if a previous run died between
-    # the two appends below (daily written, metrics not), the affected signals
-    # are reprocessed on resume and their stale daily rows are removed here
-    # instead of duplicating.
-    if daily_buffer:
-        df = pd.concat(daily_buffer, ignore_index=True)
-        delete_rows_in('signal_daily_stats', 'signal_name', df['signal_name'].unique().tolist())
-        save_data('signal_daily_stats', df, mode='append', datetime_columns=['date'])
-        daily_buffer.clear()
-    if summary_buffer:
-        df = pd.DataFrame(summary_buffer)
-        delete_rows_in('signal_metrics', 'signal_name', df['signal_name'].unique().tolist())
-        save_data('signal_metrics', df, mode='append')
-        summary_buffer.clear()
-
-
-def run_all(parallel: bool = True, fresh_start: bool = False, limit: int = 0,
-            signal: str = ''):
-    from tqdm import tqdm
-
-    registry = build_registry()
-    all_signals = sorted(registry.keys())
-    if signal:
-        matches = [s for s in all_signals if s == signal]
-        if not matches:
-            matches = [s for s in all_signals if signal in s]
-        if not matches:
-            raise SystemExit(f"No signal matches: {signal}")
-        all_signals = matches
-    print(f"Signal universe: {len(all_signals)} signals x {len(LAG_GRID)} lags")
-
-    if fresh_start and signal:
-        n_daily = sum(delete_rows_where('signal_daily_stats', 'signal_name', s)
-                      for s in all_signals)
-        n_metrics = sum(delete_rows_where('signal_metrics', 'signal_name', s)
-                        for s in all_signals)
-        print(f"Fresh signal run: removed {n_daily:,} daily rows and "
-              f"{n_metrics:,} metric rows for {len(all_signals)} signal(s)")
-        signals = all_signals
-    elif fresh_start:
-        print("Fresh start: clearing signal_daily_stats and signal_metrics")
-        delete_table('signal_daily_stats')
-        delete_table('signal_metrics')
-        signals = all_signals
-    else:
-        done = _processed_signals()
-        signals = [s for s in all_signals if s not in done]
-        if done:
-            print(f"Skipping {len(done)} already-processed signals")
-
-    if limit > 0:
-        signals = signals[:limit]
-    if not signals:
-        print("Nothing to do")
-        return
-
-    # Group signals by their feature-column set: one load per group
-    groups: Dict[Tuple[str, ...], List[str]] = {}
-    for s in signals:
-        key = tuple(signal_feature_columns(registry[s]['signal_def']))
-        groups.setdefault(key, []).append(s)
-    max_batch_columns = get('compute.signal_batch_max_columns', 8)
-    max_batch_signals = get('compute.signal_batch_max_signals', 200)
-    group_items = _batch_signal_groups(groups, max_batch_columns,
-                                       max_batch_signals)
-    # Start with smaller batches so visible progress arrives quickly, then let
-    # longest-processing-first dominate the remaining makespan.
-    group_items.sort(key=lambda item: len(item[1]))
-
-    print(f"Evaluating {len(signals)} signals in {len(group_items)} "
-          f"column batches from {len(groups)} groups "
-          f"(max {max_batch_columns} columns and {max_batch_signals} "
-          f"signals/batch, screening grid "
-          f"{SCREENING_GRID}, cost {COST_BPS}bps)")
-
-    daily_buffer, summary_buffer = [], []
-    flush_every = 200
-    n_ok = n_err = 0
-
-    def _consume(group_results):
-        nonlocal n_ok, n_err
-        for _, (daily, summaries) in group_results:
-            if not daily.empty:
-                daily_buffer.append(daily)
-            summary_buffer.extend(summaries)
-            if any(s.get('error') for s in summaries):
-                n_err += 1
-            else:
-                n_ok += 1
-        if len(summary_buffer) >= flush_every * len(LAG_GRID):
-            _flush(daily_buffer, summary_buffer)
-
-    if parallel:
-        max_workers = get('compute.signal_workers', 6)
-        # Polars' runtime is NOT fork-safe: forking after the parent has used
-        # Polars deadlocks the workers (they hang on the first Polars call in
-        # _load_features). Default to 'spawn', where each worker starts a clean
-        # interpreter and builds its own panel via _init_state(). Only 'fork'
-        # benefits from a parent-side preload (copy-on-write sharing); under
-        # 'spawn' that preload is wasted work, so skip it.
-        start_method = get('compute.signal_start_method', 'spawn')
-        if start_method == 'fork':
-            print("Building shared evaluation data: forward residual targets, "
-                  "screening timestamps, and liquid-half flags...", flush=True)
-            init_started = time.perf_counter()
-            _init_state()
-            print(f"Shared research state ready in "
-                  f"{time.perf_counter() - init_started:,.1f}s", flush=True)
-        elif start_method == 'spawn':
-            _prepare_target_cache()
-        with get_parallel_executor(max_workers, start_method=start_method) as executor:
-            from concurrent.futures import FIRST_COMPLETED, wait
-            pending = {}
-            next_item = 0
-            while next_item < len(group_items) and len(pending) < max_workers:
-                item = group_items[next_item]
-                pending[executor.submit(_evaluate_group_worker, item)] = item
-                next_item += 1
-            with tqdm(total=len(signals), desc="Signals") as pbar:
-                while pending:
-                    done, _ = wait(set(pending), return_when=FIRST_COMPLETED)
-                    for fut in done:
-                        _, names = pending.pop(fut)
-                        try:
-                            group_results = fut.result()
-                        except Exception as e:
-                            group_results = [_error_result(n, e) for n in names]
-                        _consume(group_results)
-                        pbar.update(len(names))
-                        if next_item < len(group_items):
-                            item = group_items[next_item]
-                            pending[executor.submit(
-                                _evaluate_group_worker, item)] = item
-                            next_item += 1
-    else:
-        with tqdm(total=len(signals), desc="Signals") as pbar:
-            for item in group_items:
-                _consume(_evaluate_group_worker(item))
-                pbar.update(len(item[1]))
-    # (flush threshold below counts summary rows: one per signal per lag)
-
-    _flush(daily_buffer, summary_buffer)
-    print(f"\nDone. OK: {n_ok}, errors: {n_err}")
-
-
-def _list_signals(category: str = '', contains: str = '', limit: int = 100) -> None:
-    """Print signals matching the filters (name, category, type, columns)."""
-    registry = build_registry()
-    rows = []
-    for name, info in sorted(registry.items()):
-        if category and info['category'] != category:
-            continue
-        if contains and contains not in name:
-            continue
-        sdef = info['signal_def']
-        rows.append((name, info['category'], getattr(sdef, 'signal_type', info.get('kind', '')),
-                     ','.join(signal_feature_columns(sdef))))
-    for name, cat, stype, cols in rows[:limit]:
-        print(f"{name:44s} {cat:18s} {stype:24s} {cols}")
-    if len(rows) > limit:
-        print(f"... {len(rows) - limit} more")
-    print(f"{len(rows)} matching signals")
-
-
-def _resolve_signal(name: str) -> str:
-    """Resolve a signal name: exact match wins, else a unique substring match.
-    Lists candidates and exits when the name is unknown or ambiguous."""
-    registry = build_registry()
-    if name in registry:
-        return name
-    matches = sorted(s for s in registry if name in s)
-    if not matches:
-        raise SystemExit(f"Unknown signal: {name!r} (use --list to browse)")
-    if len(matches) > 1:
-        print(f"{name!r} matches {len(matches)} signals - be specific:")
-        for s in matches[:50]:
-            print(f"  {s}")
-        raise SystemExit(1)
-    return matches[0]
-
-
-def evaluate_one(name: str, save: bool = True, days: int = 0) -> None:
-    """Evaluate a single signal and print compact horizon diagnostics.
-
-    save=True (default) refreshes this signal's rows in signal_daily_stats /
-    signal_metrics; save=False is the read-only dev loop (compute + print only).
-    """
+def score_registry(registry: Optional[Dict] = None) -> pd.DataFrame:
+    """Score every registry signal and return the daily-stats frame the
+    walk-forward selector consumes. In memory, nothing persisted: the
+    promoted disc_* set is small, so serial per-column-group evaluation is
+    fine (one feature load per distinct column set)."""
+    global _REGISTRY
     _init_state()
-    registry = build_registry()
-    columns = signal_feature_columns(registry[name]['signal_def'])
-    features = _load_features(columns)
-    daily, summaries = evaluate_signal(name, features)
+    if registry is not None:
+        _REGISTRY = registry          # evaluate_signal reads the module state
+    registry = _REGISTRY
 
-    shown = daily
-    if days and not daily.empty:
-        cutoff = pd.Timestamp(daily['date'].max()) - pd.Timedelta(days=days)
-        shown = daily[pd.to_datetime(daily['date']) >= cutoff]
+    groups: Dict[tuple, list] = {}
+    for name in sorted(registry):
+        key = tuple(signal_feature_columns(registry[name]['signal_def']))
+        groups.setdefault(key, []).append(name)
 
-    print(f"\nSignal: {name}")
-    print(f"Columns: {', '.join(columns) if columns else '(none)'}")
-    print(f"Daily rows: {len(shown):,}")
-    if summaries:
-        summary = pd.DataFrame(summaries)
-        cols = ['horizon', 'ic_mean', 'ic_tstat_hac', 'ic_tstat', 'icir',
-                'ic_liquid', 'ic_liq_bottom', 'ic_liq_top',
-                'q_spread', 'raw_ic_mean', 'raw_ic_tstat_hac',
-                'raw_q_spread', 'n_cross_sections', 'avg_n_assets',
-                'avg_daily_net_ret', 'avg_daily_raw_net_ret',
-                'avg_turnover_per_rebalance', 'error']
-        print(summary[[c for c in cols if c in summary.columns]].to_string(index=False))
-    else:
-        print("No summaries produced")
-
-    if save:
-        n_daily = delete_rows_where('signal_daily_stats', 'signal_name', name)
-        n_metrics = delete_rows_where('signal_metrics', 'signal_name', name)
-        _flush([daily] if not daily.empty else [], list(summaries))
-        print(f"Saved (refreshed {n_daily:,} daily / {n_metrics:,} metric rows)")
-    else:
-        print("Not saved (--no-save): diagnostics only, tables untouched")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Signal evaluation - multi-horizon IC against forward residuals')
-    parser.add_argument('signal', nargs='?',
-                        help='Evaluate only this signal (exact or unique substring); '
-                             'prints diagnostics and refreshes its rows. Omit to run all.')
-    parser.add_argument('--no-save', action='store_true',
-                        help='Single-signal dev loop: compute + print diagnostics, '
-                             'do not write to signal_daily_stats / signal_metrics')
-    parser.add_argument('--days', type=int, default=0,
-                        help='Single-signal: summarize only the last N days of daily stats')
-    parser.add_argument('--list', action='store_true',
-                        help='List signals matching --category / --contains and exit')
-    parser.add_argument('--category', default='', help='Filter --list by category')
-    parser.add_argument('--contains', default='', help='Filter --list by name substring')
-    parser.add_argument('--fresh', action='store_true',
-                        help='Full run: clear all results first')
-    parser.add_argument('--no-parallel', action='store_true', help='Full run: serial')
-    parser.add_argument('--limit', type=int, default=0, help='Full run: first N signals only')
-    parser.add_argument('--screening-grid', default='',
-                        help='Override signals.screening_grid for this run')
-    args = parser.parse_args()
-
-    configure_screening_grid(args.screening_grid)
-
-    if args.list or (not args.signal and (args.category or args.contains)):
-        _list_signals(args.category, args.contains, args.limit or 100)
-        return
-
-    if args.signal:
-        evaluate_one(_resolve_signal(args.signal), save=not args.no_save, days=args.days)
-        return
-
-    run_all(parallel=not args.no_parallel, fresh_start=args.fresh,
-            limit=args.limit)
-
-
-if __name__ == '__main__':
-    main()
+    frames = []
+    for columns, names in sorted(groups.items()):
+        features = _load_features(list(columns))
+        for name in names:
+            try:
+                daily, summaries = evaluate_signal(name, features)
+            except Exception as e:
+                logging.warning(f"scoring failed for {name}: {e}")
+                continue
+            if not daily.empty:
+                frames.append(daily)
+            for row in summaries:
+                if row.get('error'):
+                    logging.warning(f"{name} [{row.get('horizon')}]: "
+                                    f"{row['error']}")
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

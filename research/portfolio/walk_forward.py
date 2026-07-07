@@ -2,7 +2,8 @@
 Walk-Forward Market-Neutral Portfolio.
 
 Per rolling window (train_months -> test_days):
-1. SELECT (training data only, from signal_daily_stats aggregates):
+1. SCORE the promoted disc_* signals in memory (signal_eval.score_registry),
+   then SELECT per window (training data only, from the daily aggregates):
    - Pooled IC stats per (signal, horizon); Bonferroni correction across
      horizons and Benjamini-Yekutieli FDR across dependent signal variants.
    - Threshold filters (IC band, ICIR, Sharpe of daily net returns, turnover).
@@ -13,14 +14,10 @@ Per rolling window (train_months -> test_days):
 3. ALPHA (Grinold): alpha_i[t] = sum_h IC_h * sigma_i * z_{i,h}[t] / sqrt(p_h)
    where IC_h is the pooled training IC of the horizon composite, sigma_i the
    per-asset single-bar residual vol, p_h the horizon length in bars.
-4. OPTIMIZE (portfolio.weight_scheme): 'equal_weight' (default) sizes by the
-   cross-sectional RANK of alpha - covariance-free - while 'mvo' uses the
-   Ledoit-Wolf shrunk covariance of single-bar RESIDUAL returns (refreshed
-   daily). Both impose the same equality constraints [dollar, market-beta,
-   size-beta] = 0, per-name cap and gross leverage 1. The benchmark_scheme is
-   run alongside each window as a monitored foil. Rank sizing is the default
-   because the EW-vs-MVO walk-forward showed the covariance weighting was
-   net-destructive on this low-breadth, negatively-skewed book.
+4. OPTIMIZE: Ledoit-Wolf shrunk-covariance MVO on single-bar RESIDUAL
+   returns (refreshed daily), under equality constraints [dollar,
+   market/size/momentum/vol beta] within neutrality bands, per-name cap and
+   gross leverage 1 scaled by expected-edge-vs-cost.
 5. BACKTEST at asset level on RAW forward returns (the honest test - the
    neutrality constraints, not the residual bookkeeping, must do the hedging),
    with per-side costs on turnover, a volume-participation cap on per-bar
@@ -51,16 +48,15 @@ from dbutil import load_data, save_data, delete_table, delete_rows_where, _scan
 from config import (config as global_config, get, horizon_col,
                     horizon_bars, BASE_FREQUENCY, BARS_PER_DAY)
 from research.lib.portfolio_opt import (shrunk_covariance, solve_constrained_mvo,
-                                              solve_equal_weight,
                                               benjamini_hochberg,
                                               benjamini_yekutieli,
                                               residual_clusters,
                                               cluster_penalty_matrix)
-from research.signals.evaluate import (build_registry, compute_signal_panel,
+from research.lib.signal_eval import (build_registry, compute_signal_panel,
                                       effective_halflife_for,
                                       signal_feature_columns,
                                       load_universe_membership,
-                                      universe_member_mask,
+                                      universe_member_mask, score_registry,
                                       LAG_GRID, SCREENING_GRID, lag_label)
 
 warnings.filterwarnings('ignore')
@@ -77,20 +73,17 @@ FACTOR_NAMES = get('risk_model.factors', ['market', 'size'])
 EXTRA_EXPOSURE_FACTORS = [n for n in FACTOR_NAMES if n not in ('market', 'size')]
 EXTRA_EXPOSURE_COLS = [f'{n}_exposure' for n in EXTRA_EXPOSURE_FACTORS]
 IC_HAC_LAGS = WF.get('ic_hac_lags', 'auto')
-PORTFOLIO_RETURNS_TABLE = 'wf_portfolio_returns'   # production-sizing book
-# Benchmark (foil) sizing scheme run alongside the production book with the same
-# alpha/selection/neutrality - isolates the value of the production risk model.
-PORTFOLIO_RETURNS_BENCH_TABLE = 'wf_portfolio_returns_bench'
+PORTFOLIO_RETURNS_TABLE = 'wf_portfolio_returns'
 SIGNAL_ATTRIBUTION_TABLE = 'wf_portfolio_signal_attribution'
 WEIGHTS_TABLE = 'wf_portfolio_weights'       # per-bar held weight per name
 RISK_TABLE = 'wf_portfolio_risk'             # per-bar predicted risk / cov diagnostics
-BACKTEST_TABLES = (PORTFOLIO_RETURNS_TABLE, PORTFOLIO_RETURNS_BENCH_TABLE,
+BACKTEST_TABLES = (PORTFOLIO_RETURNS_TABLE,
                    'wf_portfolio_windows',
                    'wf_portfolio_exposures', SIGNAL_ATTRIBUTION_TABLE,
                    WEIGHTS_TABLE, RISK_TABLE)
-# 'wf_portfolio_returns_ew' was the old name for the benchmark table (when MVO
-# was production and EW the foil); cleaned up on reset so it can't go stale.
-LEGACY_BACKTEST_TABLES = ('wf_portfolio_equity', 'wf_portfolio_returns_ew')
+# Retired output tables, cleaned up on reset so they can't go stale.
+LEGACY_BACKTEST_TABLES = ('wf_portfolio_equity', 'wf_portfolio_returns_ew',
+                          'wf_portfolio_returns_bench')
 
 
 def _nw_tstat(x: np.ndarray, lags='auto') -> float:
@@ -250,50 +243,23 @@ def edge_gross_multiplier(exp_edge: float, rt_cost: float,
 
 
 def cost_holding_bars(lag_bars: float, turnover: Optional[float],
-                      cfg: Optional[dict] = None) -> float:
-    """Bars a position is credited with earning its per-bar alpha when the
-    no-trade band / edge-scaled gross weigh it against a ROUND-TRIP cost.
+                      max_bars: Optional[float] = None) -> float:
+    """Turnover-implied holding/persistence in bars: lag / per-rebalance
+    turnover, capped at portfolio.cost_holding_max_bars.
 
     Cost is paid per unit TRADED, not per unit time: a bucket that rebalances
     a fraction `turnover` of its book per scoring lag holds a position for
-    ~lag/turnover bars, earning per-bar alpha the whole way while paying for
-    ONE round trip (low turnover <=> persistent z-scores, so the per-bar edge
-    persisting over the held period is the same fact). turnover ~1 (churny
-    fast signal) -> the scoring lag, identical to the legacy accounting;
-    turnover > 1 (flips more than once per lag) -> LESS than the lag;
-    turnover 0.04 (slow carry sleeve) -> ~25x the lag, capped at
-    max_holding_bars. The lag-based accounting under-credited the slow
-    sleeve's edge-per-round-trip ~25x and vetoed the one OOS-proven signal
-    while deploying on fast losers. Missing/invalid turnover or disabled ->
+    ~lag/turnover bars (low turnover <=> persistent z-scores, so the per-bar
+    edge persists as long as the position does). turnover ~1 -> the scoring
+    lag; turnover > 1 (clipped at 2) -> less; missing/invalid turnover ->
     the scoring lag."""
-    cfg = cfg if cfg is not None else get('portfolio.cost_holding', {})
+    if max_bars is None:
+        max_bars = get('portfolio.cost_holding_max_bars', 1008)
     h = max(float(lag_bars), 1.0)
-    if not cfg.get('turnover_based', False):
-        return h
     if turnover is None or not np.isfinite(turnover) or turnover <= 0:
         return h
-    cap = max(float(cfg.get('max_holding_bars', h)), h / 2.0)
+    cap = max(float(max_bars), h / 2.0)
     return float(min(h / min(float(turnover), 2.0), cap))
-
-
-def ic_gate(stats: pd.DataFrame) -> pd.Series:
-    """|IC| floor with an economics override.
-
-    The classic gate demands |ic0| >= min_ic - an edge-STRENGTH proxy
-    calibrated (at zero cost) on the fast library. Measured at 5bps it vetoed
-    the only net-viable sleeve: funding/positioning carry signals with tiny
-    per-stamp IC (~0.004) but microscopic turnover and strong after-cost
-    economics (training sharpe_net +0.8..+1.2, IC t-stats 4-5). IC measures
-    correlation per stamp; sharpe_net measures the thing the book actually
-    earns - so a signal whose training net Sharpe (after amortized costs, in
-    the traded direction) clears min_ic_net_sharpe_override passes this gate
-    regardless of |IC| magnitude. FDR significance and the stability /
-    recent-third / turnover / gross-Sharpe gates still apply on top."""
-    ok = stats['ic0'].abs() >= WF['min_ic']
-    override = WF.get('min_ic_net_sharpe_override')
-    if override is not None and 'sharpe_net' in stats.columns:
-        ok |= stats['sharpe_net'] >= float(override)
-    return ok
 
 
 def filter_valid_from(stats: pd.DataFrame, valid_from: Dict[str, pd.Timestamp],
@@ -332,13 +298,10 @@ def selection_cost_rate(lag_bars: Optional[int]) -> float:
     alpha side (see _backtest_window ic_scale). Charging the full standalone-
     replication cost priced signals as if the book re-optimized stamp by
     stamp, which at realistic cost_bps rejected 93-96% of FDR survivors for
-    turnover the executor never pays. Mirrors ic_scale's gating: amortization
-    applies only while gp_trading models an aim fill, and can be disabled via
-    walk_forward.selection_cost_amortization. Unknown lag -> full cost
-    (conservative)."""
+    turnover the executor never pays. Applies only while gp_trading models an
+    aim fill (mirrors ic_scale). Unknown lag -> full cost (conservative)."""
     cost = PORT['cost_bps'] / 10000.0
     if (lag_bars is None
-            or not WF.get('selection_cost_amortization', True)
             or not PORT.get('gp_trading', {}).get('enabled', False)):
         return cost
     _, kappa = effective_fill_rate()
@@ -410,10 +373,8 @@ class WindowResult:
     bucket_to: Dict[str, float] = field(default_factory=dict)      # bucket -> per-rebalance turnover
     eff_breadth: Dict[str, float] = field(default_factory=dict)
     n_candidates: int = 0
-    oos_returns: Optional[pd.DataFrame] = None  # production-sizing book
-    oos_returns_bench: Optional[pd.DataFrame] = None  # benchmark-sizing foil
+    oos_returns: Optional[pd.DataFrame] = None
     oos_sharpe: float = np.nan
-    oos_sharpe_bench: float = np.nan
     is_sharpe: float = np.nan
     avg_gross: float = np.nan
     avg_turnover: float = np.nan
@@ -447,9 +408,7 @@ class SignalSelector:
         self.signal_categories = signal_categories or {}
         # signal_name -> earliest date its DEFINITION existed (discovered
         # signals: promotion date). Enforced per window in select_decay.
-        self.signal_valid_from = (
-            signal_valid_from
-            if WF.get('respect_signal_valid_from', True) else None) or {}
+        self.signal_valid_from = signal_valid_from or {}
         self.last_candidate_stats = pd.DataFrame()
         self.last_rets = pd.DataFrame()   # selected signals' training daily returns
         self.last_selection_counts: Dict[str, int] = {}
@@ -547,7 +506,7 @@ class SignalSelector:
                   pooled_sign).reindex(ic_mean.index).fillna(False)
 
         # Liquid-half IC and Q5-Q1 tail spread (columns exist for stats
-        # produced by the current signals/evaluate; NaN-safe otherwise)
+        # produced by the current scorer; NaN-safe otherwise)
         if 'liq_ic_sum' in d.columns:
             ic_liq = g['liq_ic_sum'].sum() / g['n_liq'].sum().replace(0, np.nan)
         else:
@@ -683,18 +642,15 @@ class SignalSelector:
             stats.attrs['n_candidates'] = n_cand
             return {}, stats, {}
 
+        # One economics gate + robustness gates. IC magnitude, ICIR, gross
+        # Sharpe and per-signal turnover caps were retired: each was a proxy
+        # for "does this signal earn after costs", which sharpe_net (net of
+        # amortized costs, traded direction) measures directly. Statistical
+        # significance is the FDR step above; robustness is below.
         gates = (
-            ic_gate(stats) &
-            (stats['icir'].abs() >= WF['min_icir']) &
-            (stats['sharpe'] >= WF['min_sharpe_threshold']) &
-            (stats['avg_turnover'] <= WF['max_signal_turnover']) &
+            (stats['sharpe_net'] >= WF['min_net_sharpe_threshold']) &
             (stats['stable_thirds'] >= WF['min_stable_thirds'])
         )
-        # Cost-aware economic floor: the signal must clear its own trading cost at
-        # its rebalance horizon. None -> off (gross-only behaviour); 0.0 -> require
-        # the net edge to at least break even after cost_bps/side.
-        if WF.get('min_net_sharpe_threshold') is not None:
-            gates &= (stats['sharpe_net'] >= WF['min_net_sharpe_threshold'])
         if self.min_holding_lag > 0:
             # The speed floor compares against the signal's turnover-implied
             # PERSISTENCE (scoring lag / per-rebalance turnover), not the raw
@@ -704,10 +660,9 @@ class SignalSelector:
             # Mirrors the aim discount / cost amortization in the backtest
             # (cost_holding_bars), so selection and execution keep pricing
             # signal speed identically.
-            hold_cfg = PORT.get('cost_holding', {})
             eff_hold = stats.apply(
                 lambda r: cost_holding_bars(r['holding_lag'],
-                                            r['avg_turnover'], hold_cfg),
+                                            r['avg_turnover']),
                 axis=1)
             gates &= (eff_hold >= self.min_holding_lag)
         if WF.get('require_recent_third', True):
@@ -861,21 +816,11 @@ class SignalSelector:
 
     @staticmethod
     def _combination_strength(stats: pd.DataFrame, signals) -> Dict[str, float]:
-        """Per-signal strength vector for the composite combination.
-
-        basis 'net_sharpe' (default): the signal's training-window NET Sharpe
-        (after amortized costs, traded direction), clipped at 0 - the direct
-        measurement of the after-cost value the composite exists to maximize.
-        basis 'ic': legacy |training IC| (Grinold's gross-IR optimum). IC is
-        per-stamp correctness and contains NO cost information: it weighted
-        churny co-signals (IC 0.01, net ~0) 2.5x over the OOS-proven funding
-        sleeve (IC 0.004, net ~+1), keeping the aim jittery and overriding
-        the sleeve's funding tilt. Fifth and last IC-as-proxy site converted
-        to measured economics (after the IC gate override, the amortized
-        selection cost, the holding-period credit and the persistence floor).
-        Missing/NaN values count as 0 strength."""
-        basis = WF.get('signal_combination', {}).get('basis', 'net_sharpe')
-        if basis == 'net_sharpe' and 'sharpe_net' in stats.columns:
+        """Per-signal strength vector for the composite combination: the
+        signal's training-window NET Sharpe (after amortized costs, traded
+        direction), clipped at 0 - the direct measurement of the after-cost
+        value the composite exists to maximize. Missing/NaN -> 0 strength."""
+        if 'sharpe_net' in stats.columns:
             v = dict(zip(stats['signal_name'], stats['sharpe_net']))
         else:
             v = dict(zip(stats['signal_name'], stats['ic_mean'].abs()))
@@ -901,22 +846,14 @@ class SignalSelector:
     @staticmethod
     def combination_weights(stats: pd.DataFrame, selected: List[str],
                             rets: pd.DataFrame) -> Dict[str, float]:
-        """Covariance-aware signal combination (Grinold 'combining signals',
-        net-economics variant).
-
-        Combo weights w proportional to C^{-1} . strength, where C is the
-        correlation of the signals' TRADED-DIRECTION daily returns and
-        strength is the configured basis (_combination_strength: training net
-        Sharpe by default, legacy |IC| via signal_combination.basis). The
-        C^{-1} term down-weights redundant signals and up-weights unique ones
-        - exploiting the diversification flat weighting throws away. C is
-        shrunk toward the identity for stability; negative (anti-)weights are
-        clipped to 0 so a noisy correlation can't flip a signal into being
-        shorted. Returns POSITIVE per-signal weights summing to 1 (the caller
-        applies each signal's sign). This is the ONLY weighting system; when
-        it cannot run (disabled, or fewer than 2 signals with return history)
-        the fallback is plain strength-proportional weights (_ic_weights) -
-        no extra parameters.
+        """Covariance-aware signal combination: w proportional to
+        C^{-1} . strength, where C is the correlation of the signals'
+        TRADED-DIRECTION daily returns and strength is the training net
+        Sharpe (_combination_strength). C^{-1} down-weights redundant
+        signals; C is shrunk toward the identity for stability; negative
+        (anti-)weights are clipped to 0. Returns POSITIVE weights summing to
+        1 (the caller applies each signal's sign). Fallback (disabled, or <2
+        signals with return history): plain strength-proportional weights.
         """
         cfg = WF.get('signal_combination', {})
         cols = [s for s in selected if rets is not None and s in rets.columns]
@@ -1033,16 +970,14 @@ class DataContext:
         # speed and NO participation cap (warned loudly - the cap silently
         # vanishing would overstate capacity).
         self.dollar_vol_wide = None
-        if (PORT.get('liquidity_aware', {}).get('enabled')
-                or PORT.get('participation', {}).get('enabled')):
-            try:
-                pv = _wide_panel('prices', 'quote_asset_volume')
-                if not pv.empty:
-                    self.dollar_vol_wide = pv
-            except Exception as e:  # missing column / table -> graceful fallback
-                logging.warning(f"no dollar-volume panel ({e}); falling back to "
-                                "flat costs / scalar trade speed / NO "
-                                "volume-participation cap")
+        try:
+            pv = _wide_panel('prices', 'quote_asset_volume')
+            if not pv.empty:
+                self.dollar_vol_wide = pv
+        except Exception as e:  # missing column / table -> graceful fallback
+            logging.warning(f"no dollar-volume panel ({e}); falling back to "
+                            "flat costs / scalar trade speed / NO "
+                            "volume-participation cap")
 
         # Funding-rate panel (settlement stamp x symbol) for the funding-PnL
         # accrual. Padded one bar past the context end: a settlement at exactly
@@ -1097,22 +1032,35 @@ class DataContext:
 
 class WalkForwardPortfolio:
     def __init__(self):
-        daily_stats = load_data('signal_daily_stats')
-        if daily_stats.empty:
-            raise RuntimeError("signal_daily_stats is empty - run research/signals/evaluate.py first")
+        # Discovery is the only signal source: the registry holds the
+        # promoted disc_* candidates, which are SCORED here in memory
+        # (research/lib/signal_eval.score_registry) - there is no separate
+        # scoring pipeline stage or signal_daily_stats table.
         self.registry = build_registry()
-        known = set(self.registry)
-        before = len(daily_stats)
-        daily_stats = daily_stats[daily_stats['signal_name'].isin(known)].copy()
-        dropped = before - len(daily_stats)
-        if dropped:
-            logging.warning(f"Dropped {dropped:,} signal_daily_stats rows with "
-                            "no current registry entry")
+        if not self.registry:
+            raise RuntimeError(
+                "signal registry is empty - run "
+                "research/signals/agent/run_discovery.py first (promoted "
+                "candidates are the only signal source)")
+        logging.info(f"Scoring {len(self.registry)} promoted signals across "
+                     f"the {len(LAG_GRID)}-lag grid...")
+        daily_stats = score_registry(self.registry)
+        if daily_stats.empty:
+            raise RuntimeError("scoring produced no daily stats - check that "
+                               "features/residual_returns cover the "
+                               "walk-forward window")
         categories = {name: info.get('family') or info.get('category', name)
                       for name, info in self.registry.items()}
         valid_from = {name: pd.Timestamp(info['valid_from'])
                       for name, info in self.registry.items()
                       if info.get('valid_from') is not None}
+        # Fitted alpha half-life (bars) from each signal's discovery train
+        # profile: caps the turnover-implied persistence below, so alpha is
+        # never aim-discounted as if it outlived its own term structure.
+        self.signal_half_life = {
+            name: float(info['half_life_bars'])
+            for name, info in self.registry.items()
+            if info.get('half_life_bars')}
         if valid_from:
             logging.info(f"{len(valid_from)} discovered (disc_*) signals in "
                          "the registry; each selectable only from its "
@@ -1123,17 +1071,8 @@ class WalkForwardPortfolio:
         self._ctx_end: Optional[pd.Timestamp] = None
         self.universe_members = load_universe_membership()
         self.windows: List[WindowResult] = []
-        # Production sizing scheme + the benchmark foil run alongside it.
-        # 'equal_weight' (rank) is the default production scheme; 'mvo' the foil.
-        self.weight_scheme = get('portfolio.weight_scheme', 'equal_weight')
-        self.benchmark_scheme = get('portfolio.benchmark_scheme', 'mvo')
-        self.compare_benchmark = (bool(self.benchmark_scheme)
-                                  and self.benchmark_scheme != self.weight_scheme)
-        # Active scheme during a backtest pass (set by _backtest_scheme).
-        self._weight_scheme = self.weight_scheme
-        # Held book carried across contiguous windows (see _backtest_window),
-        # one per scheme so production and benchmark evolve independent history.
-        self._carry: Dict[str, pd.Series] = {}
+        # Held book carried across contiguous windows (see _backtest_window).
+        self._carry: pd.Series = pd.Series(dtype=float)
 
     def _set_context_bounds(self, schedule: List[Tuple[pd.Timestamp,
                                                        pd.Timestamp,
@@ -1146,9 +1085,8 @@ class WalkForwardPortfolio:
         liq_days = (int(liq_cfg.get('adv_window_days', 0))
                     if liq_cfg.get('enabled') else 0)
         part_cfg = PORT.get('participation', {})
-        part_days = (int(np.ceil(int(part_cfg.get('volume_window_bars', 0))
-                                 / BARS_PER_DAY))
-                     if part_cfg.get('enabled') else 0)
+        part_days = int(np.ceil(int(part_cfg.get('volume_window_bars', 0))
+                                / BARS_PER_DAY))
         warmup_days = max(int(PORT['cov_window_days']),
                           int(PORT['residual_vol_window_days']),
                           liq_days, part_days,
@@ -1230,7 +1168,7 @@ class WalkForwardPortfolio:
             n_candidates = self.selector.last_selection_counts.get('candidates', 0)
 
         selected, weights, bucket_ic, bucket_h = {}, {}, {}, {}
-        bucket_to = {}
+        bucket_to, bucket_hl = {}, {}
         for lab, sigs in buckets.items():
             if not sigs:
                 continue
@@ -1257,6 +1195,14 @@ class WalkForwardPortfolio:
                 abs(w) * (to_map.get(s) if np.isfinite(to_map.get(s, np.nan))
                           else 1.0)
                 for s, w in weights[lab].items()) / max(wsum, 1e-12))
+            # |weight|-averaged fitted alpha half-life of the bucket's
+            # signals (bars): None when no signal carries one.
+            hls = [(abs(w), self.signal_half_life[s])
+                   for s, w in weights[lab].items()
+                   if s in self.signal_half_life]
+            bucket_hl[lab] = (float(sum(w * h for w, h in hls)
+                                    / max(sum(w for w, _ in hls), 1e-12))
+                              if hls else None)
 
         if not selected and WF.get('fallback_to_previous') and prev and prev.selected:
             selected, bucket_ic, bucket_h = (prev.selected, prev.horizon_ic,
@@ -1302,9 +1248,9 @@ class WalkForwardPortfolio:
             return res
 
         self._ensure_context()
-        bt_returns = self._backtest_scheme(self.weight_scheme, composites,
-                                           bucket_ic, bucket_h, bucket_to,
-                                           train_end, test_end)
+        bt_returns = self._backtest_window(composites, bucket_ic, bucket_h,
+                                           bucket_to, train_end, test_end,
+                                           bucket_hl=bucket_hl)
         if bt_returns is None or bt_returns.empty:
             return res
 
@@ -1338,38 +1284,7 @@ class WalkForwardPortfolio:
             logging.info(f"  half-alpha: cost/exp_alpha={res.cost_to_alpha:.2f} "
                          f"(~0.5 ideal), net/gross={res.net_to_gross:.2f}")
 
-        # Benchmark (foil) sizing on the SAME composites/selection: only the
-        # risk model differs, so production-minus-benchmark isolates what the
-        # production risk model adds (or destroys).
-        if self.compare_benchmark:
-            bench = self._backtest_scheme(self.benchmark_scheme, composites,
-                                          bucket_ic, bucket_h, bucket_to,
-                                          train_end, test_end)
-            if bench is not None and not bench.empty:
-                res.oos_returns_bench = bench[[
-                    'gross_return', 'net_return', 'net_return_lag1',
-                    'funding_pnl', 'turnover', 'gross_exposure',
-                    'mkt_exposure', 'size_exposure',
-                ]]
-                std_b = bench['net_return'].std()
-                res.oos_sharpe_bench = (float(bench['net_return'].mean() / std_b *
-                                              np.sqrt(ppy)) if std_b > 0 else 0.0)
         return res
-
-    def _backtest_scheme(self, scheme: str, composites: Dict[str, pd.DataFrame],
-                         bucket_ic: Dict[str, float], bucket_h: Dict[str, float],
-                         bucket_to: Dict[str, float],
-                         test_start: pd.Timestamp,
-                         test_end: pd.Timestamp) -> Optional[pd.DataFrame]:
-        """Run `_backtest_window` under a given weighting scheme, restoring the
-        active scheme afterward. Each scheme carries its own position history."""
-        prev = self._weight_scheme
-        self._weight_scheme = scheme
-        try:
-            return self._backtest_window(composites, bucket_ic, bucket_h,
-                                         bucket_to, test_start, test_end)
-        finally:
-            self._weight_scheme = prev
 
     def _signal_oos_attribution(self, sel: pd.DataFrame, test_start: pd.Timestamp,
                                 test_end: pd.Timestamp, idx: int) -> List[dict]:
@@ -1425,7 +1340,9 @@ class WalkForwardPortfolio:
                          bucket_h: Dict[str, float],
                          bucket_to: Dict[str, float],
                          test_start: pd.Timestamp,
-                         test_end: pd.Timestamp) -> Optional[pd.DataFrame]:
+                         test_end: pd.Timestamp,
+                         bucket_hl: Optional[Dict[str, float]] = None
+                         ) -> Optional[pd.DataFrame]:
         if self.ctx is None:
             self._ensure_context()
         # Per-window diagnostic side-channels (read by run_window after this call);
@@ -1481,12 +1398,19 @@ class WalkForwardPortfolio:
         # slow-carry bucket whose ranking barely moves is fillable by a slow
         # book even though its SCORING lag is short (the lag-based discount
         # wrote off the OOS-proven funding sleeve as unfillable).
-        hold_cfg = PORT.get('cost_holding', {})
-        hold_bars = {b: cost_holding_bars(bucket_h.get(b, 1.0),
-                                          (bucket_to or {}).get(b), hold_cfg)
-                     for b in composites}
-        if (hold_cfg.get('turnover_based') and composites
-                and self._weight_scheme == self.weight_scheme):
+        # Turnover-implied persistence, CAPPED by the bucket's fitted alpha
+        # half-life (from the discovery train profile) when one exists: low
+        # turnover says the POSITIONS live long, the half-life says how long
+        # the ALPHA does - the discount must honor the shorter of the two.
+        hold_bars = {}
+        for b in composites:
+            h = cost_holding_bars(bucket_h.get(b, 1.0),
+                                  (bucket_to or {}).get(b))
+            hl = (bucket_hl or {}).get(b)
+            if hl is not None and np.isfinite(hl) and hl > 0:
+                h = min(h, float(hl))
+            hold_bars[b] = h
+        if composites:
             logging.info(
                 "  holding/persistence (bars): %s",
                 ", ".join(f"{b}:{hold_bars[b]:.0f} (to {(bucket_to or {}).get(b, float('nan')):.2f})"
@@ -1513,9 +1437,8 @@ class WalkForwardPortfolio:
             ic_scale_raw[b] = raw
             p_b = hold_bars[b]
             ic_scale[b] = raw * (p_b / (p_b + 1.0 / kappa)) if gp_on else raw
-        # Observability: how hard the execution layer scales each bucket. Logged
-        # for the production scheme only (identical for the benchmark foil).
-        if gp_on and self._weight_scheme == self.weight_scheme:
+        # Observability: how hard the execution layer scales each bucket.
+        if gp_on:
             disc = {b: hold_bars[b] / (hold_bars[b] + 1.0 / kappa)
                     for b in composites}
             logging.info(
@@ -1592,8 +1515,7 @@ class WalkForwardPortfolio:
         # decided). Rows follow `bars`, columns follow fwd_columns so
         # fwd_col_positions indexes this panel too.
         part_cfg = PORT.get('participation', {})
-        part_on = (bool(part_cfg.get('enabled'))
-                   and self.ctx.dollar_vol_wide is not None)
+        part_on = self.ctx.dollar_vol_wide is not None
         vol_ma_values_all = None
         part_rate = book_size = np.nan
         part_window_bars = 0
@@ -1611,7 +1533,7 @@ class WalkForwardPortfolio:
         A = pd.DataFrame()
         target_index = pd.Index([])
         target_values = np.array([], dtype=float)
-        carry = self._carry.get(self._weight_scheme, pd.Series(dtype=float))
+        carry = self._carry
         held_index = carry.index
         held_values = carry.values.astype(float, copy=True)
         alpha_values = np.array([], dtype=float)
@@ -1696,13 +1618,6 @@ class WalkForwardPortfolio:
                 # speed never vetoes a profitable signal.
                 alpha = pd.Series(0.0, index=assets)
                 alpha_h = pd.Series(0.0, index=assets)
-                # `score_z` is the VOL-FREE combined score (sum of ic_scale * z,
-                # no sigma). It is the ordering basis for the rank/equal-weight
-                # book: sigma belongs in alpha only when a risk term penalizes
-                # sigma^2 (the MVO); ranking on sigma*z just tilts the rank
-                # book's extremes toward the highest-vol names with no
-                # offsetting risk penalty - a pure Sharpe drag.
-                score_z = pd.Series(0.0, index=assets)
                 got_signal = False
                 for h, score in held_scores.items():
                     z = score.reindex(assets)
@@ -1711,7 +1626,6 @@ class WalkForwardPortfolio:
                     zf = z.fillna(0.0)
                     sig_z = sigma.reindex(assets) * zf
                     alpha = alpha.add(ic_scale[h] * sig_z, fill_value=0.0)
-                    score_z = score_z.add(ic_scale[h] * zf, fill_value=0.0)
                     alpha_h = alpha_h.add(
                         ic_scale_raw[h] * sig_z * hold_bars[h],
                         fill_value=0.0)
@@ -1731,9 +1645,6 @@ class WalkForwardPortfolio:
                           else pd.Series(1.0, index=assets))
                     band = no_trade_mult * cost_rate * cm
                     alpha = alpha.where(alpha_h.abs() >= band, 0.0)
-                    # The rank basis must honour the same gate, or the rank
-                    # book would still allocate to unmonetizable names.
-                    score_z = score_z.where(alpha != 0.0, 0.0)
                     if alpha.abs().sum() < 1e-15:
                         target_valid = False
                         continue
@@ -1759,7 +1670,6 @@ class WalkForwardPortfolio:
                     target_valid = False
                     continue
                 alpha = alpha.reindex(assets).fillna(0.0)
-                score_z = score_z.reindex(assets).fillna(0.0)
 
                 # Constraints: dollar + factor-beta neutrality
                 cons = {'dollar': pd.Series(1.0, index=assets)}
@@ -1789,21 +1699,10 @@ class WalkForwardPortfolio:
                 n_clusters_day = len(clusters) if clusters else 0
                 max_cluster_day = max((len(c) for c in clusters), default=0)
 
-                # Same neutrality (A), cap and gross for both schemes; only the
-                # sizing basis differs: the rank book orders by the vol-free
-                # score_z (ranks + no risk term -> sigma must NOT enter), the
-                # MVO takes the sigma-scaled Grinold alpha (its risk term
-                # penalizes sigma^2, restoring the correct z/sigma tilt).
-                if self._weight_scheme == 'equal_weight':
-                    w_target = solve_equal_weight(score_z, A,
-                                                  max_position=cap,
-                                                  gross_leverage=gross_target,
-                                                  bands=bands)
-                else:
-                    w_target = solve_constrained_mvo(alpha, cov_a, A,
-                                                     max_position=cap,
-                                                     gross_leverage=gross_target,
-                                                     bands=bands)
+                w_target = solve_constrained_mvo(alpha, cov_a, A,
+                                                 max_position=cap,
+                                                 gross_leverage=gross_target,
+                                                 bands=bands)
                 # Edge-scaled gross: shrink the aim when its expected horizon
                 # edge cannot cover edge_mult round trips - never trade a
                 # gross-1 book on alpha that can't pay for itself. Identity
@@ -2037,14 +1936,14 @@ class WalkForwardPortfolio:
 
         # Persist the final book so the next contiguous window starts from it
         # (per scheme - MVO and equal-weight keep independent position history).
-        self._carry[self._weight_scheme] = pd.Series(held_values, index=held_index)
+        self._carry = pd.Series(held_values, index=held_index)
         if not rows:
             return None
 
         # Binding-constraint summary (production scheme): if the turnover budget
         # binds on ~all bars, the GP trade_urgency knob is inert and the budget
         # alone sets the book's speed - worth knowing before tuning either.
-        if risk_rows and self._weight_scheme == self.weight_scheme:
+        if risk_rows:
             n_bound = sum(1 for r in risk_rows if r['budget_bound'])
             rates = np.array([r['trade_rate'] for r in risk_rows], dtype=float)
             logging.info(
@@ -2118,7 +2017,7 @@ class WalkForwardPortfolio:
         self._run_ts = datetime.now()
         self._cum_wealth = 1.0
         self._peak_wealth = 1.0
-        self._carry = {}  # fresh run starts flat (per scheme)
+        self._carry = pd.Series(dtype=float)  # fresh run starts flat
         self._reset_backtest_tables()
 
         prev = None
@@ -2150,7 +2049,6 @@ class WalkForwardPortfolio:
     def _clear_window_outputs(window_idx: int) -> None:
         delete_rows_where('wf_portfolio_windows', 'window_idx', window_idx)
         delete_rows_where(PORTFOLIO_RETURNS_TABLE, 'window', window_idx)
-        delete_rows_where(PORTFOLIO_RETURNS_BENCH_TABLE, 'window', window_idx)
         delete_rows_where('wf_portfolio_exposures', 'window', window_idx)
         delete_rows_where(SIGNAL_ATTRIBUTION_TABLE, 'window_idx', window_idx)
         delete_rows_where(WEIGHTS_TABLE, 'window', window_idx)
@@ -2175,9 +2073,6 @@ class WalkForwardPortfolio:
 
         print("\n" + "=" * 70)
         print("WALK-FORWARD MARKET-NEUTRAL PORTFOLIO")
-        print(f"Sizing: {self.weight_scheme}" +
-              (f"   (benchmark foil: {self.benchmark_scheme})"
-               if self.compare_benchmark else ""))
         print("=" * 70)
         print(f"Annual return:      {ann_ret * 100:+.1f}%")
         print(f"Annual vol:         {ann_vol * 100:.1f}%")
@@ -2194,34 +2089,16 @@ class WalkForwardPortfolio:
             print(f"Funding PnL (ann.): {ann_funding * 100:+.1f}%  "
                   f"(perp funding on held positions; included in net)")
 
-        # Benchmark (foil) sizing: same selection/alpha/neutrality, different
-        # risk model. production-minus-benchmark = the value the production risk
-        # model adds; <= 0 means the foil sizing is as good or better.
-        bench_oos = [w.oos_returns_bench for w in self.windows
-                     if w.oos_returns_bench is not None and not w.oos_returns_bench.empty]
-        if bench_oos:
-            b_r = pd.concat(bench_oos).sort_index()['net_return']
-            b_ann = b_r.mean() * ppy
-            b_vol = b_r.std() * np.sqrt(ppy)
-            b_sharpe = b_ann / b_vol if b_vol > 0 else 0.0
-            print(f"\nBenchmark sizing '{self.benchmark_scheme}', same selection/alpha:")
-            print(f"  benchmark annual return: {b_ann * 100:+.1f}%   "
-                  f"benchmark Sharpe: {b_sharpe:.2f}   "
-                  f"(production '{self.weight_scheme}' Sharpe {sharpe:.2f}; "
-                  f"production-minus-benchmark = {sharpe - b_sharpe:+.2f})")
         # Per-window detail as an aligned table. Buckets are the distinct
         # selected lags ('3b:5' = 5 signals held at the 3-bar lag); top
         # families are abbreviated to the three largest (full breakdown lives
         # in the notebook's attribution view).
         row = ("  {win:<4}{period:<24}{nsig:>5}  {bkt:<20}{eff:>14}"
-               "{sr:>8}{bchsr:>8}{rho:>8}{sign:>7}{mkt:>9}  {fam}")
-        print(f"\nPer-window detail (buckets = selected lags; "
-              f"OOS_SR = production '{self.weight_scheme}'"
-              + (f", BCH_SR = benchmark '{self.benchmark_scheme}'"
-                 if self.compare_benchmark else "") + "):")
+               "{sr:>8}{rho:>8}{sign:>7}{mkt:>9}  {fam}")
+        print("\nPer-window detail (buckets = selected lags):")
         print(row.format(win='Win', period='OOS test period', nsig='#sig',
                          bkt='lag:sigs', eff='effN', sr='OOS_SR',
-                         bchsr='BCH_SR', rho='IC_rho', sign='sign', mkt='|mkt|',
+                         rho='IC_rho', sign='sign', mkt='|mkt|',
                          fam='top families'))
         for w in self.windows:
             labs = sorted(w.selected, key=lambda s: int(str(s).rstrip('b') or 0))
@@ -2240,8 +2117,6 @@ class WalkForwardPortfolio:
                 bkt=bkt or '-',
                 eff=eff or '-',
                 sr=f'{w.oos_sharpe:.2f}',
-                bchsr=(f'{w.oos_sharpe_bench:.2f}'
-                       if np.isfinite(w.oos_sharpe_bench) else '-'),
                 rho=f'{w.train_oos_ic_rank_corr:.2f}',
                 sign=f'{w.train_oos_ic_sign_accuracy:.0%}',
                 mkt=f'{mkt:.4f}',
@@ -2331,16 +2206,6 @@ class WalkForwardPortfolio:
         save_data('wf_portfolio_exposures', exp, mode='append',
                   datetime_columns=['timestamp', 'run_timestamp'])
 
-        # Benchmark (foil) sizing returns: raw per-bar streams; the notebook
-        # cumulates and de-overlaps them exactly as for the production book.
-        if res.oos_returns_bench is not None and not res.oos_returns_bench.empty:
-            bench = (res.oos_returns_bench.reset_index()
-                     .rename(columns={'index': 'timestamp'}))
-            bench['window'] = res.window_idx
-            bench['run_timestamp'] = self._run_ts
-            save_data(PORTFOLIO_RETURNS_BENCH_TABLE, bench, mode='append',
-                      datetime_columns=['timestamp', 'run_timestamp'])
-
         # Per-bar held weights (enables exact position-cap audits + per-name PnL)
         # and per-bar predicted risk / covariance diagnostics.
         if res.oos_weights is not None and not res.oos_weights.empty:
@@ -2358,16 +2223,7 @@ class WalkForwardPortfolio:
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='Walk-forward market-neutral portfolio')
-    parser.add_argument('--no-benchmark', action='store_true',
-                        help='Skip the benchmark (foil) sizing pass '
-                             '(faster production-only run)')
-    args = parser.parse_args()
-
     wf = WalkForwardPortfolio()
-    if args.no_benchmark:
-        wf.compare_benchmark = False
     # run() checkpoints each window to the DB (wf_portfolio_*) as it traverses.
     returns = wf.run()
     if returns.empty:

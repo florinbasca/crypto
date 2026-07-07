@@ -13,7 +13,7 @@ a sequential mini-simulation that mirrors the _backtest_window ordering
 (GP step -> clamp -> clip/neutralize loop -> gross scale -> final clamp),
 asserting the cap holds bar by bar after all adjustments.
 
-Run: uv run python tests/participation_cap_checks.py
+Run: uv run tests/participation_cap_checks.py
 """
 
 import sys
@@ -177,11 +177,11 @@ from config import get, config as global_config   # import runs validate_config
 part_cfg = get('portfolio.participation', {})
 check("portfolio.participation block exists with all keys",
       all(k in part_cfg for k in
-          ('enabled', 'book_size_usd', 'max_participation',
-           'volume_window_bars')))
-check("discovery backtest cost falls back to portfolio.cost_bps",
-      global_config['discovery']['backtest']['cost_bps'] is None)
-check("portfolio.cost_bps is set (signals scored net of cost)",
+          ('book_size_usd', 'max_participation', 'volume_window_bars')))
+check("discovery has NO backtest block (purely statistical; the "
+      "walk-forward is the only money judge)",
+      'backtest' not in global_config['discovery'])
+check("portfolio.cost_bps is set (the book is scored net of cost)",
       float(get('portfolio.cost_bps')) > 0.0,
       f"(cost_bps {get('portfolio.cost_bps')})")
 

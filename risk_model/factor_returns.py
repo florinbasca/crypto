@@ -1,5 +1,5 @@
 """
-Factor Returns: Market (equal-weight) + Size / Momentum / Vol (rank-weighted spreads).
+Factor Returns: Market (equal-weight) + Size / Momentum / Vol / Meme (rank-weighted spreads).
 
 All factors are TRADABLE PORTFOLIO RETURNS in return units, computed per
 base-frequency bar over the current candidate universe:
@@ -55,6 +55,9 @@ MCAP_MAX_STALENESS_DAYS = get('risk_model.size.mcap_max_staleness_days', 7)
 MOM_LOOKBACK_DAYS = get('risk_model.momentum.lookback_days', 30)
 MOM_SKIP_DAYS = get('risk_model.momentum.skip_days', 2)
 VOL_LOOKBACK_DAYS = get('risk_model.vol.lookback_days', 30)
+MEME_ANCHORS = get('risk_model.meme.anchor_symbols', [])
+MEME_CORR_DAYS = get('risk_model.meme.corr_window_days', 60)
+MEME_MIN_DAYS = get('risk_model.meme.min_corr_days', 30)
 
 
 def load_returns_wide() -> pd.DataFrame:
@@ -143,6 +146,32 @@ def compute_vol_char(returns: pd.DataFrame) -> pd.DataFrame:
     min_p = max(2, VOL_LOOKBACK_DAYS // 2)
     rv = daily_var.rolling(VOL_LOOKBACK_DAYS, min_periods=min_p).sum()
     return np.sqrt(rv.shift(1))
+
+
+def compute_meme_char(returns: pd.DataFrame) -> pd.DataFrame:
+    """Meme-ness per name, STRICTLY before each date: trailing correlation of
+    MARKET-ADJUSTED daily returns with an anchor meme index (equal-weight
+    daily return of the fixed anchor seed, also market-adjusted).
+
+    Market adjustment = subtract the cross-sectional mean daily return, so
+    plain beta doesn't masquerade as meme-ness. The anchor seed is tiny and
+    pre-sample-canonical (point-in-time safe); any new meme acquires high
+    anchor correlation within weeks of listing, so membership self-updates
+    with no list maintenance. shift(1): the bar's own day excluded.
+    """
+    if not MEME_ANCHORS:
+        return pd.DataFrame()
+    daily = _daily_log_returns(returns)
+    adj = daily.sub(daily.mean(axis=1), axis=0)          # market-adjusted
+    anchor_cols = [c for c in MEME_ANCHORS if c in adj.columns]
+    if not anchor_cols:
+        return pd.DataFrame()
+    anchor = adj[anchor_cols].mean(axis=1)
+    min_p = max(2, int(MEME_MIN_DAYS))
+    corr = adj.rolling(int(MEME_CORR_DAYS), min_periods=min_p).corr(anchor)
+    # The anchors themselves correlate with the index by construction; that
+    # is correct - they ARE the meme tail.
+    return corr.shift(1)
 
 
 def _daily_rank_weights(char_wide: pd.DataFrame, unique_dates: pd.DatetimeIndex,
@@ -242,6 +271,7 @@ def compute_factor_returns(returns: pd.DataFrame,
         ('size', mcap if not mcap.empty else None, True),   # long small mcap
         ('momentum', compute_momentum_char(returns), False),  # long winners
         ('vol', compute_vol_char(returns), True),             # long low vol
+        ('meme', compute_meme_char(returns), False),          # long high meme-corr
     ]
     for name, char_wide, low_is_long in char_specs:
         weight_map = _daily_rank_weights(char_wide, unique_dates, membership, low_is_long)

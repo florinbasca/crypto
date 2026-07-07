@@ -7,7 +7,7 @@ book trades each bar. It must be cost-responsive (trade slower when costs are
 higher), reproduce the legacy halflife rate at the reference cost, fall back to
 the halflife when disabled, and stay a valid fraction in (0, 1).
 
-Run: uv run python tests/portfolio_trade_rate_checks.py
+Run: uv run tests/portfolio_trade_rate_checks.py
 """
 
 import sys

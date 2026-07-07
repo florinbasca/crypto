@@ -13,7 +13,7 @@ Synthetic-data checks for the agentic signal discovery engine
    effect, the ledger is complete, runs are reproducible, and the OOS book
    is dollar-neutral.
 
-Run: uv run python tests/discovery_checks.py
+Run: uv run tests/discovery_checks.py
 """
 
 import copy
@@ -29,7 +29,7 @@ from config import get
 from research.signals.agent import generation as gen
 from research.signals.agent import data as data_mod
 from research.signals.agent import search as search_mod
-from research.signals.agent import backtest as bt_mod
+from research.signals.agent import promotion as bt_mod
 
 rng = np.random.default_rng(7)
 FAILURES = []
@@ -60,10 +60,12 @@ def test_cfg():
     }
     cfg['search'].update({'seed': 7, 'n_generations': 2, 'batch_size': 8,
                           'survivors': 6, 'diversity_max_corr': 0.9})
+    # min_select_days 0: the synthetic select window is only ~6 days long.
+    # min_capture 0: a single-lag test grid fits every half-life to the
+    # shortest grid value, which the production capture floor would block.
     cfg['promotion'].update({'min_rolls_survived': 1, 'deflation_mult': 1.0,
-                             'max_promoted_per_roll': 3, 'max_book_size': 10})
-    cfg['backtest'].update({'funding_pnl': False, 'min_assets': 10,
-                            'cost_bps': 2.0})
+                             'max_book_size': 10, 'min_select_days': 0,
+                             'min_capture': 0.0})
     return cfg
 
 
@@ -135,7 +137,7 @@ for rho in (0.3, 0.0):
     win = pd.DataFrame({'timestamp': cal_ts, 'symbol': cal_sym,
                         'fwd_6b': tgt, 'is_liquid': True})
     m = search_mod.evaluate_window(sig_df, win, 'fwd_6b', lag_bars=1,
-                                   min_assets=10, cost_bps=2.0)
+                                   min_assets=10)
     # Spearman of a bivariate normal: (6/pi) * asin(rho/2)
     expected = 6.0 / np.pi * np.arcsin(rho / 2.0)
     if rho > 0:
@@ -144,7 +146,6 @@ for rho in (0.3, 0.0):
               f"(ic {m['ic_mean']:.4f} vs expected {expected:.4f})")
         check("calibration: t-stat strongly significant", m['ic_tstat'] > 5,
               f"(t {m['ic_tstat']:.1f})")
-        check("calibration: gross sharpe positive", m['gross_sharpe'] > 0)
     else:
         check("calibration: zero-IC panel reads ~0",
               abs(m['ic_mean']) < 0.02, f"(ic {m['ic_mean']:.4f})")
@@ -259,7 +260,7 @@ family_cols = data_mod.resolve_family_columns(
     [c for c in noise_panel.columns], CFG)
 noise_survivors = search_mod.run_search(noise_panel, ROLL, family_cols,
                                         noise_proposer, noise_ledger, CFG)
-noise_promoted = bt_mod.promote(noise_survivors, ROLL, noise_ledger, [], CFG)
+noise_promoted = bt_mod.promote(noise_survivors, ROLL, noise_ledger, CFG)
 check("noise: search ran a full budget", noise_ledger.n_trials(0) >= 10,
       f"({noise_ledger.n_trials(0)} trials)")
 check("noise: ~nothing promoted from pure noise", len(noise_promoted) <= 1,
@@ -304,7 +305,7 @@ check("e2e: reproducible (same seed -> same survivors + rewards)",
       and np.allclose([s['reward'] for s in survivors_a],
                       [s['reward'] for s in survivors_b]))
 
-promoted = bt_mod.promote(survivors_a, ROLL, ledger_a, [], CFG)
+promoted = bt_mod.promote(survivors_a, ROLL, ledger_a, CFG)
 check("e2e: planted effect promoted through the gates", len(promoted) >= 1,
       f"({len(promoted)} promoted)")
 check("e2e: ledger promoted flags set",
@@ -336,7 +337,7 @@ check("carry-over: seeds recorded in the ledger (generation -1)",
        ['cand_hash'].nunique()) >= len(carried))
 persist_cfg = copy.deepcopy(CFG)
 persist_cfg['promotion']['min_rolls_survived'] = 2
-promoted_r1 = bt_mod.promote(survivors_roll1, ROLL_B, ledger_a, [],
+promoted_r1 = bt_mod.promote(survivors_roll1, ROLL_B, ledger_a,
                              persist_cfg)
 check("carry-over: 2-roll persistence gate now passes",
       len(promoted_r1) >= 1
@@ -347,41 +348,36 @@ check("carry-over: ledger survivor_candidates round-trips",
       {c.hash for c in ledger_a.survivor_candidates(0)}
       == {s['candidate'].hash for s in survivors_a})
 
+# Discovery is purely statistical: promotions carry everything the
+# walk-forward (the only money judge) needs to trade them.
 if promoted:
-    result = bt_mod.backtest_oos(planted_panel, ROLL, promoted, CFG)
-    daily = result['daily']
-    check("e2e: OOS backtest produced daily PnL", len(daily) >= 3,
-          f"({len(daily)} days, {result['stamps']} rebalances)")
-    check("e2e: PnL finite and costs positive",
-          np.isfinite(daily['net']).all() and (daily['cost'] >= 0).all())
-    check("e2e: book is dollar-neutral",
-          result['exposures'].get('dollar', 1.0) < 1e-6,
-          f"(mean |net| {result['exposures'].get('dollar'):.2e})")
-    check("e2e: planted alpha earns positive OOS gross",
-          daily['gross'].sum() > 0,
-          f"(gross {daily['gross'].sum() * 1e4:,.1f} bps)")
-    curve = bt_mod.stitch_oos([result])
-    check("e2e: stitched curve has cum_net",
-          'cum_net' in curve.columns and len(curve) == len(daily))
+    p0 = promoted[0]
+    check("e2e: promotion carries profile + half-life + capture",
+          'half_life_bars' in p0 and 'capture' in p0
+          and 'promoted_lags' in p0 and len(p0['promoted_lags']) >= 1
+          and 0.0 < p0['capture'] <= 1.0,
+          f"(hl {p0['half_life_bars']:.0f}b, capture {p0['capture']:.2f}, "
+          f"lags {p0['promoted_lags']})")
 print(f"(end-to-end block: {time.perf_counter() - t0:,.1f}s)")
 
 # ---------------------------------------------------------------------------
-# 5b. Multi-lag search: each candidate is pinned (on TRAIN) to the horizon
-#     where its effect actually lives - fast effects to fast lags, slow
-#     effects to slow lags - in ONE search over the full lag grid.
+# 5b. Profile (no pinning): each candidate carries its full per-lag IC
+#     profile; best_lag (day-equivalent t, per-bet-fair) lands on the horizon
+#     where the effect actually lives, and the fitted half-life separates
+#     fast from slow alpha.
 # ---------------------------------------------------------------------------
-print("--- 5b. multi-lag search pins candidates to their true horizon ---")
+print("--- 5b. per-lag profile finds each effect's true horizon ---")
 CFG_ML = test_cfg()
 CFG_ML['horizon_lags_bars'] = [6, 36]
-CFG_ML['search_lags_bars'] = 'all'
 CFG_ML['search'] = {**CFG_ML['search'], 'n_generations': 0}  # seeds only
 
 
-def make_slow_panel(plant=0.01, seed=33, k=20):
-    """vol_noise (WHITE noise) predicts the residual k=20 bars ahead: zero
-    signal inside a 6-bar forward window, real signal inside a 36-bar one -
-    the cleanest fast/slow horizon separation (a persistent AR state would
-    echo into every horizon)."""
+def make_impulse_panel(plant=0.01, seed=33, k=20):
+    """vol_noise (WHITE noise) predicts the residual exactly k bars ahead:
+    a one-bar impulse of alpha at horizon k. k=1 -> all the alpha sits
+    inside the 6-bar target (fast); k=20 -> only the 36-bar target sees it
+    (slow). White noise, not an AR state, so the horizon separation is
+    exact."""
     r = np.random.default_rng(seed)
     n_bars = N_DAYS * BPD
     ts = pd.date_range('2024-01-01', periods=n_bars, freq='10min')
@@ -407,36 +403,69 @@ def make_slow_panel(plant=0.01, seed=33, k=20):
 
 fast_seed = gen.Candidate(name='fast_probe', family='residual_shape',
                           expression=('col', 'res_zscore'))
-slow_seed = gen.Candidate(name='slow_probe', family='volatility_regime',
-                          expression=('col', 'vol_noise'))
+wn_seed = gen.Candidate(name='wn_probe', family='volatility_regime',
+                        expression=('col', 'vol_noise'))
 
-fast_panel_ml = data_mod.attach_targets(make_panel(plant=0.002, seed=31), [36])
+fast_panel_ml = make_impulse_panel(plant=0.01, seed=31, k=1)
 led_fast = search_mod.DiscoveryLedger(None)
 pop_fast = search_mod.run_search(
     fast_panel_ml, ROLL, family_cols,
     gen.RandomProposer(dsl_cfg=CFG_ML['dsl'], mutation_prob=0.6),
-    led_fast, CFG_ML, seed_candidates=[fast_seed])
-e_fast = next(s for s in pop_fast if s['candidate'].hash == fast_seed.hash)
-check("multi-lag: fast planted effect pinned to the 6-bar lag",
+    led_fast, CFG_ML, seed_candidates=[wn_seed])
+e_fast = next(s for s in pop_fast if s['candidate'].hash == wn_seed.hash)
+check("profile: fast impulse effect -> best per-bet lag 6",
       e_fast['target_lag'] == 6,
       f"(chose {e_fast['target_lag']}, t {e_fast['metrics_select']['ic_tstat']:.1f})")
+check("profile: fast effect -> short fitted half-life",
+      e_fast['half_life_bars'] <= 24,
+      f"(half-life {e_fast['half_life_bars']:.0f} bars)")
 
-slow_panel_ml = make_slow_panel()
+slow_panel_ml = make_impulse_panel()
 led_slow = search_mod.DiscoveryLedger(None)
 pop_slow = search_mod.run_search(
     slow_panel_ml, ROLL, family_cols,
     gen.RandomProposer(dsl_cfg=CFG_ML['dsl'], mutation_prob=0.6),
-    led_slow, CFG_ML, seed_candidates=[slow_seed])
-e_slow = next(s for s in pop_slow if s['candidate'].hash == slow_seed.hash)
-check("multi-lag: slow planted effect pinned to the 36-bar lag",
+    led_slow, CFG_ML, seed_candidates=[wn_seed])
+e_slow = next(s for s in pop_slow if s['candidate'].hash == wn_seed.hash)
+check("profile: slow impulse effect -> best per-bet lag 36",
       e_slow['target_lag'] == 36,
       f"(chose {e_slow['target_lag']}, t {e_slow['metrics_select']['ic_tstat']:.1f})")
-check("multi-lag: slow effect is real at its lag",
+check("profile: slow effect is real at its lag",
       e_slow['metrics_select']['ic_tstat'] > 2,
       f"(select t {e_slow['metrics_select']['ic_tstat']:.1f})")
-check("multi-lag: ledger records the chosen lag",
+check("profile: slow effect outlives the fast one",
+      e_slow['half_life_bars'] > e_fast['half_life_bars'],
+      f"(slow {e_slow['half_life_bars']:.0f} vs fast "
+      f"{e_fast['half_life_bars']:.0f} bars)")
+check("profile: ledger records best lag + half-life + profile json",
       set(led_fast.to_frame()['target_lag']) == {6}
-      and set(led_slow.to_frame()['target_lag']) == {36})
+      and set(led_slow.to_frame()['target_lag']) == {36}
+      and led_slow.to_frame()['half_life_bars'].notna().all()
+      and (led_slow.to_frame()['profile_json'].str.len() > 2).all())
+check("profile: BOTH lags scored on train and select",
+      all(set(e['profile_train']) == {6, 36}
+          and set(e['profile_select']) == {6, 36}
+          for e in (e_fast, e_slow)))
+
+# ---------------------------------------------------------------------------
+# 5b2. Sign-agnostic capture: a strongly NEGATIVE-IC effect must be found
+#      and traded with direction -1 (the flip is fixed on TRAIN; SELECT is
+#      then scored on the flipped signal, so its IC comes out positive).
+# ---------------------------------------------------------------------------
+print("--- 5b2. negative-IC effect captured with flipped direction ---")
+neg_panel = data_mod.attach_targets(make_panel(plant=-0.002, seed=41), [36])
+led_neg = search_mod.DiscoveryLedger(None)
+pop_neg = search_mod.run_search(
+    neg_panel, ROLL, family_cols,
+    gen.RandomProposer(dsl_cfg=CFG_ML['dsl'], mutation_prob=0.6),
+    led_neg, CFG_ML, seed_candidates=[fast_seed])
+e_neg = next(s for s in pop_neg if s['candidate'].hash == fast_seed.hash)
+check("negative effect: traded direction is -1", e_neg['direction'] == -1)
+check("negative effect: select IC strongly positive AFTER the flip",
+      e_neg['metrics_select']['ic_tstat'] > 3,
+      f"(t {e_neg['metrics_select']['ic_tstat']:.1f})")
+check("negative effect: train IC positive after the flip too",
+      e_neg['metrics_train']['ic_mean'] > 0)
 
 # ---------------------------------------------------------------------------
 # 5c. ML probe robustness: degenerate feature columns (all-NaN / constant in
@@ -462,6 +491,80 @@ try:
           m6.get('ic_tstat', 0.0) > 2, f"(t {m6.get('ic_tstat', 0.0):.1f})")
 except Exception as e:
     check("ml probe: survives all-NaN + constant columns", False, f"({e})")
+
+# ---------------------------------------------------------------------------
+# 5d. Unit checks: day-equivalent t, half-life fit, persistence weight,
+#     analytic flip, Student-t p-values, half-alpha gate.
+# ---------------------------------------------------------------------------
+print("--- 5d. profile/persistence unit checks ---")
+
+# day-equivalent t: the same raw t is worth sqrt(24) less at lag 6 (24
+# stamps/day) than at lag 144 (1 stamp/day) - the anti-pinning-bias scale.
+t6 = search_mod.day_equivalent_tstat({'ic_tstat': 10.0}, 6)
+t144 = search_mod.day_equivalent_tstat({'ic_tstat': 10.0}, 144)
+check("day-equivalent t: lag-6 discounted by sqrt(24)",
+      abs(t6 - 10.0 / np.sqrt(24)) < 1e-9 and abs(t144 - 10.0) < 1e-9,
+      f"(t6 {t6:.2f}, t144 {t144:.2f})")
+
+# half-life fit: a flat cumulative profile (all alpha in the first bars) is
+# FAST; a linearly growing one (constant per-bar alpha) is SLOW.
+hl_fast = search_mod.fit_half_life({6: 1.0, 36: 1.0, 72: 1.0, 144: 1.0})
+hl_slow = search_mod.fit_half_life({6: 6.0, 36: 36.0, 72: 72.0, 144: 144.0})
+check("half-life fit: flat profile -> fast, linear profile -> slow",
+      hl_fast <= 12 and hl_slow >= 720,
+      f"(fast {hl_fast:.0f}, slow {hl_slow:.0f} bars)")
+check("half-life fit: degenerate profile priced as fastest, never free",
+      search_mod.fit_half_life({}) == search_mod.HALF_LIFE_GRID[0]
+      and search_mod.fit_half_life({6: -1.0, 36: -2.0})
+      == search_mod.HALF_LIFE_GRID[0])
+
+# persistence weight 1/(1 + phi/rate): persistent alpha keeps ~full weight,
+# alpha faster than the trade rate is crushed toward 0.
+rate = search_mod.trade_rate_per_bar()
+w_slow = search_mod.persistence_weight(1008, rate)
+w_fast = search_mod.persistence_weight(3, rate)
+check("persistence weight: slow ~1, fast ~0, monotone",
+      w_slow > 0.9 and w_fast < 0.25 and w_slow > w_fast,
+      f"(rate {rate:.4f}/bar: hl 1008 -> {w_slow:.3f}, hl 3 -> {w_fast:.3f})")
+
+# capture-weighted reward: a slow signal outscores an equally-strong fast
+# one; the IC term is exactly (day-equivalent t) x capture.
+m_eq = {'ic_mean': 0.02, 'ic_tstat': 5.0, 'icir': 0.3,
+        'liquid_ic_ratio': 0.5, 'target_dispersion': 0.01,
+        'n_cross_sections': 100, 'n_days': 20}
+cand_r = gen.Candidate(name='r', family='residual_shape',
+                       expression=('col', 'res_zscore'))
+t_fast = search_mod.reward_terms(m_eq, 144, 6, 0.0, cand_r, 0.0)
+t_slow = search_mod.reward_terms(m_eq, 144, 288, 0.0, cand_r, 0.0)
+check("reward: capture-weighted IC term (slow beats equally-strong fast)",
+      t_slow['ic_tstat'] > 2.5 * t_fast['ic_tstat']
+      and abs(t_slow['ic_tstat']
+              - 5.0 * search_mod.persistence_weight(288, rate)) < 1e-9,
+      f"(fast {t_fast['ic_tstat']:.2f} vs slow {t_slow['ic_tstat']:.2f})")
+
+# analytic flip mirrors IC metrics exactly
+m0 = {'ic_mean': 0.02, 'ic_tstat': 3.0, 'icir': 0.4,
+      'liquid_ic_ratio': 0.7, 'target_dispersion': 0.01,
+      'n_cross_sections': 100, 'n_days': 10}
+mf = search_mod.flip_metrics(m0)
+check("flip: ic/t/icir negate; ratio/dispersion/counts unchanged",
+      mf['ic_mean'] == -0.02 and mf['ic_tstat'] == -3.0
+      and mf['icir'] == -0.4 and mf['liquid_ic_ratio'] == 0.7
+      and mf['target_dispersion'] == 0.01 and mf['n_days'] == 10)
+
+# Student-t p-values: on 30 daily obs the normal approximation is
+# anti-conservative - the t p-value must be LARGER.
+p_t = bt_mod._tstat_pvalue(2.5, n_days=30)
+p_norm = bt_mod._tstat_pvalue(2.5)
+check("p-values: Student-t (30 days) > normal for the same t",
+      p_t > p_norm, f"(t-dist {p_t:.4f} vs normal {p_norm:.4f})")
+
+# capture floor: with min_capture above the single-lag fit's capture,
+# nothing may promote (the gate that replaced the PnL scoreboard).
+cap_cfg = copy.deepcopy(CFG)
+cap_cfg['promotion']['min_capture'] = 0.99
+check("capture floor: min_capture blocks fast-alpha promotion",
+      bt_mod.promote(survivors_a, ROLL, ledger_a, cap_cfg) == [])
 
 # ---------------------------------------------------------------------------
 # 6. Proposer providers + cost tracking (no API calls: clients are lazy)
@@ -575,11 +678,24 @@ check("parse: prose around the array",
       gen._parse_json_array('Here you go:\n[{"a": 1}]\nEnjoy!') == [{'a': 1}])
 check("parse: object-wrapped array",
       gen._parse_json_array('{"candidates": [{"a": 1}]}') == [{'a': 1}])
+# max_tokens truncation: the complete prefix is salvaged, not the whole
+# batch dropped
+check("parse: truncated array salvages complete prefix",
+      gen._parse_json_array('[{"a": 1}, {"b": [2, {"c": 3}]}, {"d": "trunc')
+      == [{'a': 1}, {'b': [2, {'c': 3}]}])
+check("parse: truncation inside a string (with escapes) salvaged",
+      gen._parse_json_array('[{"a": "x\\"y"}, {"b": "cut }he')
+      == [{'a': 'x"y'}])
 try:
     gen._parse_json_array('no array here')
     check("parse: garbage raises", False)
 except ValueError:
     check("parse: garbage raises", True)
+try:
+    gen._parse_json_array('[{"a": tru')
+    check("parse: truncated with NO complete object raises", False)
+except ValueError:
+    check("parse: truncated with NO complete object raises", True)
 
 # ---------------------------------------------------------------------------
 print()

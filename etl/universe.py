@@ -204,7 +204,7 @@ def update_membership_history(current_symbols, as_of) -> pd.DataFrame:
     """Maintain the point-in-time `universe_membership` interval table.
 
     IO wrapper around `evolve_membership` (see its docstring for semantics).
-    Consumed automatically by research/signals/evaluate.py
+    Consumed automatically by research/lib/signal_eval.py
     (universe_member_mask) and the walk-forward DataContext.
     """
     mem = load_data('universe_membership') if table_exists('universe_membership') \

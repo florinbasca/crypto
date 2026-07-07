@@ -11,7 +11,7 @@ earliest promotion date wins), the compiled 'dsl' space op (values, gating,
 alignment to the feature frame), direction application through
 compute_signal_panel, and the walk-forward valid_from filter.
 
-Run: uv run python tests/discovered_bridge_checks.py
+Run: uv run tests/discovered_bridge_checks.py
 """
 
 import sys
@@ -43,11 +43,16 @@ GATED = Candidate(name='syn_gated', family='liquidity',
                   conditions=(('gt', ('col', 'f2'), 0.0),))
 
 
-def promo_row(cand, roll_id=2, direction=1, tstat=2.5):
-    return {'roll_id': roll_id, 'cand_hash': cand.hash, 'name': cand.name,
-            'family': cand.family, 'direction': direction,
-            'candidate_json': cand.to_json(), 'select_ic_tstat': tstat,
-            'reward': 1.0, 'n_trials_at_promotion': 100}
+def promo_row(cand, roll_id=2, direction=1, tstat=2.5, half_life=None,
+              target_lag=36):
+    row = {'roll_id': roll_id, 'cand_hash': cand.hash, 'name': cand.name,
+           'family': cand.family, 'direction': direction,
+           'candidate_json': cand.to_json(), 'select_ic_tstat': tstat,
+           'reward': 1.0, 'n_trials_at_promotion': 100,
+           'target_lag': target_lag}
+    if half_life is not None:
+        row['half_life_bars'] = half_life
+    return row
 
 
 VALID_FROM = {1: pd.Timestamp('2024-03-01'), 2: pd.Timestamp('2024-04-01'),
@@ -64,6 +69,17 @@ check("entry family is disc_<family>", e['family'] == 'disc_residual_shape')
 check("valid_from = promotion roll's OOS start",
       e['valid_from'] == pd.Timestamp('2024-04-01'))
 check("op is dsl", e['signal_def'].op == 'dsl')
+check("no half-life column -> entry carries None (no fake persistence)",
+      e['half_life_bars'] is None)
+
+# half-life flows from the promotion row into the entry + signal_def
+entries_hl = entries_from_promotions(
+    pd.DataFrame([promo_row(CAND, half_life=96.0)]), VALID_FROM)
+e_hl = entries_hl[name]
+check("half_life_bars flows through the bridge",
+      e_hl['half_life_bars'] == 96.0
+      and e_hl['signal_def'].halflife == 96.0
+      and e_hl['signal_def'].lag == 36)
 
 # --- dedup across tables: strongest t wins direction, earliest date wins -------
 promos = pd.DataFrame([
@@ -121,7 +137,7 @@ check("gate conditions apply (gated-off rows collapse to one neutral value)",
       bool(same_within_ts.all()))
 
 # --- direction flows through compute_signal_panel -------------------------------
-from research.signals.evaluate import compute_signal_panel
+from research.lib.signal_eval import compute_signal_panel
 
 registry = {name: entries[name]}
 panel_pos = compute_signal_panel(name, {**registry,
@@ -152,11 +168,12 @@ check("valid_from gate: empty map is a no-op",
       filter_valid_from(stats, {}, pd.Timestamp('2024-01-01')).equals(stats))
 
 # --- registry merge is graceful without promotions tables -----------------------
-from research.signals.evaluate import build_registry
+from research.lib.signal_eval import build_registry
 
 reg = build_registry()   # promotions tables may or may not exist locally
-check("build_registry works with the bridge in place (curated spaces intact)",
-      'space_residual_displacement' in reg)
+check("build_registry: discovery is the only signal source (disc_* or empty)",
+      all(k.startswith('disc_') for k in reg),
+      f"({len(reg)} entries)")
 
 # ---------------------------------------------------------------------------
 print()

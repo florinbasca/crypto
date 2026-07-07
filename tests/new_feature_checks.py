@@ -9,7 +9,7 @@ leader-follower must show high ll_lag_corr), degenerate inputs (leader symbol
 itself, missing leader), and the wiring (discovery families resolve the new
 prefixes; the new spaces reference real columns).
 
-Run: uv run python tests/new_feature_checks.py
+Run: uv run tests/new_feature_checks.py
 """
 
 import sys
@@ -163,17 +163,6 @@ check("discovery family 'seasonality' resolves sn_ columns",
       set(fams.get('seasonality', [])) == set(SN_FEATURE_NAMES))
 check("discovery family 'lead_lag' resolves ll_ columns",
       set(fams.get('lead_lag', [])) == set(LL_NAMES))
-
-# --- wiring: new spaces reference real feature columns --------------------------
-from research.lib.spaces import SPACES
-
-new_spaces = {sp.name: sp for sp in SPACES
-              if sp.theme in ('seasonality', 'lead_lag')}
-valid_cols = set(SN_FEATURE_NAMES) | set(LL_NAMES)
-check("4 new spaces registered under seasonality / lead_lag themes",
-      len(new_spaces) == 4, f"(found {sorted(new_spaces)})")
-check("new spaces reference existing feature columns",
-      all(c in valid_cols for sp in new_spaces.values() for c in sp.columns))
 
 # ---------------------------------------------------------------------------
 print()

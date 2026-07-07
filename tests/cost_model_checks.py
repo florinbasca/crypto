@@ -12,7 +12,7 @@ deployment floor in research/portfolio/walk_forward.py. No database required.
   (unwind) instead of deploying a sliver of gross that pays full relative
   costs on ~no expected alpha.
 
-Run: uv run python tests/cost_model_checks.py
+Run: uv run tests/cost_model_checks.py
 """
 
 import sys
@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 
+from config import get   # import runs validate_config
 from research.portfolio.walk_forward import (PORT, WF, _lag_bars_from_label,
                                              edge_gross_multiplier,
                                              effective_fill_rate,
@@ -45,12 +46,11 @@ check("non-bar labels -> None",
 FULL = PORT['cost_bps'] / 10000.0
 _, KAPPA = effective_fill_rate()
 gp_enabled = PORT.get('gp_trading', {}).get('enabled', False)
-amort_on = WF.get('selection_cost_amortization', True)
 
 check("unknown lag -> full cost (conservative)",
       selection_cost_rate(None) == FULL)
 
-if gp_enabled and amort_on and FULL > 0:
+if gp_enabled and FULL > 0:
     r6 = selection_cost_rate(6)
     r144 = selection_cost_rate(144)
     check("amortized cost matches closed form h/(h + 1/kappa) at h=6",
@@ -65,15 +65,9 @@ if gp_enabled and amort_on and FULL > 0:
     check("lag floored at 1 bar",
           selection_cost_rate(0) == selection_cost_rate(1))
 else:
-    print("[SKIP] amortization checks (gp_trading disabled, amortization off, "
-          "or zero cost in config)")
+    print("[SKIP] amortization checks (gp_trading disabled or zero cost)")
 
-# Fallbacks: flag off / gp off -> full cost. Mutate config dicts and restore.
-_saved_flag = WF.get('selection_cost_amortization', True)
-WF['selection_cost_amortization'] = False
-check("amortization disabled -> full cost", selection_cost_rate(6) == FULL)
-WF['selection_cost_amortization'] = _saved_flag
-
+# Fallback: gp off -> full cost. Mutate config dict and restore.
 _saved_gp = PORT['gp_trading'].get('enabled', False)
 PORT['gp_trading']['enabled'] = False
 check("gp_trading disabled -> full cost (no aim fill modeled)",
@@ -101,50 +95,27 @@ check("zero / negative edge -> zero (with or without floor)",
 # --- cost_holding_bars: turnover-implied holding period ------------------------
 from research.portfolio.walk_forward import cost_holding_bars
 
-HOLD = {'turnover_based': True, 'max_holding_bars': 1008}
-check("churny signal (turnover 1) -> the scoring lag (legacy)",
-      cost_holding_bars(6, 1.0, HOLD) == 6.0)
+MAXB = 1008
+check("churny signal (turnover 1) -> the scoring lag",
+      cost_holding_bars(6, 1.0, MAXB) == 6.0)
 check("slow carry (turnover 0.04) -> lag/turnover",
-      cost_holding_bars(6, 0.04, HOLD) == 150.0,
-      f"({cost_holding_bars(6, 0.04, HOLD):.0f} bars)")
-check("near-zero turnover capped at max_holding_bars",
-      cost_holding_bars(6, 0.001, HOLD) == 1008.0)
+      cost_holding_bars(6, 0.04, MAXB) == 150.0,
+      f"({cost_holding_bars(6, 0.04, MAXB):.0f} bars)")
+check("near-zero turnover capped at cost_holding_max_bars",
+      cost_holding_bars(6, 0.001, MAXB) == 1008.0)
 check("hyperactive signal (turnover > 1) credited LESS than the lag",
-      cost_holding_bars(6, 2.0, HOLD) == 3.0
-      and cost_holding_bars(6, 5.0, HOLD) == 3.0)   # turnover clipped at 2
+      cost_holding_bars(6, 2.0, MAXB) == 3.0
+      and cost_holding_bars(6, 5.0, MAXB) == 3.0)   # turnover clipped at 2
 check("missing/invalid turnover -> the scoring lag (fallback)",
-      cost_holding_bars(6, None, HOLD) == 6.0
-      and cost_holding_bars(6, float('nan'), HOLD) == 6.0
-      and cost_holding_bars(6, 0.0, HOLD) == 6.0)
-check("disabled -> the scoring lag",
-      cost_holding_bars(6, 0.04, {'turnover_based': False}) == 6.0)
-check("lag floored at 1 bar", cost_holding_bars(0, 1.0, HOLD) == 1.0)
+      cost_holding_bars(6, None, MAXB) == 6.0
+      and cost_holding_bars(6, float('nan'), MAXB) == 6.0
+      and cost_holding_bars(6, 0.0, MAXB) == 6.0)
+check("lag floored at 1 bar", cost_holding_bars(0, 1.0, MAXB) == 1.0)
+check("max_bars=None reads portfolio.cost_holding_max_bars",
+      cost_holding_bars(6, 0.001) ==
+      float(get('portfolio.cost_holding_max_bars')))
 
-# --- ic_gate: economics override on the IC floor -------------------------------
 import pandas as pd
-from research.portfolio.walk_forward import ic_gate
-
-stats = pd.DataFrame({
-    'signal_name': ['strong_ic', 'carry_low_ic', 'weak_both', 'neg_net_low_ic'],
-    'ic0':        [0.02,        0.004,          0.004,       0.004],
-    'sharpe_net': [-0.5,        0.9,            0.1,         -2.0],
-})
-_saved_ic = WF['min_ic']
-_saved_ovr = WF.get('min_ic_net_sharpe_override')
-WF['min_ic'] = 0.01
-WF['min_ic_net_sharpe_override'] = 0.5
-g = ic_gate(stats)
-check("ic_gate: strong IC passes regardless of net", bool(g.iloc[0]))
-check("ic_gate: low-IC carry with strong net passes via override",
-      bool(g.iloc[1]))
-check("ic_gate: low IC + weak net fails", not bool(g.iloc[2]))
-check("ic_gate: low IC + negative net fails", not bool(g.iloc[3]))
-WF['min_ic_net_sharpe_override'] = None
-g_strict = ic_gate(stats)
-check("ic_gate: override None -> strict IC floor",
-      g_strict.tolist() == [True, False, False, False])
-WF['min_ic'] = _saved_ic
-WF['min_ic_net_sharpe_override'] = _saved_ovr
 
 # --- combination weights: net-economics strength basis --------------------------
 from research.portfolio.walk_forward import SignalSelector
@@ -159,24 +130,14 @@ comb_stats = pd.DataFrame({
 comb_rets = pd.DataFrame({'sleeve': rng_c.normal(size=200),
                           'churny': rng_c.normal(size=200)})
 _saved_comb = dict(WF.get('signal_combination', {}))
-WF['signal_combination'] = {'enabled': True, 'corr_shrink': 0.5,
-                            'basis': 'net_sharpe'}
+WF['signal_combination'] = {'enabled': True, 'corr_shrink': 0.5}
 w_net = SignalSelector.combination_weights(comb_stats, ['sleeve', 'churny'],
                                            comb_rets)
-WF['signal_combination']['basis'] = 'ic'
-w_ic = SignalSelector.combination_weights(comb_stats, ['sleeve', 'churny'],
-                                          comb_rets)
-check("net basis weights the after-cost earner above the churny signal",
+check("weights follow after-cost value, not IC magnitude",
       w_net['sleeve'] > w_net['churny'],
       f"(sleeve {w_net['sleeve']:.2f} vs churny {w_net['churny']:.2f})")
-check("legacy ic basis reproduces the old ordering",
-      w_ic['churny'] > w_ic['sleeve'],
-      f"(sleeve {w_ic['sleeve']:.2f} vs churny {w_ic['churny']:.2f})")
-check("weights sum to 1 under both bases",
-      abs(sum(w_net.values()) - 1) < 1e-12
-      and abs(sum(w_ic.values()) - 1) < 1e-12)
+check("weights sum to 1", abs(sum(w_net.values()) - 1) < 1e-12)
 
-WF['signal_combination']['basis'] = 'net_sharpe'
 neg_stats = comb_stats.assign(sharpe_net=[1.0, -0.5])
 w_neg = SignalSelector.combination_weights(neg_stats, ['sleeve', 'churny'],
                                            comb_rets)
@@ -187,21 +148,17 @@ w_nan = SignalSelector.combination_weights(nan_stats, ['sleeve', 'churny'],
                                            comb_rets)
 check("NaN training net -> zero strength (not a crash)",
       w_nan['churny'] == 0.0)
-# Fallback path (<2 signals with return history) honours the basis too
+# Fallback path (<2 signals with return history) uses the same strength
 w_fb = SignalSelector._ic_weights(comb_stats, ['sleeve', 'churny'])
-check("knob-free fallback uses the same net basis",
+check("knob-free fallback weights by after-cost value too",
       w_fb['sleeve'] > w_fb['churny'],
       f"(sleeve {w_fb['sleeve']:.2f})")
 WF['signal_combination'] = _saved_comb
 
 # --- config wiring -------------------------------------------------------------
-from config import get   # import runs validate_config
-
 check("edge_scaled_gross.min_mult present and valid",
       0.0 <= float(get('portfolio.edge_scaled_gross.min_mult', -1)) < 1.0,
       f"(min_mult {get('portfolio.edge_scaled_gross.min_mult')})")
-check("walk_forward.selection_cost_amortization present",
-      'selection_cost_amortization' in get('walk_forward', {}))
 check("cost-aware net-Sharpe gate is active",
       get('walk_forward.min_net_sharpe_threshold') is not None,
       f"(threshold {get('walk_forward.min_net_sharpe_threshold')})")

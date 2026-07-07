@@ -1,31 +1,40 @@
 """
 Agentic signal discovery - the deterministic harness (see agent.md).
 
-Outer loop per roll (train 5mo / select 1mo / OOS 1mo, advancing monthly):
-  1. build diagnostics on TRAIN (compressed - the proposer's entire view)
-  2. SEARCH: budgeted propose -> compile -> evaluate(train->select) -> reward
-     -> keep best+diverse survivors (evolutionary loop, family bandit)
-  3. PROMOTE survivors through the gates (FDR, deflation, persistence,
-     orthogonality vs the book)
-  4. BACKTEST the promoted book through the OOS month (dollar+factor neutral,
-     ex-post costs, funding) - the search never saw this month
-  5. roll forward; stitched OOS months = the equity curve
+Discovery is PURELY STATISTICAL: it measures IC, fits alpha half-lives, and
+emits promotions. It never trades, never charges costs, never prints PnL -
+research/portfolio/walk_forward.py is the ONLY money judge.
 
-The LLM is only the idea generator inside step 2. Defaults: the proposer is
-the config LLM (discovery.llm.provider, currently gemini) and every run is a
-FRESH start (discovery tables cleared first). --proposer random is the no-API
-baseline / control experiment; --no-fresh keeps existing tables.
+Outer loop per roll (train 5mo / select 1mo, advancing monthly; the roll's
+OOS month exists only as the promotion's valid_from date):
+  1. build diagnostics on TRAIN (compressed - the proposer's entire view)
+  2. SEARCH: budgeted propose -> compile -> evaluate -> reward -> keep
+     best+diverse survivors (evolutionary loop, family bandit). The search
+     is TRAIN-ONLY: reward, survival, breeding and direction never see the
+     select window. The reward's IC term is CAPTURE-WEIGHTED (x 1/(1 +
+     phi/kappa)), so persistent signals outscore equally-strong fast ones
+     and the search breeds toward duration.
+  3. PROMOTE survivors through the gates - the first and only look at
+     select (per-lag profile FDR, deflation over the actual looks,
+     persistence, sign agreement, capture floor, orthogonality)
+  4. roll forward. Output: the promotions table, consumed by the
+     walk-forward via research/lib/discovered.py.
+
+The LLM (config discovery.llm.provider) is the idea generator inside step 2 -
+everything it emits is re-validated, compiled, causality-checked and scored
+by fixed code, so it can only ever waste budget, not corrupt results. Every
+run is a FRESH start (discovery tables cleared first); --no-fresh keeps
+existing tables. Ledger and promotions are flushed EVERY roll - a run
+killed at roll 20 keeps its first 20 rolls.
 
 Usage:
     python research/signals/agent/run_discovery.py
-        [--proposer random|llm|anthropic|gemini] [--max-rolls N]
-        [--ml-probe] [--no-fresh] [--no-save] [--target-lag BARS]
+        [--max-rolls N] [--no-fresh] [--no-save]
 
-The search is MULTI-LAG by default: every candidate is evaluated at every lag
-in discovery.search_lags_bars ('all' -> the horizon_lags_bars grid) on TRAIN
-and pinned to its strongest horizon there, so one run finds signals wherever
-on the speed spectrum they live. --target-lag restricts to a single lag
-(writes to _h<lag>-suffixed tables) for focused runs.
+NO PINNING: every candidate is evaluated at every lag in
+discovery.horizon_lags_bars (train AND select) - the per-lag profile is its
+alpha term structure, and its fitted half-life sets the capture weight in
+the reward here and the persistence discount in the walk-forward.
 """
 
 import sys
@@ -39,7 +48,7 @@ import time
 import pandas as pd
 
 from config import config as global_config, get
-from research.signals.agent import backtest as bt
+from research.signals.agent import promotion as bt
 from research.signals.agent import data as data_mod
 from research.signals.agent import search as search_mod
 from research.signals.agent.generation import Candidate, make_proposer
@@ -73,48 +82,16 @@ def main():
     parser = argparse.ArgumentParser(
         description='Agentic signal discovery: bounded-DSL search + '
                     'walk-forward promotion + OOS backtest')
-    parser.add_argument('--proposer', default='llm',
-                        choices=['random', 'llm', 'anthropic', 'gemini'],
-                        help='Candidate generator (default llm = provider '
-                             'from config discovery.llm.provider, currently '
-                             'gemini). random = no-API baseline / control; '
-                             'or name the provider explicitly')
     parser.add_argument('--max-rolls', type=int, default=0,
                         help='Only run the first N rolls (0 = all)')
-    parser.add_argument('--ml-probe', action='store_true',
-                        help='Also fit the GBM predictability ceiling per roll')
     parser.add_argument('--no-fresh', action='store_true',
                         help='Keep existing discovery tables (default is a '
                              'fresh start: tables cleared before running)')
     parser.add_argument('--no-save', action='store_true',
                         help='Do not persist ledger/promotions/returns')
-    parser.add_argument('--target-lag', type=int, default=0,
-                        help='RESTRICT the search to one lag (must be in '
-                             'discovery.horizon_lags_bars); output tables get '
-                             'a _h<lag> suffix. Default 0 = multi-lag: every '
-                             'candidate is scored at every lag in '
-                             'discovery.search_lags_bars and pinned to its '
-                             'strongest one on TRAIN - one run searches the '
-                             'whole speed spectrum.')
     args = parser.parse_args()
 
     cfg = get('discovery')
-    if args.target_lag:
-        allowed = [int(x) for x in cfg['horizon_lags_bars']]
-        if args.target_lag not in allowed:
-            raise SystemExit(
-                f"--target-lag {args.target_lag} is not in "
-                f"discovery.horizon_lags_bars {allowed}: the panel only "
-                "builds forward targets for those lags (add it there first)")
-        # Shallow copy: this run scores at the override lag only and writes
-        # to suffixed tables; the global config object stays untouched.
-        cfg = {**cfg,
-               'search_lags_bars': [int(args.target_lag)],
-               'target_lag_bars': int(args.target_lag),
-               'tables': {k: f"{v}_h{args.target_lag}"
-                          for k, v in cfg['tables'].items()}}
-        print(f"Target-lag override: search restricted to {args.target_lag} "
-              f"bars, tables suffixed _h{args.target_lag}")
     tables = cfg['tables']
     save = not args.no_save
     fresh = not args.no_fresh
@@ -123,6 +100,8 @@ def main():
         from dbutil import delete_table
         for t in tables.values():
             delete_table(t)
+        # legacy scoreboard table (discovery no longer produces PnL)
+        delete_table('discovery_oos_returns')
         print("Fresh start: discovery tables cleared")
 
     print("Resolving the bounded input space from the features table:")
@@ -144,13 +123,11 @@ def main():
           f"select {cfg['select_months']}mo / OOS {cfg['oos_months']}mo")
 
     ledger = search_mod.DiscoveryLedger(tables['ledger'] if save else None)
-    proposer = make_proposer(args.proposer)
+    proposer = make_proposer('llm')
     provider = getattr(proposer, 'provider', '')
     if provider:
         print(f"LLM proposer: {provider} / {proposer.model}")
 
-    book = []          # currently promoted entries (candidate, direction, ...)
-    oos_results = []
     promo_rows = []
     usage_rows = []
     seeds = []         # previous roll's survivors, re-tested each new roll
@@ -160,12 +137,15 @@ def main():
               f"select {roll.select_start.date()} OOS {roll.oos_start.date()}"
               f"..{roll.oos_end.date()} ===")
 
-        if args.ml_probe:
-            probe = search_mod.run_ml_probe(panel, roll, feature_cols, cfg)
-            for lag_i, m in sorted(probe['metrics_by_lag'].items()):
-                print(f"ML ceiling @ {lag_i:>3d} bars: IC {m['ic_mean']:.4f} "
-                      f"(t={m['ic_tstat']:.2f}, "
-                      f"net Sharpe {m['net_sharpe']:.2f})")
+        # Predictability ceiling per horizon (always on): a GBM on ALL
+        # features - the upper bound on what any search over them could find.
+        # If a lag's ceiling is ~0 across rolls, the features are barren at
+        # that speed; if the ceiling is real but the search finds nothing,
+        # the search is the bottleneck.
+        probe = search_mod.run_ml_probe(panel, roll, feature_cols, cfg)
+        for lag_i, m in sorted(probe['metrics_by_lag'].items()):
+            print(f"ML ceiling @ {lag_i:>3d} bars: IC {m['ic_mean']:.4f} "
+                  f"(t={m['ic_tstat']:.2f})")
 
         if not seeds and roll.roll_id > 0:
             # resumed/partial runs: recover the previous roll's survivors
@@ -197,63 +177,58 @@ def main():
                 'est_cost_usd': cost,
             })
 
-        # Recompile the current book on THIS roll's select window so the
-        # orthogonality gate compares like with like.
-        pb = data_mod.purge_bars(cfg)
-        roll_panel = data_mod.slice_window(panel, roll.train_start,
-                                           roll.oos_start, 0).reset_index(drop=True)
-        select_start = roll.select_start
-        for entry in book:
-            from research.signals.agent.generation import compile_candidate
-            sig = compile_candidate(entry['candidate'], roll_panel)
-            sig['signal'] *= entry['direction']
-            entry['signal_select'] = sig[sig['timestamp'] >= select_start]
-
-        promoted = bt.promote(survivors, roll, ledger, book, cfg)
-        book.extend(promoted)
-        print(f"promoted {len(promoted)} (book size {len(book)})")
-        for p in promoted:
+        # THIS roll's book: re-formed from scratch every roll - a signal
+        # trades the OOS month only if it re-qualified on the 6 months of
+        # data ending just before it. No carryover, no lifetime membership;
+        # failing to re-qualify IS the demotion.
+        book = bt.promote(survivors, roll, ledger, cfg)
+        print(f"promoted this roll: {len(book)} signals "
+              f"(tradable from {roll.oos_start.date()}; the walk-forward "
+              f"is the money judge)")
+        roll_promo_rows = []
+        for p in book:
             c = p['candidate']
-            promo_rows.append({
+            roll_promo_rows.append({
                 'roll_id': roll.roll_id, 'cand_hash': c.hash, 'name': c.name,
                 'family': c.family, 'direction': p['direction'],
                 'target_lag': int(p.get('target_lag', 0) or 0),
+                'half_life_bars': float(p.get('half_life_bars', 0) or 0),
+                'capture': float(p.get('capture', 0) or 0),
+                'promoted_lags': ','.join(str(l) for l in
+                                          p.get('promoted_lags', [])),
                 'candidate_json': c.to_json(),
                 'select_ic_tstat': p['metrics_select']['ic_tstat'],
                 'reward': p['reward'],
+                'n_looks_at_promotion': p.get('n_looks_at_promotion', 0),
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
             })
             print(f"  + {c.name} ({c.family}) "
-                  f"t={p['metrics_select']['ic_tstat']:.2f} "
-                  f"@ {p.get('target_lag', '?')} bars")
+                  f"select t={p['metrics_select']['ic_tstat']:.2f} "
+                  f"@ lags [{roll_promo_rows[-1]['promoted_lags']}] "
+                  f"half-life {p.get('half_life_bars', 0):,.0f} bars "
+                  f"(capture {p.get('capture', 0):.2f})")
+        promo_rows.extend(roll_promo_rows)
 
-        result = bt.backtest_oos(panel, roll, book, cfg)
-        result['roll_id'] = roll.roll_id
-        if len(result['daily']) > 0:
-            result['daily']['roll_id'] = roll.roll_id
-            net = result['daily']['net'].sum()
-            print(f"OOS month: net {net * 1e4:,.1f} bps over "
-                  f"{result['stamps']} rebalances; "
-                  f"mean |exposures| { {k: round(v, 4) for k, v in result['exposures'].items()} }")
-        else:
-            print("OOS month: no book to trade")
-        oos_results.append(result)
-
+        # Flush EVERY roll: a run killed at roll N keeps rolls 0..N-1.
         if save:
             ledger.flush()
+            _save(tables['promotions'], pd.DataFrame(roll_promo_rows),
+                  fresh=False, save=True)
 
-    curve = bt.stitch_oos(oos_results)
-    print("\n=== stitched OOS equity curve ===")
-    if curve.empty:
-        print("No promoted book was ever traded.")
+    print(f"\n=== promotions ===")
+    if not promo_rows:
+        print("Nothing promoted. (Statistical gates only - see "
+              "inspect_discovery.py for near-misses.)")
     else:
-        total = curve['net'].sum()
-        daily = curve['net']
-        sharpe = search_mod._annualized_sharpe(daily.values)
-        print(f"{len(curve)} days, net {total * 1e4:,.1f} bps, "
-              f"annualized Sharpe {sharpe:.2f}, "
-              f"costs {curve['cost'].sum() * 1e4:,.1f} bps, "
-              f"funding {curve['funding'].sum() * 1e4:,.1f} bps")
+        pf = pd.DataFrame(promo_rows)
+        print(f"{len(pf)} promotions across "
+              f"{pf['roll_id'].nunique()} rolls, "
+              f"{pf['cand_hash'].nunique()} distinct signals; "
+              f"half-life range "
+              f"{pf['half_life_bars'].min():,.0f}-"
+              f"{pf['half_life_bars'].max():,.0f} bars")
+        print("Next: uv run research/portfolio/walk_forward.py "
+              "(the only money judge)")
 
     # Always shown, every run: what this run cost in LLM tokens/dollars.
     if usage_rows:
@@ -267,18 +242,15 @@ def main():
         print(f"{total['calls']} calls, {total['input_tokens']:,} in / "
               f"{total['output_tokens']:,} out tokens{cost_str}")
     else:
-        print("\n=== LLM cost ===\n$0.00 (no API calls - random proposer)")
+        print("\n=== LLM cost ===\n$0.00 (no API calls)")
 
-    _save(tables['llm_usage'], pd.DataFrame(usage_rows), fresh, save)
-    _save(tables['promotions'], pd.DataFrame(promo_rows), fresh, save)
-    _save(tables['oos_returns'],
-          pd.concat([r['daily'] for r in oos_results if len(r['daily'])],
-                    ignore_index=True) if any(len(r['daily']) for r in oos_results)
-          else pd.DataFrame(), fresh, save)
+    # promotions were appended per roll; only usage is left.
+    _save(tables['llm_usage'], pd.DataFrame(usage_rows), fresh=False,
+          save=save)
     if save:
         ledger.flush()
         print(f"Saved: {tables['ledger']}, {tables['promotions']}, "
-              f"{tables['oos_returns']}")
+              f"{tables['llm_usage']}")
 
 
 if __name__ == '__main__':

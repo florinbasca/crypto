@@ -1,7 +1,7 @@
 """
 Synthetic-data sanity checks for the rebuilt pipeline. No database required.
 
-Run: uv run python tests/sanity_checks.py
+Run: uv run tests/sanity_checks.py
 """
 
 import sys
@@ -158,7 +158,7 @@ check("fdr: BY no less conservative than BH",
 # ---------------------------------------------------------------------------
 # 6. Rank IC vectorization matches scipy
 # ---------------------------------------------------------------------------
-import research.signals.evaluate as srmod
+import research.lib.signal_eval as srmod
 rank_ic_per_timestamp = srmod.rank_ic_per_timestamp
 from scipy.stats import spearmanr
 
@@ -179,31 +179,44 @@ check("ic: matches scipy spearman", np.allclose(ics.set_index('timestamp')['ic']
 srmod.MIN_ASSETS = _orig_min_assets
 
 # ---------------------------------------------------------------------------
-# 7. Signal registry builds against new feature names
+# 7. Signal registry: discovery-only, and a promoted DSL candidate computes
+#    cleanly through the production panel path
 # ---------------------------------------------------------------------------
-from research.signals.evaluate import build_registry, compute_signal_panel, signal_feature_columns
+from research.lib.signal_eval import build_registry, compute_signal_panel, signal_feature_columns
 
 registry = build_registry()
-check("registry: spaces present", len(registry) >= 20, f"({len(registry)} spaces)")
+check("registry: discovery is the only signal source",
+      all(k.startswith('disc_') for k in registry),
+      f"({len(registry)} entries)")
 
-space_cols = sorted({c for info in registry.values()
-                     for c in signal_feature_columns(info['signal_def'])})
+from research.lib.discovered import entries_from_promotions
+from research.signals.agent.generation import Candidate
+
+_cand = Candidate(name='syn', family='residual_shape',
+                  expression=('col', 'res_zscore'))
+_promos = pd.DataFrame([{'roll_id': 0, 'cand_hash': _cand.hash,
+                         'name': _cand.name, 'family': _cand.family,
+                         'direction': 1, 'candidate_json': _cand.to_json(),
+                         'select_ic_tstat': 3.0}])
+syn_registry = entries_from_promotions(_promos)
+
 n_sym, n_ts = 12, 600
 sym = np.repeat([f'S{i}' for i in range(n_sym)], n_ts)
 tss = np.tile(pd.date_range('2024-01-01', periods=n_ts, freq='10min'), n_sym)
 feat = pd.DataFrame({'timestamp': tss, 'symbol': sym})
-for c in space_cols:
-    feat[c] = rng.normal(size=len(feat))
+feat['res_zscore'] = rng.normal(size=len(feat))
+feat = feat.sort_values(['symbol', 'timestamp']).reset_index(drop=True)
 
 errors = []
-for s in registry:
+for s in syn_registry:
     try:
-        out = compute_signal_panel(s, registry, feat)
+        out = compute_signal_panel(s, syn_registry, feat)
         if out.empty or out['signal'].abs().max() > 3.0001:
             errors.append((s, 'bad output'))
     except Exception as e:
         errors.append((s, str(e)[:60]))
-check("signals: all spaces compute cleanly", len(errors) == 0, f"{errors[:3]}")
+check("signals: promoted DSL candidate computes cleanly through the panel",
+      len(errors) == 0, f"{errors[:3]}")
 
 # ---------------------------------------------------------------------------
 # 8. OU rolling fit recovers mean reversion on synthetic OU spread
@@ -261,6 +274,39 @@ check("factors: size matches manual rank-weighted spread",
 f_mcap_tied = pd.DataFrame({s: 1e9 for s in f_syms}, index=f_dates)
 sf_tied = frmod.compute_factor_returns(f_rets, f_membership, f_mcap_tied)['size_factor'].dropna()
 check("factors: tied mcaps still produce a factor", len(sf_tied) > 1000)
+
+# --- meme characteristic: anchor-correlated names rank high, causally --------
+# Needs > min_corr_days of history, so it gets its own 90-day panel.
+m_idx = pd.date_range('2024-01-01', periods=90 * 144, freq='10min')
+m_syms = ['DOGE', 'SHIB', 'PEPE'] + [f'M{i}' for i in range(9)]
+m_rets = pd.DataFrame(rng.normal(0, 1e-3, (len(m_idx), 12)),
+                      index=m_idx, columns=m_syms)
+meme_shock = rng.normal(0, 1.5e-3, len(m_idx))
+for s_ in ['DOGE', 'SHIB', 'PEPE', 'M0', 'M1']:     # anchors + 2 followers
+    m_rets[s_] += meme_shock
+m_char = frmod.compute_meme_char(m_rets)
+last = m_char.dropna(how='all').iloc[-1]
+followers = last[['M0', 'M1']].mean()
+independents = last[[f'M{i}' for i in range(2, 9)]].mean()
+check("meme char: followers of the anchor index rank above independents",
+      followers > independents + 0.3,
+      f"(followers {followers:.2f} vs independents {independents:.2f})")
+# causal: value at date D identical when data after D is removed
+cut_ts = m_idx[len(m_idx) // 2]
+m_char_tr = frmod.compute_meme_char(m_rets[m_rets.index <= cut_ts])
+d_cmp = m_char_tr.dropna(how='all').index[-1]
+check("meme char: truncation-causal (strictly-past)",
+      np.allclose(m_char.loc[d_cmp].values, m_char_tr.loc[d_cmp].values,
+                  atol=1e-12, equal_nan=True))
+m_membership = {p: set(m_syms)
+                for p in pd.period_range('2024-01', '2024-04', freq='M')}
+m_out = frmod.compute_factor_returns(
+    m_rets, m_membership,
+    pd.DataFrame({s: 1e9 for s in m_syms},
+                 index=pd.date_range('2023-12-25', '2024-04-05', freq='D')))
+check("factors: meme factor column produced",
+      'meme_factor' in m_out.columns
+      and m_out['meme_factor'].notna().sum() > 500)
 
 # ---------------------------------------------------------------------------
 # 10. Cluster detection + soft cluster penalty in MVO
@@ -352,21 +398,50 @@ def make_synth_panel(n_bars, seed=42):
     })
     leader = pd.Series(100 * np.exp(np.cumsum(r.normal(0, 1e-3, n_bars))),
                        index=ts)
-    return df, res, factors, loadings, leader
+    cal = pd.date_range(ts[0].normalize() - pd.Timedelta(days=30),
+                        ts[-1].normalize(), freq='D')
+    macro = pd.DataFrame({
+        'date': cal,
+        'rates2y': 4.0 + r.normal(0, 0.02, len(cal)).cumsum(),
+        'rates10y': 4.2 + r.normal(0, 0.02, len(cal)).cumsum(),
+        'vix': 15 + np.abs(r.normal(0, 1, len(cal))).cumsum() * 0.01,
+        'dollar': 120 + r.normal(0, 0.2, len(cal)).cumsum(),
+        'stables_mcap': 1.3e11 * (1 + 0.0005 * np.arange(len(cal))),
+        'fed_bs': 7.5e6 + r.normal(0, 1e4, len(cal)).cumsum(),
+        'rrp': 500 + r.normal(0, 5, len(cal)).cumsum(),
+        'breakeven10': 2.3 + r.normal(0, 0.01, len(cal)).cumsum(),
+        'fear_greed': np.clip(50 + r.normal(0, 2, len(cal)).cumsum(), 0, 100),
+    })
+    events = pd.DataFrame({
+        'event_time_utc': pd.date_range(ts[0] + pd.Timedelta(days=2),
+                                        periods=6, freq='3D')
+                          + pd.Timedelta(hours=19),
+        'event_type': ['fomc', 'cpi', 'nfp'] * 2,
+    })
+    dominance = pd.Series(0.5 + r.normal(0, 0.002, len(cal)).cumsum(),
+                          index=cal)
+    return df, res, factors, loadings, leader, macro, events, dominance
 
 N_FULL, N_TRUNC = 2400, 1800
-df_f, res_f, fac_f, ld_f, lead_f = make_synth_panel(N_FULL)
+(df_f, res_f, fac_f, ld_f, lead_f,
+ mac_f, ev_f, dom_f) = make_synth_panel(N_FULL)
 full = calculate_all_features(df_f, FEATURE_CONFIG, 'SYN', res_f, ld_f,
-                              factors_df=fac_f, leader_close=lead_f)
+                              factors_df=fac_f, leader_close=lead_f,
+                              macro_daily=mac_f, macro_events=ev_f,
+                              dominance=dom_f)
 
 df_t = df_f.iloc[:N_TRUNC].copy()
 res_t = res_f.iloc[:N_TRUNC]
 fac_t = fac_f.iloc[:N_TRUNC]
 cutoff_ts = df_t['timestamp'].iloc[-1]
 ld_t = ld_f[ld_f['date'] <= cutoff_ts]
+cut_date = df_t['timestamp'].iloc[-1].normalize()
 trunc = calculate_all_features(df_t, FEATURE_CONFIG, 'SYN', res_t, ld_t,
                                factors_df=fac_t,
-                               leader_close=lead_f.iloc[:N_TRUNC])
+                               leader_close=lead_f.iloc[:N_TRUNC],
+                               macro_daily=mac_f[mac_f['date'] <= cut_date],
+                               macro_events=ev_f,
+                               dominance=dom_f[dom_f.index <= cut_date])
 
 feat_cols = [c for c in full.columns if c not in ('timestamp', 'symbol')]
 row_full = full.iloc[N_TRUNC - 1][feat_cols].astype(float).values
@@ -424,12 +499,16 @@ hurst = (0.5 + np.log(vr_ou) / (2 * np.log(36))).dropna().median()
 check("hurst: OU spread gives H < 0.5", hurst < 0.4, f"(H {hurst:.3f})")
 
 # ---------------------------------------------------------------------------
-# 13. Schema completeness: every feature the SPACES reference is produced
+# 13. Schema completeness: the discovery families resolve real feature
+#     columns (the DSL search space is non-empty in every family)
 # ---------------------------------------------------------------------------
+from research.signals.agent.data import resolve_family_columns
+from config import get as _get
 produced = set(full.columns) - {'timestamp', 'symbol'}
-missing_feats = [c for c in space_cols if c not in produced]
-check("schema: all space feature columns produced", len(missing_feats) == 0,
-      f"missing: {missing_feats[:8]}")
+fams = resolve_family_columns(sorted(produced), _get('discovery'))
+empty_fams = [f for f, cols in fams.items() if not cols]
+check("schema: every discovery family resolves feature columns",
+      len(empty_fams) == 0, f"empty: {empty_fams}")
 
 # ---------------------------------------------------------------------------
 # 14. Funding-PnL accrual: a settlement stamp maps to the bar whose forward
@@ -497,7 +576,7 @@ check("selector: effective breadth CoW-safe", 1.0 <= eb_cow <= 3.0,
 # 16. Point-in-time universe membership: spell evolution + interval mask
 # ---------------------------------------------------------------------------
 from etl.universe import evolve_membership
-from research.signals.evaluate import universe_member_mask
+from research.lib.signal_eval import universe_member_mask
 
 seed_date = pd.Timestamp('2023-01-01')
 mem0, n_new0, _ = evolve_membership(None, {'AAA', 'BBB'}, '2025-06-01', seed_date)
@@ -530,7 +609,7 @@ check("membership: interval mask (member / delisted gap / relisted)",
 # ---------------------------------------------------------------------------
 # 16b. Per-lag smoothing halflife + edge-scaled gross helpers
 # ---------------------------------------------------------------------------
-from research.signals.evaluate import smoothing_halflife_for_lag
+from research.lib.signal_eval import smoothing_halflife_for_lag
 from research.portfolio.walk_forward import edge_gross_multiplier
 from config import get as _cfg_get
 

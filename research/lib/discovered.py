@@ -7,16 +7,15 @@ rows into registry entries of the SAME shape as the curated spaces
 (research/lib/spaces.py), so the ordinary pipeline picks them up with no
 manual translation step:
 
-    run_discovery.py [--target-lag ...]   # promotes candidates
-    evaluate.py                           # scores disc_* signals (incremental)
-    walk_forward.py                       # they enter selection + the backtest
+    run_discovery.py    # promotes candidates
+    walk_forward.py     # scores disc_* in memory, selects, backtests
 
 Timing honesty: a candidate's EXPRESSION was chosen by a search that saw data
 up to its promotion roll, so letting the walk-forward select it in windows
 BEFORE that date is time travel (the signal definition did not exist yet).
 Every entry therefore carries valid_from = the promotion roll's OOS start,
 and the walk-forward selector drops discovered signals from windows whose
-training end precedes it (walk_forward.respect_signal_valid_from).
+training end precedes it.
 
 Disable the whole bridge with signals.include_discovered: false.
 """
@@ -61,11 +60,8 @@ class DiscoveredDef:
 
 
 def promotion_tables() -> list:
-    """The base promotions table plus every _h<lag> lag-sweep variant."""
-    cfg = get('discovery', {})
-    base = cfg['tables']['promotions']
-    return [base] + [f"{base}_h{int(lag)}"
-                     for lag in cfg.get('horizon_lags_bars', [])]
+    """The promotions table(s) the bridge reads."""
+    return [get('discovery', {})['tables']['promotions']]
 
 
 def entries_from_promotions(promos: pd.DataFrame,
@@ -76,8 +72,7 @@ def entries_from_promotions(promos: pd.DataFrame,
     Deduped by cand_hash (the content hash of the program): the row with the
     strongest |select_ic_tstat| wins the direction/metadata, and valid_from is
     the EARLIEST promotion date seen for that hash. Names are hash-stable
-    (disc_<family>_<hash>) so signal_daily_stats rows stay consistent across
-    runs.
+    (disc_<family>_<hash>) so scored stats stay consistent across runs.
     """
     from research.signals.agent.generation import Candidate, candidate_columns
     import json
@@ -113,12 +108,15 @@ def entries_from_promotions(promos: pd.DataFrame,
         prior_vf = entries[name]['valid_from'] if name in entries else None
         if prior_vf is not None and (vf is None or prior_vf < vf):
             vf = prior_vf
+        half_life = float(row.get('half_life_bars', 0) or 0) or None
         sdef = DiscoveredDef(
             name=name,
             columns=tuple(sorted(candidate_columns(cand))),
             theme=f"disc_{cand.family}",
             rationale=cand.rationale or cand.name,
             candidate=cand,
+            lag=int(row.get('target_lag', 0) or 0),
+            halflife=half_life,
         )
         entries[name] = {
             'signal_def': sdef,
@@ -129,6 +127,11 @@ def entries_from_promotions(promos: pd.DataFrame,
             'smoothing_halflife': smoothing_halflife,
             'family': sdef.theme,
             'valid_from': vf,
+            # Fitted alpha half-life (bars) from the discovery train profile:
+            # caps the walk-forward's turnover-implied holding period, so a
+            # fast-decaying signal is never aim-discounted as if its alpha
+            # outlived its own term structure.
+            'half_life_bars': half_life,
         }
     return entries
 

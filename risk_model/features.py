@@ -26,6 +26,8 @@ Feature groups:
   fl_  factor loadings (market/size)      cap_ market-cap derived
   cs_  cross-sectional (panel phase)      fr_/oi_/pos_  futures-derived
   sn_  per-symbol seasonality profiles    ll_  leader (BTC) lead-lag, slow
+  ev_  macro-event timing (constant)      mx_  macro state (constant)
+  mb_  per-name macro sensitivities (cross-sectional)
 """
 
 import sys
@@ -827,6 +829,264 @@ def calculate_leadlag_features(df: pd.DataFrame, symbol: str,
 
 
 # ============================================================================
+# Macro / event features (etl/macro.py tables). Three classes:
+#   ev_  event timing (cross-sectionally CONSTANT: gate/interaction material)
+#   mx_  macro state  (cross-sectionally CONSTANT: gate/interaction material)
+#   mb_  per-name macro sensitivities (CROSS-SECTIONAL: direct signal material)
+# macro_daily values are ALREADY availability-dated by the ETL (first UTC date
+# each value is usable), so mapping a date's value onto that date's bars is
+# causal. Event times are exact UTC datetimes from published schedules, so
+# "hours until the next event" is legitimately knowable ahead of time.
+# ============================================================================
+
+EV_FEATURE_NAMES = [
+    'ev_fomc_day', 'ev_cpi_day', 'ev_nfp_day',
+    'ev_hours_to_event', 'ev_hours_since_event', 'ev_event_window',
+]
+
+MX_FEATURE_NAMES = [
+    'mx_rates2y_chg_1d', 'mx_rates2y_chg_5d', 'mx_curve_2s10s',
+    'mx_dollar_chg_5d', 'mx_vix_z', 'mx_vix_chg_1d', 'mx_breakeven_chg_5d',
+    'mx_net_liquidity_chg_4w', 'mx_stables_flow_7d', 'mx_fear_greed',
+    'mx_dominance_chg_7d', 'mx_event_shock',
+]
+
+MB_FEATURE_NAMES = [
+    'mb_beta_rates', 'mb_beta_dollar', 'mb_beta_vix', 'mb_beta_stables',
+    'mb_beta_dominance', 'mb_event_vol_ratio', 'mb_event_volume_ratio',
+    'mb_event_drift',
+]
+
+
+def _daily_to_bars(daily: pd.Series, ts: pd.Series) -> pd.Series:
+    """Map an availability-dated daily series onto bar timestamps (a date's
+    value applies to all bars of that UTC date)."""
+    return pd.Series(daily.reindex(ts.dt.normalize()).values, index=ts.index)
+
+
+def calculate_event_features(df: pd.DataFrame, events: Optional[pd.DataFrame],
+                             config: Dict) -> Dict[str, pd.Series]:
+    """Event-timing features from the published macro calendar.
+
+    ev_*_day: the bar's UTC date is an event date. ev_hours_to_event /
+    ev_hours_since_event: hours to the next / since the last event of ANY
+    type, clipped (pre-event positioning / post-event resolution regimes).
+    ev_event_window: within +-event_window_bars of an exact event time.
+    Constant across names by construction - gate material for the DSL."""
+    features = _nan_series(df, EV_FEATURE_NAMES)
+    if events is None or events.empty:
+        return features
+    mc = config['macro']
+    ts = pd.to_datetime(df['timestamp'])
+    dates = ts.dt.normalize()
+
+    ev_times = np.sort(pd.to_datetime(events['event_time_utc']).values)
+    for etype in ('fomc', 'cpi', 'nfp'):
+        edates = set(pd.to_datetime(
+            events.loc[events['event_type'] == etype, 'event_time_utc']
+        ).dt.normalize())
+        features[f'ev_{etype}_day'] = dates.isin(edates).astype(float)
+
+    ts_v = ts.values
+    nxt = np.searchsorted(ev_times, ts_v, side='left')
+    prv = nxt - 1
+    hours_clip = float(mc['hours_clip'])
+    to_ev = np.full(len(df), hours_clip)
+    ok = nxt < len(ev_times)
+    to_ev[ok] = (ev_times[nxt[ok]] - ts_v[ok]) / np.timedelta64(1, 'h')
+    since_ev = np.full(len(df), hours_clip)
+    ok = prv >= 0
+    since_ev[ok] = (ts_v[ok] - ev_times[prv[ok]]) / np.timedelta64(1, 'h')
+    features['ev_hours_to_event'] = pd.Series(
+        np.clip(to_ev, 0.0, hours_clip), index=df.index)
+    features['ev_hours_since_event'] = pd.Series(
+        np.clip(since_ev, 0.0, hours_clip), index=df.index)
+
+    bar_h = 24.0 / BARS_PER_DAY
+    win_h = float(mc['event_window_bars']) * bar_h
+    features['ev_event_window'] = pd.Series(
+        ((to_ev <= win_h) | (since_ev <= win_h)).astype(float), index=df.index)
+    return features
+
+
+def calculate_macro_state_features(df: pd.DataFrame,
+                                   macro_daily: Optional[pd.DataFrame],
+                                   dominance: Optional[pd.Series],
+                                   events: Optional[pd.DataFrame],
+                                   config: Dict) -> Dict[str, pd.Series]:
+    """Macro-state conditioners (constant across names - gate material).
+
+    Rate impulse, curve, dollar and inflation-expectation moves, VIX level/
+    impulse, Fed net-liquidity impulse (balance sheet minus RRP - the classic
+    crypto liquidity driver), stablecoin-supply flow (crypto dry powder),
+    Fear&Greed, BTC-dominance rotation, and mx_event_shock = the |2Y move|
+    printed by the latest CPI/FOMC day (the market's own measure of the
+    surprise - no consensus data needed, fully point-in-time)."""
+    features = _nan_series(df, MX_FEATURE_NAMES)
+    mc = config['macro']
+    ts = pd.to_datetime(df['timestamp'])
+    if macro_daily is None or macro_daily.empty:
+        m = pd.DataFrame()
+    else:
+        m = macro_daily.set_index('date').sort_index() \
+            if 'date' in macro_daily.columns else macro_daily.sort_index()
+        cal = pd.date_range(m.index.min(), ts.dt.normalize().max(), freq='D')
+        m = m.reindex(cal).ffill(limit=int(mc['ffill_limit_days']))
+
+    def col(name):
+        return m[name] if name in m.columns else None
+
+    r2 = col('rates2y')
+    if r2 is not None:
+        features['mx_rates2y_chg_1d'] = _daily_to_bars(r2.diff(1), ts)
+        features['mx_rates2y_chg_5d'] = _daily_to_bars(r2.diff(5), ts)
+    r10 = col('rates10y')
+    if r2 is not None and r10 is not None:
+        features['mx_curve_2s10s'] = _daily_to_bars(r10 - r2, ts)
+    dol = col('dollar')
+    if dol is not None:
+        features['mx_dollar_chg_5d'] = _daily_to_bars(dol.pct_change(5), ts)
+    vix = col('vix')
+    if vix is not None:
+        w = int(mc['vix_z_window_days'])
+        z = (vix - vix.rolling(w, min_periods=w // 4).mean()) / \
+            (vix.rolling(w, min_periods=w // 4).std() + 1e-10)
+        features['mx_vix_z'] = _daily_to_bars(z, ts)
+        features['mx_vix_chg_1d'] = _daily_to_bars(vix.diff(1), ts)
+    be = col('breakeven10')
+    if be is not None:
+        features['mx_breakeven_chg_5d'] = _daily_to_bars(be.diff(5), ts)
+    bs, rrp = col('fed_bs'), col('rrp')
+    if bs is not None and rrp is not None:
+        # WALCL is in $mn, RRPONTSYD in $bn -> net liquidity in $bn
+        net = bs / 1000.0 - rrp
+        features['mx_net_liquidity_chg_4w'] = _daily_to_bars(
+            net.pct_change(28), ts)
+    st = col('stables_mcap')
+    if st is not None:
+        features['mx_stables_flow_7d'] = _daily_to_bars(st.pct_change(7), ts)
+    fg = col('fear_greed')
+    if fg is not None:
+        features['mx_fear_greed'] = _daily_to_bars(fg, ts)
+    if dominance is not None and not dominance.dropna().empty:
+        features['mx_dominance_chg_7d'] = _daily_to_bars(
+            dominance.pct_change(7), ts)
+
+    # Event shock: the 2Y move becomes observable one availability day after
+    # the event day, so stamp |chg_1d| on event_date + 1.
+    if r2 is not None and events is not None and not events.empty:
+        shock_dates = set(pd.to_datetime(events['event_time_utc'])
+                          .dt.normalize() + pd.Timedelta(days=1))
+        chg = r2.diff(1).abs()
+        shock = chg.where(chg.index.isin(shock_dates), 0.0)
+        features['mx_event_shock'] = _daily_to_bars(shock, ts)
+    return features
+
+
+def calculate_macrobeta_features(df: pd.DataFrame, residual_series: pd.Series,
+                                 macro_daily: Optional[pd.DataFrame],
+                                 dominance: Optional[pd.Series],
+                                 events: Optional[pd.DataFrame],
+                                 config: Dict) -> Dict[str, pd.Series]:
+    """Per-name macro sensitivities - the CROSS-SECTIONAL macro features.
+
+    mb_beta_*: rolling beta of the name's daily residual to daily macro
+    impulses (rates, dollar, VIX, stablecoin flow, BTC dominance) - which
+    coins are rate-sensitive, dollar-sensitive, rotation-exposed. Completed
+    days only (shift 1 day).
+    mb_event_vol_ratio / mb_event_volume_ratio: the name's trailing average
+    |residual| / relative volume on macro-event days vs its everyday
+    baseline - the 'reacts to FOMC' profile, per coin.
+    mb_event_drift: trailing mean of the name's signed residual over the 24h
+    AFTER each event time - coins that systematically rally or fade after
+    macro prints. Each event enters the trailing mean only once fully
+    elapsed (available from event_time + event_response_hours)."""
+    features = _nan_series(df, MB_FEATURE_NAMES)
+    mc = config['macro']
+    res = residual_series
+    if res.notna().sum() < 100:
+        return features
+    ts = pd.to_datetime(df['timestamp'])
+    dates = ts.dt.normalize()
+
+    res_d = res.groupby(dates.values).sum(min_count=1)
+    W, MINW = int(mc['beta_window_days']), int(mc['beta_min_days'])
+
+    impulses = {}
+    if macro_daily is not None and not macro_daily.empty:
+        m = macro_daily.set_index('date').sort_index() \
+            if 'date' in macro_daily.columns else macro_daily.sort_index()
+        m = m.reindex(pd.date_range(m.index.min(), dates.max(), freq='D')) \
+             .ffill(limit=int(mc['ffill_limit_days']))
+        if 'rates2y' in m:
+            impulses['mb_beta_rates'] = m['rates2y'].diff(1)
+        if 'dollar' in m:
+            impulses['mb_beta_dollar'] = m['dollar'].pct_change(1)
+        if 'vix' in m:
+            impulses['mb_beta_vix'] = m['vix'].diff(1)
+        if 'stables_mcap' in m:
+            impulses['mb_beta_stables'] = m['stables_mcap'].pct_change(1)
+    if dominance is not None and not dominance.dropna().empty:
+        impulses['mb_beta_dominance'] = dominance.pct_change(1)
+
+    for name, x in impulses.items():
+        x_al = x.reindex(res_d.index)
+        cov = res_d.rolling(W, min_periods=MINW).cov(x_al)
+        var = x_al.rolling(W, min_periods=MINW).var()
+        beta = (cov / (var + 1e-18)).shift(1)     # completed days only
+        features[name] = _daily_to_bars(beta, ts)
+
+    if events is None or events.empty:
+        return features
+
+    K, MINE = int(mc['event_lookback_events']), int(mc['event_min_events'])
+    ev_dates = pd.DatetimeIndex(
+        pd.to_datetime(events['event_time_utc']).dt.normalize().unique()
+    ).sort_values()
+
+    def _event_ratio(daily_stat: pd.Series) -> pd.Series:
+        """Trailing mean of the stat over the last K event days, divided by
+        its everyday 60d baseline; completed days only (shift 1)."""
+        on_events = daily_stat.reindex(ev_dates).dropna()
+        trail = on_events.rolling(K, min_periods=MINE).mean()
+        trail = trail.reindex(daily_stat.index).ffill()
+        base = daily_stat.rolling(60, min_periods=20).mean()
+        return (trail / (base + 1e-18)).shift(1)
+
+    absres_d = res.abs().groupby(dates.values).sum(min_count=1)
+    features['mb_event_vol_ratio'] = _daily_to_bars(_event_ratio(absres_d), ts)
+
+    dollar_vol = df['quote_asset_volume'] if 'quote_asset_volume' in df.columns \
+        else df['volume'] * df['close']
+    dv_d = dollar_vol.groupby(dates.values).sum(min_count=1)
+    relvol_d = dv_d / (dv_d.rolling(20, min_periods=10).mean() + 1e-10)
+    features['mb_event_volume_ratio'] = _daily_to_bars(
+        _event_ratio(relvol_d), ts)
+
+    # Post-event drift: signed residual over (event_time, event_time + H];
+    # each event's return becomes usable at event_time + H.
+    H = np.timedelta64(int(float(mc['event_response_hours']) * 60), 'm')
+    ts_v = ts.values
+    cum = res.fillna(0.0).cumsum().values
+    post_rets, avail = [], []
+    for e in np.sort(pd.to_datetime(events['event_time_utc']).values):
+        lo = np.searchsorted(ts_v, e, side='right')
+        hi = np.searchsorted(ts_v, e + H, side='right')
+        if hi <= lo or hi > len(ts_v):
+            continue
+        post_rets.append(cum[hi - 1] - (cum[lo - 1] if lo > 0 else 0.0))
+        avail.append(e + H)
+    if post_rets:
+        trail = pd.Series(post_rets).rolling(K, min_periods=MINE).mean().values
+        pos = np.searchsorted(np.array(avail), ts_v, side='right') - 1
+        vals = np.full(len(df), np.nan)
+        ok = pos >= 0
+        vals[ok] = trail[pos[ok]]
+        features['mb_event_drift'] = pd.Series(vals, index=df.index)
+    return features
+
+
+# ============================================================================
 # Residual Dynamics
 # ============================================================================
 
@@ -1225,7 +1485,10 @@ def calculate_all_features(df: pd.DataFrame, config: Dict, symbol: str,
                            intrabar_df: Optional[pd.DataFrame] = None,
                            mcap_series: Optional[pd.Series] = None,
                            xs_df: Optional[pd.DataFrame] = None,
-                           leader_close: Optional[pd.Series] = None) -> pd.DataFrame:
+                           leader_close: Optional[pd.Series] = None,
+                           macro_daily: Optional[pd.DataFrame] = None,
+                           macro_events: Optional[pd.DataFrame] = None,
+                           dominance: Optional[pd.Series] = None) -> pd.DataFrame:
     feature_dfs = [df[['timestamp', 'symbol']].copy()]
 
     feature_dfs.append(pd.DataFrame(calculate_efficiency_features(df, config), index=df.index))
@@ -1254,6 +1517,15 @@ def calculate_all_features(df: pd.DataFrame, config: Dict, symbol: str,
         calculate_seasonality_features(df, residual_series, config), index=df.index))
     feature_dfs.append(pd.DataFrame(
         calculate_leadlag_features(df, symbol, leader_close, config), index=df.index))
+    feature_dfs.append(pd.DataFrame(
+        calculate_event_features(df, macro_events, config), index=df.index))
+    feature_dfs.append(pd.DataFrame(
+        calculate_macro_state_features(df, macro_daily, dominance,
+                                       macro_events, config), index=df.index))
+    feature_dfs.append(pd.DataFrame(
+        calculate_macrobeta_features(df, residual_series, macro_daily,
+                                     dominance, macro_events, config),
+        index=df.index))
 
     # Intra-bar features (precomputed on the 1m data, merged by timestamp)
     ib = pd.DataFrame(_nan_series(df, IB_FEATURE_NAMES), index=df.index)
@@ -1323,6 +1595,70 @@ def _load_factors() -> Optional[pd.DataFrame]:
     return _FACTORS_CACHE
 
 
+_MACRO_CACHE: Optional[pd.DataFrame] = None
+_EVENTS_CACHE: Optional[pd.DataFrame] = None
+_DOMINANCE_CACHE: Optional[pd.Series] = None
+_MACRO_LOADED = _EVENTS_LOADED = _DOMINANCE_LOADED = False
+
+
+def _load_macro_daily() -> Optional[pd.DataFrame]:
+    """macro_daily (availability-dated, etl/macro.py); None with a one-time
+    warning when the table is absent - ev_/mx_/mb_ features degrade to NaN."""
+    global _MACRO_CACHE, _MACRO_LOADED
+    if not _MACRO_LOADED:
+        _MACRO_LOADED = True
+        try:
+            df = load_data('macro_daily')
+            if df is not None and not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                _MACRO_CACHE = df
+            else:
+                logging.warning("macro_daily unavailable - run etl/macro.py "
+                                "(mx_/mb_ macro features will be NaN)")
+        except Exception as e:
+            logging.warning(f"macro_daily unavailable ({e})")
+    return _MACRO_CACHE
+
+
+def _load_macro_events() -> Optional[pd.DataFrame]:
+    global _EVENTS_CACHE, _EVENTS_LOADED
+    if not _EVENTS_LOADED:
+        _EVENTS_LOADED = True
+        try:
+            df = load_data('macro_events')
+            if df is not None and not df.empty:
+                df['event_time_utc'] = pd.to_datetime(df['event_time_utc'])
+                _EVENTS_CACHE = df
+            else:
+                logging.warning("macro_events unavailable - run etl/macro.py "
+                                "(ev_/event features will be NaN)")
+        except Exception as e:
+            logging.warning(f"macro_events unavailable ({e})")
+    return _EVENTS_CACHE
+
+
+def _load_dominance() -> Optional[pd.Series]:
+    """BTC dominance from the existing marketcap table (BTC mcap / total),
+    daily, lagged one day like every other mcap-derived input."""
+    global _DOMINANCE_CACHE, _DOMINANCE_LOADED
+    if not _DOMINANCE_LOADED:
+        _DOMINANCE_LOADED = True
+        try:
+            mc = load_data('marketcap')
+            if mc is not None and not mc.empty:
+                mc['date'] = pd.to_datetime(mc['date'])
+                wide = mc.pivot_table(index='date', columns='symbol',
+                                      values='market_cap', aggfunc='last')
+                if 'BTC' in wide.columns:
+                    dom = wide['BTC'] / wide.sum(axis=1)
+                    full = pd.date_range(dom.index.min(), dom.index.max(),
+                                         freq='D')
+                    _DOMINANCE_CACHE = dom.reindex(full).ffill(limit=7).shift(1)
+        except Exception as e:
+            logging.warning(f"dominance unavailable ({e})")
+    return _DOMINANCE_CACHE
+
+
 _LEADER_CACHE: Optional[pd.Series] = None
 _LEADER_LOADED = False
 
@@ -1386,16 +1722,13 @@ def process_symbol(symbol: str, xs_df: Optional[pd.DataFrame] = None) -> Optiona
                                       intrabar_df=intrabar_df,
                                       mcap_series=mcap_series,
                                       xs_df=xs_df,
-                                      leader_close=_load_leader_close())
+                                      leader_close=_load_leader_close(),
+                                      macro_daily=_load_macro_daily(),
+                                      macro_events=_load_macro_events(),
+                                      dominance=_load_dominance())
     except Exception as e:
         logging.error(f"Error processing {symbol}: {e}")
         return None
-
-
-def spaces_feature_columns() -> set:
-    """Feature columns referenced by the space library (research/lib/spaces)."""
-    from research.lib.spaces import SPACES
-    return {c for sp in SPACES for c in sp.columns}
 
 
 def _process_and_save(args: Tuple) -> Tuple[str, int, Dict[str, float]]:
@@ -1403,13 +1736,10 @@ def _process_and_save(args: Tuple) -> Tuple[str, int, Dict[str, float]]:
 
     Returns (symbol, n_rows, per-feature NaN share) for the coverage report.
     """
-    symbol, xs_df, keep_cols = args
+    symbol, xs_df = args
     features_df = process_symbol(symbol, xs_df=xs_df)
     if features_df is None or features_df.empty:
         return symbol, 0, {}
-    if keep_cols:
-        cols = [c for c in features_df.columns if c in keep_cols]
-        features_df = features_df[['timestamp', 'symbol'] + cols]
     nan_share = features_df.drop(columns=['timestamp', 'symbol']).isna().mean().to_dict()
     save_data('features', features_df, mode='append',
               datetime_columns=['timestamp'], use_file_lock=True)
@@ -1417,20 +1747,8 @@ def _process_and_save(args: Tuple) -> Tuple[str, int, Dict[str, float]]:
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='Feature panel generation')
-    parser.add_argument('--spaces-only', action='store_true',
-                        help='Persist only the feature columns referenced by the '
-                             'space library (research/lib/spaces.py) - a smaller '
-                             'panel for a faster signal-research loop. Compute is '
-                             'mostly unchanged; the win is table width, disk and '
-                             'downstream scan IO. Run the full build when '
-                             'developing NEW feature columns.')
-    args = parser.parse_args()
-    keep_cols = spaces_feature_columns() if args.spaces_only else None
-
     print("=" * 60)
-    print("Feature Generation" + (" (spaces-only columns)" if keep_cols else ""))
+    print("Feature Generation")
     print(f"Base frequency: {BASE_FREQUENCY} | Workers: {MAX_WORKERS}")
     print("=" * 60)
 
@@ -1456,7 +1774,7 @@ def main():
 
     delete_table('features')
 
-    work_items = [(sym, xs_slices.get(sym), keep_cols) for sym in symbols]
+    work_items = [(sym, xs_slices.get(sym)) for sym in symbols]
     results = parallel_map(_process_and_save, work_items, max_workers=MAX_WORKERS,
                            desc="Features", show_progress=True)
 

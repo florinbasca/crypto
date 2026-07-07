@@ -34,6 +34,7 @@ causal by construction; compile-time validation guarantees the second half
 
 import hashlib
 import json
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -674,6 +675,11 @@ class _ApiProposer(Proposer):
             'task': (f"Propose {n} new candidates for family '{family}' "
                      f"predicting the forward residual target "
                      f"'{diagnostics.get('target')}'"),
+            'notes': ("ev_/mx_ columns are CROSS-SECTIONALLY CONSTANT "
+                      "(events/macro state): identical for every coin at a "
+                      "timestamp, so a direct expression of them z-scores to "
+                      "zero. Use them ONLY inside conditions (regime gates) "
+                      "or multiplied against a cross-sectional column."),
             'allowed_columns': family_columns.get(family, []),
             'all_columns': sorted({c for cols in family_columns.values()
                                    for c in cols}),
@@ -716,8 +722,8 @@ class _ApiProposer(Proposer):
             raise SystemExit(
                 f"{self.provider} proposer cannot import its SDK ({e}). "
                 f"Install it ('uv add google-genai' for gemini, "
-                f"'uv add anthropic' for anthropic) or run with "
-                f"--proposer random.") from e
+                f"'uv add anthropic' for anthropic) or switch "
+                f"discovery.llm.provider.") from e
         except Exception as e:
             snippet = text[:200].replace('\n', ' ') if text else '(no text)'
             logging.warning(f"{self.provider} proposer failed ({e}); "
@@ -737,8 +743,11 @@ class _ApiProposer(Proposer):
 
 
 def _parse_json_array(text: str) -> list:
-    """Parse a JSON array out of an LLM response, tolerating markdown fences
-    and surrounding prose. Raises ValueError when no array can be recovered."""
+    """Parse a JSON array out of an LLM response, tolerating markdown fences,
+    surrounding prose, and TRUNCATION (max_tokens cutting the array
+    mid-object): the complete prefix of a truncated array is salvaged rather
+    than the whole batch being dropped. Raises ValueError when no array can
+    be recovered."""
     text = text.strip()
     if text.startswith('```'):
         # strip ```json ... ``` fences
@@ -749,10 +758,22 @@ def _parse_json_array(text: str) -> list:
     try:
         obj = json.loads(text)
     except json.JSONDecodeError:
-        start, end = text.find('['), text.rfind(']')
-        if start < 0 or end <= start:
+        start = text.find('[')
+        if start < 0:
             raise ValueError("no JSON array in response")
-        obj = json.loads(text[start:end + 1])
+        end = text.rfind(']')
+        obj = None
+        if end > start:
+            try:
+                obj = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                obj = None
+        if obj is None:
+            obj = _salvage_array_prefix(text[start:])
+            if obj is None:
+                raise ValueError("no JSON array in response")
+            logging.warning(f"truncated JSON array: salvaged {len(obj)} "
+                            f"complete candidates")
     if isinstance(obj, dict):
         # some models wrap the array: {"candidates": [...]}
         for v in obj.values():
@@ -762,6 +783,43 @@ def _parse_json_array(text: str) -> list:
     if not isinstance(obj, list):
         raise ValueError(f"expected a JSON array, got {type(obj).__name__}")
     return obj
+
+
+def _salvage_array_prefix(text: str) -> Optional[list]:
+    """Complete top-level objects from the head of a truncated JSON array.
+
+    text starts at '['. Scans brace depth (string- and escape-aware),
+    remembers where each depth-1 object closes, and parses the longest
+    prefix that forms a valid array. None when not even one object is
+    complete."""
+    depth = 0
+    in_str = False
+    esc = False
+    last_close = -1
+    for i, ch in enumerate(text):
+        if esc:
+            esc = False
+            continue
+        if ch == '\\':
+            esc = in_str
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in '{[':
+            depth += 1
+        elif ch in '}]':
+            depth -= 1
+            if ch == '}' and depth == 1:
+                last_close = i
+    if last_close < 0:
+        return None
+    try:
+        return json.loads(text[:last_close + 1] + ']')
+    except json.JSONDecodeError:
+        return None
 
 
 def load_api_key(name: str, path: Optional[Path] = None) -> str:

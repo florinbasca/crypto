@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from config import get, get_frequency_config, BASE_FREQUENCY
-from research.signals.evaluate import _nw_tstat, rank_ic_per_timestamp
+from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
 
 TARGET_PREFIX = 'fwd_'
 
@@ -84,24 +84,11 @@ def purge_bars(cfg: Optional[dict] = None) -> int:
 
 
 def resolve_search_lags(cfg: Optional[dict] = None) -> List[int]:
-    """Lags the search scores candidates at (discovery.search_lags_bars).
-
-    'all' (default) -> the full horizon_lags_bars grid: each candidate is
-    evaluated at every lag on TRAIN and pinned to its strongest one, so one
-    run finds signals wherever on the speed spectrum they live. An explicit
-    list restricts the search (must be a subset of horizon_lags_bars - the
-    panel only builds targets for those)."""
+    """Lags the search scores candidates at: the full horizon_lags_bars grid.
+    Each candidate is evaluated at every lag (train AND select) - the
+    per-lag profile is its alpha term structure; nothing is pinned."""
     cfg = cfg or get('discovery', {})
-    grid = [int(x) for x in cfg['horizon_lags_bars']]
-    lags = cfg.get('search_lags_bars', 'all')
-    if lags in ('all', None):
-        return grid
-    lags = [int(x) for x in lags]
-    bad = [x for x in lags if x not in grid]
-    if bad:
-        raise ValueError(f"discovery.search_lags_bars {bad} not in "
-                         f"horizon_lags_bars {grid}")
-    return lags
+    return [int(x) for x in cfg['horizon_lags_bars']]
 
 
 def slice_window(panel: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
@@ -156,7 +143,7 @@ def build_panel(feature_cols: Sequence[str],
     raw_return, fwd_{L}b..., is_liquid, beta_*], universe-filtered, sorted by
     (symbol, timestamp)."""
     from dbutil import load_data
-    from research.signals.evaluate import (load_universe_membership,
+    from research.lib.signal_eval import (load_universe_membership,
                                            universe_member_mask)
 
     cfg = cfg or get('discovery', {})

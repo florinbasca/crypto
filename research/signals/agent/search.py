@@ -2,28 +2,34 @@
 SEARCH: scoring, reward, the candidate ledger, and the budgeted evolutionary
 loop that decides what gets tried next.
 
-- evaluate_window(): compiled signal + window slice -> metrics dict, reusing
-  the production math from research/signals/evaluate.py (vectorized rank IC,
-  Newey-West HAC t-stat on the daily IC series, dollar-neutral screening
-  backtest) so a discovered candidate's numbers mean the same thing as a
-  production signal's. Non-overlapping stamps (stride = target lag).
-- compute_reward(): SELECT-only metrics -> one scalar. Scales are FIXED config
-  constants, never batch-relative: the same candidate must earn the same
-  reward regardless of its batch-mates, or rewards stop being comparable
-  across generations/rolls/resumes.
+- evaluate_window(): compiled signal + window slice -> IC metrics dict,
+  reusing the production math from research/lib/signal_eval.py (vectorized
+  rank IC, Newey-West HAC t-stat on the daily IC series). Non-overlapping
+  stamps (stride = target lag).
+- compute_reward(): TRAIN-only metrics -> one scalar. The search (reward,
+  survival, breeding, direction) NEVER sees the select window - promotion
+  touches select exactly once per survivor, so a select t-stat is a
+  measurement, not the maximum of a directed search on itself. Scales are
+  FIXED config constants, never batch-relative: the same candidate must earn
+  the same reward regardless of its batch-mates, or rewards stop being
+  comparable across generations/rolls/resumes.
+- NO PINNING: each candidate is evaluated at EVERY lag in
+  discovery.horizon_lags_bars on train AND select; the per-lag profile is
+  its alpha term structure. best_lag (day-equivalent t, so fast lags get no
+  mechanical sqrt(stamps) advantage) picks the direction and the reward
+  term; the WHOLE profile travels to promotion and the portfolio layer,
+  where fit_half_life() turns it into the persistence discount.
 - DiscoveryLedger: one row per (roll, candidate) evaluation - the debug
-  surface, the dedup index, the honest trial count behind the deflation
-  haircut, and the memory behind the N-consecutive-rolls persistence gate.
+  surface, the dedup index, and the memory behind the N-consecutive-rolls
+  persistence gate.
 - run_search(): the per-roll evolutionary loop with a UCB bandit over
-  candidate families. MULTI-LAG: each candidate is evaluated at every lag in
-  discovery.search_lags_bars on TRAIN and pinned to its strongest one there;
-  traded sign AND lag are fixed on TRAIN (never SELECT), so the lag search
-  adds no select-window multiplicity.
+  candidate families.
 - run_ml_probe(): gradient-boosting ceiling estimator on ALL resolved
   primitives, per search lag - where (if anywhere) does the feature set
   contain predictability at all?
 """
 
+import json
 import logging
 import math
 from typing import Dict, List, Optional, Sequence
@@ -31,9 +37,8 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from config import get
-from research.signals.evaluate import (_nw_tstat, dollar_neutral_backtest,
-                                       rank_ic_per_timestamp)
+from config import BARS_PER_DAY, get
+from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
 from research.signals.agent.data import (Roll, purge_bars, slice_window,
                                          strided_stamps, target_col)
 from research.signals.agent.generation import (Candidate, Proposer,
@@ -51,8 +56,8 @@ DAYS_PER_YEAR = 365
 def empty_metrics() -> dict:
     return {
         'ic_mean': np.nan, 'ic_tstat': 0.0, 'icir': np.nan,
-        'liquid_ic_ratio': np.nan, 'net_sharpe': 0.0, 'gross_sharpe': 0.0,
-        'turnover': np.nan, 'n_cross_sections': 0, 'n_days': 0,
+        'liquid_ic_ratio': np.nan, 'target_dispersion': np.nan,
+        'n_cross_sections': 0, 'n_days': 0,
     }
 
 
@@ -66,9 +71,13 @@ def _annualized_sharpe(daily_returns: np.ndarray) -> float:
 
 def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
                     tcol: str, lag_bars: int,
-                    min_assets: Optional[int] = None,
-                    cost_bps: Optional[float] = None) -> dict:
-    """Score one compiled signal on one window.
+                    min_assets: Optional[int] = None) -> dict:
+    """Score one compiled signal on one window - IC statistics ONLY.
+
+    Signals are judged purely on rank IC vs the forward residual target
+    (signals are not tradeable objects: cost/PnL are properties of the
+    portfolio layer, never of a signal). liquid_ic_ratio is itself an IC
+    (liquid-half vs full cross-section - a capacity read).
 
     signal: [timestamp, symbol, signal] (from compile_candidate)
     window_panel: the window's slice of the roll panel (must contain tcol;
@@ -77,11 +86,6 @@ def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
     cfg = get('discovery', {})
     if min_assets is None:
         min_assets = int(cfg['min_assets_per_timestamp'])
-    if cost_bps is None:
-        cost_bps = cfg['backtest']['cost_bps']
-        if cost_bps is None:
-            cost_bps = get('portfolio.cost_bps')
-    cost_bps = float(cost_bps)
 
     cols = ['timestamp', 'symbol', tcol]
     if 'is_liquid' in window_panel.columns:
@@ -120,29 +124,124 @@ def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
     else:
         liquid_ic_ratio = np.nan
 
-    bt = dollar_neutral_backtest(df, tcol, None, min_assets=min_assets,
-                                 cost_bps=cost_bps)
-    if bt.empty:
-        net_sharpe = gross_sharpe = 0.0
-        turnover = np.nan
-    else:
-        daily = bt.set_index('timestamp').groupby(
-            lambda ts: ts.normalize())[['gross_return', 'net_return']].sum()
-        net_sharpe = _annualized_sharpe(daily['net_return'].values)
-        gross_sharpe = _annualized_sharpe(daily['gross_return'].values)
-        turnover = float(bt['turnover'].mean())
+    # Mean per-stamp cross-sectional std of the forward target: with the
+    # signal z-scored, alpha_k = ic_mean * target_dispersion is the Grinold
+    # expected-return-per-bet at this horizon - the profile of these across
+    # lags is the signal's alpha term structure (SLS "Multi-Period").
+    disp = float(df.groupby('timestamp')[tcol].std().mean())
 
     return {
         'ic_mean': ic_mean,
         'ic_tstat': float(_nw_tstat(daily_ic.values, 'auto')),
         'icir': ic_mean / ic_std if ic_std > 0 else 0.0,
         'liquid_ic_ratio': liquid_ic_ratio,
-        'net_sharpe': net_sharpe,
-        'gross_sharpe': gross_sharpe,
-        'turnover': turnover,
+        'target_dispersion': disp,
         'n_cross_sections': int(len(ics)),
         'n_days': int(len(daily_ic)),
     }
+
+
+def flip_metrics(m: dict) -> dict:
+    """Metrics of the sign-flipped signal, analytically: rank IC is exactly
+    antisymmetric under negation (ic/tstat/icir flip sign; liquid_ic_ratio is
+    a ratio of two flipped ICs, unchanged; dispersion/counts unchanged)."""
+    out = dict(m)
+    for k in ('ic_mean', 'ic_tstat', 'icir'):
+        v = out.get(k)
+        if v is not None and np.isfinite(v):
+            out[k] = -v
+    return out
+
+
+def day_equivalent_tstat(m: dict, lag_bars: int) -> float:
+    """Cross-lag-FAIR strength: t / sqrt(stamps per day). A raw t-stat grows
+    ~sqrt(number of bets), handing 1h signals a mechanical ~sqrt(24) edge
+    over 24h ones for the SAME per-bet IC; dividing by sqrt(stamps/day) puts
+    every horizon on one bets-per-day-free scale (= ic_mean * sqrt(n_days) up
+    to the daily-IC noise normalization)."""
+    t = m.get('ic_tstat', 0.0)
+    if t is None or not np.isfinite(t):
+        return 0.0
+    stamps_per_day = max(BARS_PER_DAY // max(int(lag_bars), 1), 1)
+    return float(t) / math.sqrt(stamps_per_day)
+
+
+def alpha_term_structure(m_by_lag: Dict[int, dict]) -> Dict[int, float]:
+    """Cumulative expected alpha per bet at each horizon: A(L) = ic_mean(L) *
+    target_dispersion(L). This is the empirical alpha_k curve of SLS
+    "Multi-Period Optimisation" (regression of cumulative forward returns on
+    a unit-variance signal)."""
+    out = {}
+    for lag, m in m_by_lag.items():
+        ic, disp = m.get('ic_mean'), m.get('target_dispersion')
+        if (ic is not None and disp is not None
+                and np.isfinite(ic) and np.isfinite(disp)):
+            out[int(lag)] = float(ic) * float(disp)
+    return out
+
+
+def trade_rate_per_bar(cfg: Optional[dict] = None) -> float:
+    """The portfolio layer's per-bar fill rate toward the aim - the SAME
+    cost-responsive Garleanu-Pedersen rate walk_forward trades at:
+    omega = trade_urgency * (ref_cost_bps / cost_bps); rate = omega/(1+omega).
+    Fallback (gp_trading disabled): the legacy fixed smoothing halflife."""
+    port = get('portfolio', {})
+    gp = port.get('gp_trading', {})
+    urgency = gp.get('trade_urgency')
+    if gp.get('enabled', False) and urgency is not None:
+        ref = float(gp.get('ref_cost_bps', port['cost_bps']) or port['cost_bps'])
+        omega = float(urgency) * (ref / float(port['cost_bps']))
+        return omega / (1.0 + omega)
+    hl = float(port.get('weight_smoothing_halflife', 6) or 6)
+    return 1.0 - math.exp(-math.log(2.0) / max(hl, 1e-9))
+
+
+def persistence_weight(half_life_bars: float, rate_bar: float) -> float:
+    """Garleanu-Pedersen capture fraction 1/(1 + phi/rate): phi =
+    ln2/half-life is the signal's alpha decay rate, rate the book's per-bar
+    fill rate. The fraction of a signal's IC a book trading at `rate` can
+    actually be exposed to - alpha faster than the book's speed is
+    discounted toward zero; persistent alpha keeps its weight. Duration,
+    never bps. (SLS "Trading Multiple Forecasts Optimally": weight signals
+    by how persistent they are, not just how accurate.)"""
+    hl = max(float(half_life_bars), 1e-9)
+    phi = math.log(2.0) / hl
+    return 1.0 / (1.0 + phi / max(float(rate_bar), 1e-9))
+
+
+# Candidate alpha half-lives (bars) for the deterministic grid fit below.
+HALF_LIFE_GRID = [3, 6, 12, 24, 48, 96, 144, 288, 432, 720, 1008, 2016]
+
+
+def fit_half_life(profile: Dict[int, float]) -> float:
+    """Alpha half-life (bars) from the cumulative term structure A(L).
+
+    Model: per-bar alpha a(t) = a0 * exp(-phi t), so A(L) = a0 (1 - e^{-phi
+    L}) / phi. Fit by least squares over a fixed half-life grid (a0 solved
+    analytically per grid point) - deterministic, 4 data points, no
+    optimizer. Degenerate profiles (empty / non-positive everywhere) fall
+    back to the SHORTEST grid half-life: unmeasurable persistence is priced
+    as fast decay, never as free persistence."""
+    lags = sorted(L for L, a in profile.items() if np.isfinite(a))
+    if not lags or max(profile[L] for L in lags) <= 0:
+        return float(HALF_LIFE_GRID[0])
+    A = np.array([profile[L] for L in lags], dtype=float)
+    Ls = np.array(lags, dtype=float)
+
+    best_hl, best_sse = HALF_LIFE_GRID[0], np.inf
+    for hl in HALF_LIFE_GRID:
+        phi = math.log(2.0) / hl
+        shape = (1.0 - np.exp(-phi * Ls)) / phi
+        denom = float((shape ** 2).sum())
+        if denom <= 0:
+            continue
+        a0 = float((A * shape).sum()) / denom
+        if a0 <= 0:
+            continue
+        sse = float(((A - a0 * shape) ** 2).sum())
+        if sse < best_sse:
+            best_hl, best_sse = hl, sse
+    return float(best_hl)
 
 
 def signal_correlation(sig_a: pd.DataFrame, sig_b: pd.DataFrame) -> float:
@@ -170,37 +269,63 @@ def max_signal_correlation(signal: pd.DataFrame, others: list) -> float:
 # Reward
 # =============================================================================
 
-def reward_terms(train_metrics: dict, select_metrics: dict,
-                 cand: Candidate, similarity: float) -> dict:
-    """The raw (unscaled) reward terms. All finite."""
+def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
+                 instability: float, cand: Candidate,
+                 similarity: float) -> dict:
+    """The raw (unscaled) reward terms - TRAIN window only. All finite.
+
+    ic_tstat is the CAPTURE-WEIGHTED day-equivalent train t at the
+    candidate's best per-bet lag: strength x the fraction of it a book
+    trading at the portfolio rate can hold long enough to be exposed to
+    (see persistence_weight - duration, never bps). A 6h-half-life signal
+    outscores a 1h one of equal strength ~2.4x, so the search breeds toward
+    persistence. instability is the std of the train-thirds ICs (temporal
+    consistency inside train - select is never consulted)."""
     def _f(x, default=0.0):
         return float(x) if x is not None and np.isfinite(x) else default
 
+    capture = persistence_weight(half_life_bars, trade_rate_per_bar())
     return {
-        'ic_tstat': _f(select_metrics.get('ic_tstat')),
-        'net_sharpe': _f(select_metrics.get('net_sharpe')),
-        'liquid_ic_ratio': _f(select_metrics.get('liquid_ic_ratio')),
-        'turnover': _f(select_metrics.get('turnover')),
+        'ic_tstat': day_equivalent_tstat(train_metrics, best_lag) * capture,
+        'liquid_ic_ratio': _f(train_metrics.get('liquid_ic_ratio')),
         'complexity': float(complexity(cand)),
-        'instability': abs(_f(train_metrics.get('ic_mean'))
-                           - _f(select_metrics.get('ic_mean'))),
+        'instability': _f(instability),
         'similarity': _f(similarity),
     }
 
 
-def compute_reward(train_metrics: dict, select_metrics: dict,
-                   cand: Candidate, similarity: float,
+def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
+                   instability: float, cand: Candidate, similarity: float,
                    reward_cfg: Optional[dict] = None) -> tuple:
-    """reward = sum_k weight_k * term_k / scale_k. SELECT window only, fixed
+    """reward = sum_k weight_k * term_k / scale_k. TRAIN window only, fixed
     scales from config. Returns (reward, terms)."""
     cfg = reward_cfg or get('discovery.reward', {})
     weights = cfg['weights']
     scales = cfg['scales']
-    terms = reward_terms(train_metrics, select_metrics, cand, similarity)
+    terms = reward_terms(train_metrics, best_lag, half_life_bars,
+                         instability, cand, similarity)
     total = 0.0
     for key, w in weights.items():
         total += float(w) * terms[key] / float(scales[key])
     return float(total), terms
+
+
+def train_thirds_instability(sig: pd.DataFrame, train: pd.DataFrame,
+                             tcol: str, lag_bars: int,
+                             min_assets: int) -> float:
+    """Std of the signal's IC over three contiguous time-thirds of TRAIN -
+    the search-hygiene consistency term (replaces the old train-vs-select
+    gap, which leaked select into survival)."""
+    stamps = np.sort(train['timestamp'].unique())
+    if len(stamps) < 9:
+        return 0.0
+    ics = []
+    for part in np.array_split(stamps, 3):
+        sub = train[train['timestamp'].isin(part)]
+        m = evaluate_window(sig, sub, tcol, lag_bars, min_assets)
+        ic = m.get('ic_mean')
+        ics.append(float(ic) if ic is not None and np.isfinite(ic) else 0.0)
+    return float(np.std(ics))
 
 
 # =============================================================================
@@ -230,7 +355,12 @@ class DiscoveryLedger:
     def record(self, roll_id: int, generation: int, cand: Candidate,
                direction: int, train_metrics: dict, select_metrics: dict,
                reward: float, terms: dict,
-               target_lag: Optional[int] = None) -> None:
+               target_lag: Optional[int] = None,
+               profile_json: Optional[str] = None,
+               half_life_bars: Optional[float] = None) -> None:
+        """target_lag = the BEST PER-BET train lag (display/sorting only -
+        the signal is not pinned to it); profile_json = the full per-lag
+        train+select metrics; half_life_bars = fitted alpha half-life."""
         row = {
             'roll_id': int(roll_id),
             'generation': int(generation),
@@ -240,6 +370,9 @@ class DiscoveryLedger:
             'candidate_json': cand.to_json(),
             'direction': int(direction),
             'target_lag': int(target_lag) if target_lag is not None else -1,
+            'half_life_bars': (float(half_life_bars)
+                               if half_life_bars is not None else np.nan),
+            'profile_json': profile_json or '',
             'reward': float(reward),
             'survivor': False,
             'promoted': False,
@@ -343,15 +476,17 @@ def allocate_batch(bandit: Dict[str, dict], families: List[str],
 def select_survivors(population: List[dict], k: int,
                      max_corr: float) -> List[dict]:
     """Best-first greedy de-correlation: keep the highest-reward candidates
-    whose SELECT-window signal correlates below max_corr with every already-
-    kept one. Prevents the population collapsing to near-duplicates."""
+    whose TRAIN-window signal correlates below max_corr with every already-
+    kept one (train, like everything else survival touches - select stays
+    unseen until promotion). Prevents the population collapsing to
+    near-duplicates."""
     ranked = sorted(population, key=lambda s: -s['reward'])
     kept: List[dict] = []
     for cand in ranked:
         if len(kept) >= k:
             break
-        if max_signal_correlation(cand['signal_select'],
-                                  [x['signal_select'] for x in kept]) <= max_corr:
+        if max_signal_correlation(cand['signal_train'],
+                                  [x['signal_train'] for x in kept]) <= max_corr:
             kept.append(cand)
     return kept
 
@@ -374,18 +509,15 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     cfg = cfg or get('discovery', {})
     search_cfg = cfg['search']
     rng = np.random.default_rng(int(search_cfg['seed']) + roll.roll_id)
-    # Multi-lag search: every candidate is evaluated at EVERY search lag on
-    # TRAIN and pinned to the strongest one (|IC t-stat|), so one run finds
-    # signals wherever on the speed spectrum they live. target_lag_bars stays
-    # the reference lag for the proposer diagnostics only.
+    # NO PINNING: every candidate is evaluated at EVERY search lag on train
+    # and select - the per-lag profile is its alpha term structure. best_lag
+    # (day-equivalent train t) only picks direction and the reward term.
+    # target_lag_bars stays the reference lag for proposer diagnostics only.
     from research.signals.agent.data import resolve_search_lags
     search_lags = resolve_search_lags(cfg)
     diag_lag = int(cfg['target_lag_bars'])
     diag_tcol = target_col(diag_lag)
     min_assets = int(cfg['min_assets_per_timestamp'])
-    cost_bps = cfg['backtest']['cost_bps']
-    if cost_bps is None:
-        cost_bps = get('portfolio.cost_bps')
 
     pb = purge_bars(cfg)
     # Compile on train+select only: rolling warmup inside the roll, OOS unseen.
@@ -406,7 +538,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     seen = ledger.seen_hashes(roll.roll_id)
 
     def try_candidate(cand, gen: int) -> None:
-        """Validate, compile, evaluate (train->select), reward, record."""
+        """Validate, compile, evaluate the FULL train+select profile, reward
+        on train only, record."""
         if cand.hash in seen:
             return
         seen.add(cand.hash)
@@ -419,42 +552,74 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         if sig.empty:
             return
 
-        # Best lag chosen on TRAIN only (strongest |IC t-stat| across the
-        # search grid); SELECT is then scored ONCE, at that lag - the lag
-        # search adds no select-window multiplicity (the FDR/deflation gates
-        # keep operating on one select t-stat per candidate).
-        m_by_lag = {
+        # Train profile across the whole horizon grid. best_lag by the
+        # DAY-EQUIVALENT t (per-bet-fair: no sqrt(stamps/day) advantage for
+        # fast lags) picks direction and the reward term - nothing else.
+        m_train_by_lag = {
             lag_i: evaluate_window(sig, train, target_col(lag_i), lag_i,
-                                   min_assets, cost_bps)
+                                   min_assets)
             for lag_i in search_lags
         }
-        lag = max(m_by_lag, key=lambda l: abs(m_by_lag[l]['ic_tstat']))
-        m_train = m_by_lag[lag]
-        tcol = target_col(lag)
-        # Traded sign is fixed on TRAIN, never on SELECT.
-        direction = 1 if m_train['ic_mean'] >= 0 else -1
+        best_lag = max(m_train_by_lag,
+                       key=lambda l: abs(day_equivalent_tstat(
+                           m_train_by_lag[l], l)))
+        # Traded sign is fixed on TRAIN; the flip mirrors the whole profile
+        # (rank IC is exactly antisymmetric under signal negation).
+        direction = 1 if m_train_by_lag[best_lag]['ic_mean'] >= 0 else -1
         if direction < 0:
             sig = sig.assign(signal=-sig['signal'])
-            m_train = evaluate_window(sig, train, tcol, lag,
-                                      min_assets, cost_bps)
-        m_select = evaluate_window(sig, select, tcol, lag,
-                                   min_assets, cost_bps)
-        sig_select = sig[sig['timestamp'] >= roll.select_start]
+            m_train_by_lag = {l: flip_metrics(m)
+                              for l, m in m_train_by_lag.items()}
+        m_train = m_train_by_lag[best_lag]
 
+        # Alpha term structure + half-life from TRAIN (drives the
+        # persistence discount at the portfolio layer).
+        half_life = fit_half_life(alpha_term_structure(m_train_by_lag))
+
+        # Select profile: recorded for promotion to test ONCE - it feeds
+        # nothing in this loop (no reward, no survival, no breeding).
+        m_select_by_lag = {
+            lag_i: evaluate_window(sig, select, target_col(lag_i), lag_i,
+                                   min_assets)
+            for lag_i in search_lags
+        }
+        m_select = m_select_by_lag[best_lag]
+        sig_select = sig[sig['timestamp'] >= roll.select_start]
+        sig_train = sig[sig['timestamp'] < roll.select_start]
+
+        instability = train_thirds_instability(sig, train,
+                                               target_col(best_lag),
+                                               best_lag, min_assets)
         similarity = max_signal_correlation(
-            sig_select, [s['signal_select'] for s in population])
-        rwd, terms = compute_reward(m_train, m_select, cand,
-                                    similarity, cfg['reward'])
+            sig_train, [s['signal_train'] for s in population])
+        rwd, terms = compute_reward(m_train, best_lag, half_life,
+                                    instability, cand, similarity,
+                                    cfg['reward'])
+        profile = {
+            str(l): {'train': {k: (None if v is None or not np.isfinite(v)
+                                   else round(float(v), 8))
+                               for k, v in m_train_by_lag[l].items()},
+                     'select': {k: (None if v is None or not np.isfinite(v)
+                                    else round(float(v), 8))
+                                for k, v in m_select_by_lag[l].items()}}
+            for l in search_lags
+        }
         ledger.record(roll.roll_id, gen, cand, direction,
-                      m_train, m_select, rwd, terms, target_lag=lag)
+                      m_train, m_select, rwd, terms, target_lag=best_lag,
+                      profile_json=json.dumps(profile),
+                      half_life_bars=half_life)
         if cand.family in bandit:
             bandit[cand.family]['n'] += 1
             bandit[cand.family]['sum'] += rwd
         population.append({
             'candidate': cand, 'direction': direction,
-            'target_lag': int(lag),
+            'target_lag': int(best_lag),
+            'half_life_bars': float(half_life),
+            'profile_train': m_train_by_lag,
+            'profile_select': m_select_by_lag,
             'reward': rwd, 'metrics_train': m_train,
             'metrics_select': m_select,
+            'signal_train': sig_train.reset_index(drop=True),
             'signal_select': sig_select.reset_index(drop=True),
         })
 

@@ -7,7 +7,7 @@ Equivalence checks for the walk-forward signal-selection speedups:
 Each fast path must be bit-for-bit (within fp tolerance) equal to the original
 reference on synthetic data. No database required.
 
-Run: uv run python tests/walk_forward_selection_speedups_checks.py
+Run: uv run tests/walk_forward_selection_speedups_checks.py
 """
 
 import sys
