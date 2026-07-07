@@ -453,9 +453,17 @@ class Proposer(ABC):
     def propose(self, n: int, family: str, diagnostics: dict,
                 parents: Sequence[Candidate],
                 family_columns: Dict[str, list],
-                rng: np.random.Generator) -> list:
+                rng: np.random.Generator,
+                parent_scores: Optional[dict] = None,
+                failures: Optional[list] = None) -> list:
         """Return up to n candidates for one family. Invalid programs are fine
-        to return - the harness validates and drops them."""
+        to return - the harness validates and drops them.
+
+        parent_scores: {candidate_hash: {reward, ic_tstat, half_life_bars}} so
+          an API proposer can see HOW WELL each parent did, not just its form.
+        failures: [{expression, conditions, reward}] of recently-culled
+          low-scoring candidates - things to avoid re-proposing. Both are
+          hints for API proposers; the random baseline ignores them."""
 
     def usage_snapshot(self) -> dict:
         """Cumulative API usage. Zero for non-API proposers; API proposers
@@ -590,7 +598,11 @@ class RandomProposer(Proposer):
     def propose(self, n: int, family: str, diagnostics: dict,
                 parents: Sequence[Candidate],
                 family_columns: Dict[str, list],
-                rng: np.random.Generator) -> list:
+                rng: np.random.Generator,
+                parent_scores: Optional[dict] = None,
+                failures: Optional[list] = None) -> list:
+        # The random baseline mutates the grammar blindly; scores/failures
+        # are hints only an LLM can use.
         cols = list(family_columns.get(family) or [])
         if not cols:
             return []
@@ -615,10 +627,51 @@ def _named(family: str, expression: tuple, conditions: tuple,
                      rationale=rationale)
 
 
-_LLM_SYSTEM = """You are a quantitative signal researcher. You propose \
-cross-sectional signals over crypto perp RESIDUAL returns as programs in a \
-small DSL. You only see compressed diagnostics - never raw data - and \
-everything you emit is re-validated and re-scored by fixed code.
+_LLM_SYSTEM = """You are a senior quantitative researcher on a market-neutral \
+crypto statistical-arbitrage desk. THE STRATEGY: the book holds ~130 \
+Hyperliquid perpetual futures at once — long the coins it judges underpriced, \
+short the overpriced — and is kept dollar- and factor-neutral (market, size, \
+momentum, volatility, meme), so it profits ONLY from coin-specific mispricing, \
+never from the market rising or falling. Your job is to produce signals that \
+rank the coins by their expected RESIDUAL return — the return left after those \
+factors are stripped out — over the next few hours to a day. The book trades \
+SLOWLY to keep costs down, so a signal whose edge PERSISTS for hours is worth \
+far more than one that decays in minutes.
+
+Crypto perps hand you data equities never had: funding rates (the cost of \
+leverage, and a live gauge of crowding), open interest and liquidations, \
+retail-vs-smart-money positioning, nonstop 24/7 flow, BTC leading the alts, \
+and reflexive meme dynamics. That is usually where the edge hides.
+
+For each feature you are told WHAT IT MEASURES, its recent correlation with the \
+forward residual target, the shape of that relationship (decile curve), its \
+stability, and how it shifts across market regimes. Treat these as EVIDENCE — \
+then reason about the MECHANISM: WHY would this predict? (positioning unwinds, \
+funding carry and its mean-reversion, liquidity provision and short-horizon \
+reversal, information diffusion and lead-lag between coins, volatility-regime \
+shifts, event-driven repricing.)
+
+BE CREATIVE — which here means specific things, not novelty for its own sake:
+- Propose a NEW MECHANISM, not a new formula for an old one — a different \
+economic reason to expect mispricing.
+- Exploit UNDERUSED structure: conditional/regime gates (act only when VIX is \
+high, an event is near, or funding just flipped), interactions between two \
+DIFFERENT features (funding × open interest, volume surprise × recent return), \
+lead-lag (a BTC move the alt hasn't reflected yet), positioning divergences \
+(retail long while top traders are short), post-event drift.
+- Second-order ideas: the CHANGE or ACCELERATION of a feature; a feature \
+relative to its cluster; a feature that only works in one regime.
+- Prefer mechanisms that PERSIST over hours (carry, slow unwinds, diffusion) \
+over sub-hour microstructure blips the slow book cannot harvest.
+
+Do NOT: restate price momentum or reversal on its own; multiply together the \
+two highest-correlation columns; stack transforms on a single column; or submit \
+minor variations of one idea. Every candidate in the batch must rest on a \
+DIFFERENT mechanism from the others and from the parents shown. The "rationale" \
+states the ECONOMIC mechanism in one line (WHY it should predict), not the \
+formula. You see only compressed diagnostics, never raw data, and everything \
+you emit is re-validated and re-scored by fixed code — a weak idea only wastes \
+budget, it cannot corrupt results.
 
 DSL (JSON S-expressions):
   leaf: ["col", "<feature>"]  (only features listed in the diagnostics)
@@ -631,6 +684,11 @@ DSL (JSON S-expressions):
   gate: ["where", condition, expr_if_true, expr_if_false]
   condition: ["gt"|"lt"|"abs_gt"|"abs_lt", expression, threshold_number]
 
+You are shown the current best survivors WITH their scores (reward, IC t-stat, \
+alpha half-life) and a list of candidates that already scored poorly. Learn \
+from both: push further in the directions that scored well, drop the ones that \
+scored near zero, and never re-propose anything in avoid_these.
+
 Respond with ONLY a JSON array of candidate objects:
   {"family": "...", "expression": [...], "conditions": [[...], ...],
    "rationale": "one line"}
@@ -640,12 +698,15 @@ transforms. Avoid near-duplicates of the parents shown."""
 
 class _ApiProposer(Proposer):
     """Shared machinery for API-backed proposers: prompt building, response
-    parsing, and token-usage accounting. Untrusted and swappable; API/parse
-    failures degrade to an empty batch (the search continues on parents).
+    parsing, and token-usage accounting. Untrusted and swappable; an
+    unusable response (API error, truncation with no salvageable prefix) is
+    RETRIED ONCE, then degrades to an empty batch (the search continues on
+    parents).
 
     Usage accounting: every completed call adds to self.usage. `calls` counts
-    ATTEMPTS (a failed call may still bill); token counts come from the
-    provider's usage metadata on successful responses.
+    ATTEMPTS (a failed call may still bill; a retry is a second attempt);
+    token counts come from the provider's usage metadata on successful
+    responses.
     """
 
     provider = ''   # set by subclasses; selects model + price config entries
@@ -670,7 +731,20 @@ class _ApiProposer(Proposer):
     def usage_snapshot(self) -> dict:
         return dict(self.usage)
 
-    def _prompt(self, n, family, diagnostics, parents, family_columns) -> str:
+    def _prompt(self, n, family, diagnostics, parents, family_columns,
+                parent_scores=None, failures=None) -> str:
+        from research.signals.agent.data import describe_column
+        # name -> what it measures, so the LLM reasons about the mechanism
+        # rather than guessing from the abbreviation.
+        allowed = family_columns.get(family, [])
+        all_cols = sorted({c for cols in family_columns.values() for c in cols})
+        scores = parent_scores or {}
+        # Parents WITH their scores, best first, so the model can lean into
+        # what is working and away from what barely survived.
+        ranked = sorted(parents, key=lambda p: -(scores.get(p.hash, {})
+                                                  .get('reward', 0.0)))
+        parents_scored = [{**p.to_dict(), 'score': scores.get(p.hash, {})}
+                          for p in ranked][:10]
         payload = {
             'task': (f"Propose {n} new candidates for family '{family}' "
                      f"predicting the forward residual target "
@@ -679,10 +753,15 @@ class _ApiProposer(Proposer):
                       "(events/macro state): identical for every coin at a "
                       "timestamp, so a direct expression of them z-scores to "
                       "zero. Use them ONLY inside conditions (regime gates) "
-                      "or multiplied against a cross-sectional column."),
-            'allowed_columns': family_columns.get(family, []),
-            'all_columns': sorted({c for cols in family_columns.values()
-                                   for c in cols}),
+                      "or multiplied against a cross-sectional column. "
+                      "current_parents carry their 'score' (reward, IC t-stat, "
+                      "alpha half-life in bars) — build on the strong ones, "
+                      "abandon directions that scored near zero. "
+                      "avoid_these already scored poorly — do not re-propose "
+                      "them or trivial variants."),
+            'columns': {c: describe_column(c) for c in allowed},
+            'other_columns': {c: describe_column(c) for c in all_cols
+                              if c not in allowed},
             'ALLOWED_WINDOWS': self.dsl_cfg['windows'],
             'max_depth': self.dsl_cfg['max_depth'],
             'max_conditions': self.dsl_cfg['max_conditions'],
@@ -691,7 +770,8 @@ class _ApiProposer(Proposer):
                 for c in diagnostics.get('top_by_family', {}).get(family, [])
                 if c in diagnostics.get('features', {})
             },
-            'current_parents': [p.to_dict() for p in parents][:10],
+            'current_parents': parents_scored,
+            'avoid_these': (failures or [])[:6],
         }
         return json.dumps(payload, separators=(',', ':'))
 
@@ -703,31 +783,37 @@ class _ApiProposer(Proposer):
     def propose(self, n: int, family: str, diagnostics: dict,
                 parents: Sequence[Candidate],
                 family_columns: Dict[str, list],
-                rng: np.random.Generator) -> list:
-        import logging
+                rng: np.random.Generator,
+                parent_scores: Optional[dict] = None,
+                failures: Optional[list] = None) -> list:
         n = min(n, int(self.llm_cfg['candidates_per_call']))
-        self.usage['calls'] += 1
-        text = ''
-        try:
-            text = self._complete(self._prompt(n, family, diagnostics,
-                                               parents, family_columns))
-            items = _parse_json_array(text)
-        except RuntimeError:
-            raise   # missing/invalid .env key - fail fast, not N empty batches
-        except ImportError as e:
-            # Missing SDK is a broken environment, not a transient API hiccup:
-            # abort instead of degrading to an all-empty search (128 empty
-            # batches per roll, zero candidates, zero cost - looks like a run,
-            # finds nothing by construction).
-            raise SystemExit(
-                f"{self.provider} proposer cannot import its SDK ({e}). "
-                f"Install it ('uv add google-genai' for gemini, "
-                f"'uv add anthropic' for anthropic) or switch "
-                f"discovery.llm.provider.") from e
-        except Exception as e:
-            snippet = text[:200].replace('\n', ' ') if text else '(no text)'
-            logging.warning(f"{self.provider} proposer failed ({e}); "
-                            f"empty batch. Response head: {snippet!r}")
+        prompt = self._prompt(n, family, diagnostics, parents, family_columns,
+                              parent_scores=parent_scores, failures=failures)
+        items = None
+        last_err = None
+        for attempt in (1, 2):   # one retry: truncation/parse flakes are
+            self.usage['calls'] += 1   # transient; twice in a row is real
+            try:
+                items = _parse_json_array(self._complete(prompt))
+                break
+            except RuntimeError:
+                raise   # missing/invalid .env key - fail fast, not N empty batches
+            except ImportError as e:
+                # Missing SDK is a broken environment, not a transient API
+                # hiccup: abort instead of degrading to an all-empty search
+                # (128 empty batches per roll, zero candidates, zero cost -
+                # looks like a run, finds nothing by construction).
+                raise SystemExit(
+                    f"{self.provider} proposer cannot import its SDK ({e}). "
+                    f"Install it ('uv add google-genai' for gemini, "
+                    f"'uv add anthropic' for anthropic) or switch "
+                    f"discovery.llm.provider.") from e
+            except Exception as e:
+                last_err = e
+        if items is None:
+            logging.warning(f"{self.provider} proposer: unusable response "
+                            f"twice ({last_err}); skipping this batch "
+                            f"(family '{family}').")
             return []
 
         out = []

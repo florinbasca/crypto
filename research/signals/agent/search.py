@@ -631,21 +631,48 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         logging.info(f"roll {roll.roll_id}: seeded {len(population)} of "
                      f"{len(seed_candidates)} previous survivors")
 
+    # Failure memory: recently-culled low-reward candidates, so the LLM can be
+    # told what NOT to re-propose (worst first, capped).
+    failures: List[dict] = []
+
+    def _parent_scores(pop) -> Dict[str, dict]:
+        return {s['candidate'].hash: {
+            'reward': round(float(s['reward']), 3),
+            'ic_tstat': round(day_equivalent_tstat(s['metrics_train'],
+                                                   s['target_lag']), 2),
+            'half_life_bars': int(s.get('half_life_bars', 0) or 0),
+        } for s in pop}
+
     for gen in range(int(search_cfg['n_generations'])):
         alloc = allocate_batch(bandit, families,
                                int(search_cfg['batch_size']),
                                float(search_cfg['bandit_ucb_c']))
         parents = [s['candidate'] for s in population]
+        parent_scores = _parent_scores(population)
+        fail_hint = [{'expression': c.to_dict()['expression'],
+                      'conditions': c.to_dict()['conditions'],
+                      'reward': round(float(r), 3)}
+                     for c, r in sorted(failures, key=lambda x: x[1])[:6]]
         for family in families:
             n_fam = alloc[family]
             if n_fam <= 0:
                 continue
             cands = proposer.propose(n_fam, family, diagnostics, parents,
-                                     family_columns, rng)
+                                     family_columns, rng,
+                                     parent_scores=parent_scores,
+                                     failures=fail_hint)
             for cand in cands:
                 try_candidate(cand, gen)
+        pre_cull = population
         population = select_survivors(population, int(search_cfg['survivors']),
                                       float(search_cfg['diversity_max_corr']))
+        # Whatever was tried this gen but did not survive is a failure to
+        # remember (low reward first is selected at prompt time).
+        kept = {s['candidate'].hash for s in population}
+        for s in pre_cull:
+            if s['candidate'].hash not in kept:
+                failures.append((s['candidate'], s['reward']))
+        failures = sorted(failures, key=lambda x: x[1])[:50]   # keep worst 50
         logging.info(f"roll {roll.roll_id} gen {gen}: "
                      f"{ledger.n_trials(roll.roll_id)} trials, "
                      f"best reward "

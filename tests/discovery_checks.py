@@ -587,6 +587,29 @@ class _BrokenSDKProposer(gen.GeminiProposer):
         raise ImportError("cannot import name 'genai' from 'google'")
 
 
+# parent scores + failure memory reach the prompt (guided evolution)
+import json as _json
+_pp = gen.GeminiProposer.__new__(gen.GeminiProposer)
+_pp.llm_cfg = {'candidates_per_call': 8}
+_pp.dsl_cfg = get('discovery.dsl')
+_pa = gen.Candidate('a', 'residual_shape', ('col', 'res_zscore'))
+_pb = gen.Candidate('b', 'residual_shape', ('neg', ('col', 'res_zscore')))
+_payload = _json.loads(_pp._prompt(
+    4, 'residual_shape',
+    {'target': 'fwd_36b', 'features': {}, 'top_by_family': {}}, [_pb, _pa],
+    {'residual_shape': ['res_zscore']},
+    parent_scores={_pa.hash: {'reward': 2.1, 'ic_tstat': 4.3, 'half_life_bars': 288},
+                   _pb.hash: {'reward': 0.1, 'ic_tstat': 0.4, 'half_life_bars': 6}},
+    failures=[{'expression': ['col', 'res_mom'], 'conditions': [], 'reward': -0.5}]))
+check("prompt: parents carry scores, ranked best-first",
+      _payload['current_parents'][0]['score']['reward'] == 2.1
+      and _payload['current_parents'][1]['score']['reward'] == 0.1)
+check("prompt: failure memory reaches avoid_these",
+      _payload['avoid_these'] == [{'expression': ['col', 'res_mom'],
+                                   'conditions': [], 'reward': -0.5}])
+check("prompt: columns carry descriptions (data dictionary)",
+      _payload['columns'].get('res_zscore', '') != '')
+
 try:
     _BrokenSDKProposer().propose(4, 'residual_shape', {}, [], {}, rng)
     check("providers: missing SDK aborts the run (fail fast)", False,
@@ -597,6 +620,35 @@ except SystemExit as e:
 except Exception as e:
     check("providers: missing SDK aborts the run (fail fast)", False,
           f"(wrong exception: {type(e).__name__}: {e})")
+
+class _FlakyProposer(gen.GeminiProposer):
+    """First call truncates INSIDE the first object (nothing salvageable);
+    the retry returns a clean array."""
+    def __init__(self, fail_times=1):
+        self.llm_cfg = {'candidates_per_call': 8}
+        self.usage = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0}
+        self._fails_left = fail_times
+
+    def _prompt(self, *args, **kwargs):
+        return 'x'
+
+    def _complete(self, prompt):
+        if self._fails_left > 0:
+            self._fails_left -= 1
+            return '[ {"family": "residual_shape", "rationale": "cut mid-str'
+        return ('[{"family": "residual_shape", '
+                '"expression": ["col", "res_zscore"], "conditions": []}]')
+
+
+flaky = _FlakyProposer(fail_times=1)
+got = flaky.propose(4, 'residual_shape', {}, [], {}, rng)
+check("providers: unusable response retried once and recovered",
+      len(got) == 1 and flaky.usage['calls'] == 2,
+      f"({len(got)} candidates from {flaky.usage['calls']} attempts)")
+dead = _FlakyProposer(fail_times=2)
+check("providers: unusable twice -> empty batch, no exception",
+      dead.propose(4, 'residual_shape', {}, [], {}, rng) == []
+      and dead.usage['calls'] == 2)
 
 check("providers: 'random' -> RandomProposer",
       isinstance(gen.make_proposer('random'), gen.RandomProposer))

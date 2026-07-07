@@ -247,6 +247,133 @@ def beta_columns(panel: pd.DataFrame) -> List[str]:
 
 
 # =============================================================================
+# Feature descriptions (the proposer's data dictionary)
+# =============================================================================
+# What each column MEASURES, so the LLM can reason about the mechanism instead
+# of guessing from the abbreviation. Point-in-time honest: describe the INPUT,
+# never claim it predicts. Per-column where confirmed against
+# risk_model/features.py; a prefix fallback covers the rest at family level.
+# Keep in sync with the feature calculators.
+
+FEATURE_DESCRIPTIONS = {
+    # cross-sectional (per-timestamp rank/relative vs the universe)
+    'cs_rel_volume': "own bar $volume vs its trailing average, relative to the universe median (volume surprise)",
+    'cs_ret_rank_1h': "cross-sectional percentile rank of the trailing 1h return",
+    'cs_ret_rank_1d': "cross-sectional percentile rank of the trailing 1d return",
+    'cs_dispersion_1h': "universe-wide return dispersion over 1h (same for all coins; a regime conditioner)",
+    'cs_breadth_sma': "fraction of the universe above its SMA (breadth; same for all coins)",
+    'cs_funding_z': "coin's funding rate z-scored across the universe (relative crowding)",
+    'cs_mcap_rank': "market-cap percentile rank across the universe (lagged 1 day)",
+    'cs_cluster_rel_z': "residual cumulative return z-scored within the coin's trailing correlation cluster",
+    # funding (perpetual funding rate)
+    'fr_annualized': "perpetual funding rate, annualized (positive = longs pay shorts = long crowding)",
+    'fr_rate': "current funding rate",
+    'fr_rate_zscore': "funding rate vs its own recent history (z-score)",
+    'fr_rate_change': "change in the funding rate",
+    'fr_rate_ma_7d': "7-day moving-average funding rate",
+    'fr_cumulative_24h': "funding paid/received over the last 24h (realized carry)",
+    'fr_mean': "trailing mean funding rate",
+    'fr_std': "trailing volatility of the funding rate",
+    'fr_extreme_high': "flag: funding unusually high (crowded longs)",
+    'fr_extreme_low': "flag: funding unusually low/negative (crowded shorts)",
+    'fr_flip_age': "bars since funding last flipped sign",
+    'fr_oi_crowding': "funding × open interest (size of the crowded carry position)",
+    # open interest / positioning
+    'oi_value': "open interest (notional outstanding)",
+    'oi_change': "change in open interest",
+    'oi_change_pct': "percent change in open interest",
+    'oi_change_z': "open-interest change z-scored",
+    'oi_change_zscore': "open-interest change z-scored",
+    'oi_value_zscore': "open interest vs its own history (z-score)",
+    'oi_relative': "open interest relative to the universe",
+    'oi_price_divergence': "open interest rising while price falls (or vice-versa) — positioning/price divergence",
+    'oi_flush': "flag: sharp open-interest drop (liquidation flush)",
+    'oi_mean': "trailing mean open interest",
+    'oi_std': "trailing volatility of open interest",
+    # trader positioning (exchange long/short & taker flow)
+    'pos_retail_ls': "retail long/short account ratio",
+    'pos_retail_ls_zscore': "retail long/short ratio z-scored",
+    'pos_toptrader_ls': "top-trader long/short position ratio",
+    'pos_toptrader_ls_zscore': "top-trader long/short ratio z-scored",
+    'pos_retail_vs_smart': "retail vs top-trader positioning gap (dumb-vs-smart money)",
+    'pos_taker_ratio': "taker buy/sell volume ratio (aggressive flow direction)",
+    'pos_taker_zscore': "taker buy/sell ratio z-scored",
+    # market relationship / lead-lag to the market factor
+    'mk_corr_market_1d': "trailing 1d correlation of the coin's returns with the market factor",
+    'mk_beta_drift': "change in the coin's market beta",
+    'mk_lag_response_gap': "how much the coin still has to catch up to a market move it lagged",
+    'mk_market_ret_1h': "market factor return over 1h (same for all coins; regime)",
+    'mk_market_vol_1d': "market factor volatility over 1d (same for all coins; regime)",
+    'mk_market_move_z': "size of the current market move in std units (same for all coins)",
+    'mk_lag_corr_short': "short-window lagged correlation to the market (coin leads/lags market)",
+    'mk_lag_corr_long': "long-window lagged correlation to the market",
+    # factor loadings (rolling betas + drift)
+    'fl_beta_market': "rolling beta to the market factor",
+    'fl_beta_size': "rolling beta to the size factor",
+    'fl_beta_market_change_short': "short-horizon change in market beta",
+    'fl_beta_market_change_long': "long-horizon change in market beta",
+    'fl_beta_size_change_short': "short-horizon change in size beta",
+    'fl_beta_size_change_long': "long-horizon change in size beta",
+    'fl_r2_total': "how well the factor model explains this coin lately (R²; high = little idiosyncratic room)",
+    # lead-lag vs the market leader (BTC)
+    'll_leader_beta': "beta of the coin to the market leader (BTC)",
+    'll_lag_corr': "correlation of the coin's return to the leader's lagged return (does BTC lead it?)",
+    # intrabar microstructure
+    'ib_rv_1h': "realized volatility over 1h from 1-min bars",
+    'ib_rv_cc_ratio': "intrabar realized vol vs close-to-close vol (intrabar noise)",
+    'ib_max_move_1m': "largest 1-min move in the bar, normalized",
+    'ib_autocorr_1m': "1-min return autocorrelation within the bar (trending vs choppy)",
+    'ib_vwap_dev': "close vs VWAP (where price settled within the bar)",
+    'ib_zero_vol_share': "share of zero-volume minutes (illiquidity)",
+    'ib_volume_herf_1h': "volume concentration across the hour (Herfindahl; bursty vs even)",
+    # macro-beta (per-coin sensitivity to macro drivers)
+    'mb_beta_rates': "coin's sensitivity (beta) to 2y rate changes",
+    'mb_beta_dollar': "sensitivity to the US dollar index",
+    'mb_beta_vix': "sensitivity to VIX (risk-off beta)",
+    'mb_beta_stables': "sensitivity to stablecoin-supply flows",
+    'mb_beta_dominance': "sensitivity to BTC dominance",
+    'mb_event_vol_ratio': "how much the coin's volatility rises around macro events",
+    'mb_event_volume_ratio': "how much the coin's volume rises on event days",
+    'mb_event_drift': "the coin's typical residual drift in the 24h after an event",
+}
+
+# Family-level fallback by prefix, for columns not listed above.
+_DESC_PREFIX = [
+    ('res_', "residual-return dynamics: autocorrelation, volatility, and mean-reversion state of the coin's factor residual"),
+    ('ou_', "Ornstein-Uhlenbeck mean-reversion fit on the residual price level (reversion speed, half-life, deviation)"),
+    ('vr_', "volatility-regime feature (short vs long realized-vol ratios, breakouts, persistence)"),
+    ('rb_', "range-based volatility estimator from OHLC (Parkinson / Garman-Klass / Rogers-Satchell)"),
+    ('ib_', "intrabar microstructure feature from 1-min bars"),
+    ('lq_', "liquidity/illiquidity feature (Amihud, price impact)"),
+    ('vl_', "liquidity/volume feature"),
+    ('ms_', "market-microstructure feature"),
+    ('fr_', "perpetual funding-rate feature"),
+    ('oi_', "open-interest / positioning feature"),
+    ('pos_', "trader-positioning feature (retail vs top-trader, taker flow)"),
+    ('cs_', "cross-sectional rank/relative feature vs the universe"),
+    ('fl_', "rolling factor loading (beta) and its drift"),
+    ('mk_', "relationship to the market factor (beta, lead-lag, market state)"),
+    ('cap_', "market-cap / turnover feature"),
+    ('sn_', "seasonality: hour-of-day or day-of-week residual pattern"),
+    ('ll_', "lead-lag vs the market leader (BTC)"),
+    ('ev_', "event timing (FOMC/CPI/NFP proximity) — identical for all coins; use as a gate"),
+    ('mx_', "macro state (rates, dollar, VIX, liquidity, sentiment) — identical for all coins; use as a gate"),
+    ('mb_', "per-coin sensitivity (beta) to a macro driver or event"),
+]
+
+
+def describe_column(col: str) -> str:
+    """One-line description of what a feature column MEASURES (data dictionary
+    for the LLM). Exact match first, then prefix fallback, then empty."""
+    if col in FEATURE_DESCRIPTIONS:
+        return FEATURE_DESCRIPTIONS[col]
+    for prefix, desc in _DESC_PREFIX:
+        if col.startswith(prefix):
+            return desc
+    return ""
+
+
+# =============================================================================
 # Diagnostics builder (the proposer's entire view of the world)
 # =============================================================================
 
@@ -314,6 +441,7 @@ def build_diagnostics(train_panel: pd.DataFrame,
             base = _feature_ic(df, col, tcol, min_assets)
             entry = {
                 'family': family,
+                'desc': describe_column(col),
                 'ic': round(base['ic'], 5) if np.isfinite(base['ic']) else None,
                 'ic_tstat': round(base['tstat'], 2),
                 'binned_fwd': _binned_curve(df, col, tcol, n_bins),

@@ -532,9 +532,11 @@ config = {
             # across horizons; a mixed profile is a red flag.
             'min_profile_sign_agreement': 0.75,
             'max_book_corr': 0.5,            # signal corr vs already-promoted book
-            # A candidate must be a search survivor in this many CONSECUTIVE
-            # rolls (by candidate hash) before it may be promoted.
-            'min_rolls_survived': 2,
+            # Consecutive-roll survival required before promotion. 1 =
+            # OFF: each month stands alone, promoted purely on its own
+            # train + held-out select month, with no dependence on prior
+            # months. (>1 would re-couple months as an anti-overfit filter.)
+            'min_rolls_survived': 1,
             'max_book_size': 15,      # per roll (the book re-forms every roll)
             # Capture floor: minimum persistence weight 1/(1 + phi/kappa) a
             # candidate needs to promote. 0.5 = alpha half-life of at least
@@ -567,17 +569,18 @@ config = {
                 'anthropic': 'claude-sonnet-4-6',
                 'gemini': 'gemini-2.5-flash',
             },
-            # 8192: at 4096 the 8-candidate JSON array was regularly cut
-            # mid-object and the WHOLE batch parsed to nothing (the search
-            # ran at ~40% of its configured width). The parser also salvages
-            # the complete prefix of a truncated array now.
-            'max_tokens': 8192,
+            # max_output_tokens must cover BOTH the reasoning budget below
+            # AND the JSON (8 candidates ~= 2-3k tokens). 10240 leaves the
+            # model room to think ~3k tokens and still emit a full batch;
+            # the parser salvages the prefix if a batch is ever cut.
+            'max_tokens': 10240,
             'candidates_per_call': 8,
-            # Gemini 2.5 thinking budget (tokens). 0 disables thinking so the
-            # whole max_tokens budget goes to the JSON output (thoughts are
-            # billed as output and can truncate the response mid-array).
-            # None = provider default.
-            'gemini_thinking_budget': 0,
+            # Gemini 2.5 thinking budget (tokens). The whole point of using an
+            # LLM here is economic reasoning, so give it room to deliberate
+            # before emitting JSON (weigh mechanisms, diversify the batch).
+            # Counts against max_tokens above. 0 disables; None = provider
+            # default.
+            'gemini_thinking_budget': 3072,
             # $ per million tokens, per provider - used ONLY for the cost
             # estimate printed/persisted by run_discovery. Prices change, so
             # pin your provider's current rates here; None disables the

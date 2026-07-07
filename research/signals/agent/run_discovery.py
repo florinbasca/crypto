@@ -182,9 +182,7 @@ def main():
         # data ending just before it. No carryover, no lifetime membership;
         # failing to re-qualify IS the demotion.
         book = bt.promote(survivors, roll, ledger, cfg)
-        print(f"promoted this roll: {len(book)} signals "
-              f"(tradable from {roll.oos_start.date()}; the walk-forward "
-              f"is the money judge)")
+        print(f"promoted this roll: {len(book)} signals")
         roll_promo_rows = []
         for p in book:
             c = p['candidate']
