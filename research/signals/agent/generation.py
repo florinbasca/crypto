@@ -244,6 +244,43 @@ def _depth(node) -> int:
 
 
 # =============================================================================
+# Structural (AST) similarity - diversity beyond output correlation
+# =============================================================================
+
+def _subtree_nodes(node, out=None) -> list:
+    """Every sub-expression node of a tree (each tuple is a canonical,
+    hashable structural key: operator + children + columns/windows)."""
+    if out is None:
+        out = []
+    if isinstance(node, tuple):
+        out.append(node)
+        for arg in node[1:]:
+            if isinstance(arg, tuple):
+                _subtree_nodes(arg, out)
+    return out
+
+
+def candidate_subtrees(cand: Candidate, min_depth: int = 2) -> set:
+    """A candidate's structural building blocks: sub-expressions of at least
+    min_depth (bare column leaves excluded as too generic). Condition
+    expressions count too."""
+    nodes = _subtree_nodes(cand.expression)
+    for cond in cand.conditions:
+        nodes += _subtree_nodes(cond[1])
+    return {n for n in nodes if _depth(n) >= min_depth}
+
+
+def ast_similarity(a: Candidate, b: Candidate) -> float:
+    """Jaccard overlap of two candidates' building blocks: 1.0 = identical
+    structure, 0.0 = nothing shared. Catches near-clones that slip under
+    output-correlation de-dup (same recipe, one column/window swapped)."""
+    sa, sb = candidate_subtrees(a), candidate_subtrees(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+# =============================================================================
 # Validation (boundedness): only allowed columns, ops, windows, and size caps
 # =============================================================================
 
@@ -455,14 +492,17 @@ class Proposer(ABC):
                 family_columns: Dict[str, list],
                 rng: np.random.Generator,
                 parent_scores: Optional[dict] = None,
-                failures: Optional[list] = None) -> list:
+                failures: Optional[list] = None,
+                overused: Optional[list] = None) -> list:
         """Return up to n candidates for one family. Invalid programs are fine
         to return - the harness validates and drops them.
 
         parent_scores: {candidate_hash: {reward, ic_tstat, half_life_bars}} so
           an API proposer can see HOW WELL each parent did, not just its form.
         failures: [{expression, conditions, reward}] of recently-culled
-          low-scoring candidates - things to avoid re-proposing. Both are
+          low-scoring candidates - things to avoid re-proposing.
+        overused: over-mined structural building blocks (sub-expressions) to
+          vary away from - the frequent-subtree-avoidance hint. All three are
           hints for API proposers; the random baseline ignores them."""
 
     def usage_snapshot(self) -> dict:
@@ -600,9 +640,10 @@ class RandomProposer(Proposer):
                 family_columns: Dict[str, list],
                 rng: np.random.Generator,
                 parent_scores: Optional[dict] = None,
-                failures: Optional[list] = None) -> list:
-        # The random baseline mutates the grammar blindly; scores/failures
-        # are hints only an LLM can use.
+                failures: Optional[list] = None,
+                overused: Optional[list] = None) -> list:
+        # The random baseline mutates the grammar blindly; scores/failures/
+        # overused are hints only an LLM can use.
         cols = list(family_columns.get(family) or [])
         if not cols:
             return []
@@ -732,7 +773,7 @@ class _ApiProposer(Proposer):
         return dict(self.usage)
 
     def _prompt(self, n, family, diagnostics, parents, family_columns,
-                parent_scores=None, failures=None) -> str:
+                parent_scores=None, failures=None, overused=None) -> str:
         from research.signals.agent.data import describe_column
         # name -> what it measures, so the LLM reasons about the mechanism
         # rather than guessing from the abbreviation.
@@ -754,11 +795,22 @@ class _ApiProposer(Proposer):
                       "timestamp, so a direct expression of them z-scores to "
                       "zero. Use them ONLY inside conditions (regime gates) "
                       "or multiplied against a cross-sectional column. "
+                      "LIQUIDITY-CONDITIONING (documented): short-horizon price "
+                      "autocorrelation FLIPS with liquidity — illiquid/low-volume "
+                      "coins REVERSE (liquidity-provision premium), liquid coins "
+                      "trend. A pooled price signal blends the two and cancels; "
+                      "gate reversal/momentum on a liquidity or volume column "
+                      "(e.g. cs_rel_volume, lq_*, cs_mcap_rank). Order-flow "
+                      "columns (of_/ms_ofi/signed) are largely ORTHOGONAL to "
+                      "price signals — prized independent breadth. "
                       "current_parents carry their 'score' (reward, IC t-stat, "
                       "alpha half-life in bars) — build on the strong ones, "
                       "abandon directions that scored near zero. "
                       "avoid_these already scored poorly — do not re-propose "
-                      "them or trivial variants."),
+                      "them or trivial variants. overused_building_blocks are "
+                      "sub-expressions the search has already tried heavily — "
+                      "reach for a DIFFERENT structure/mechanism, not another "
+                      "formula built on them."),
             'columns': {c: describe_column(c) for c in allowed},
             'other_columns': {c: describe_column(c) for c in all_cols
                               if c not in allowed},
@@ -772,6 +824,7 @@ class _ApiProposer(Proposer):
             },
             'current_parents': parents_scored,
             'avoid_these': (failures or [])[:6],
+            'overused_building_blocks': (overused or [])[:8],
         }
         return json.dumps(payload, separators=(',', ':'))
 
@@ -785,10 +838,12 @@ class _ApiProposer(Proposer):
                 family_columns: Dict[str, list],
                 rng: np.random.Generator,
                 parent_scores: Optional[dict] = None,
-                failures: Optional[list] = None) -> list:
+                failures: Optional[list] = None,
+                overused: Optional[list] = None) -> list:
         n = min(n, int(self.llm_cfg['candidates_per_call']))
         prompt = self._prompt(n, family, diagnostics, parents, family_columns,
-                              parent_scores=parent_scores, failures=failures)
+                              parent_scores=parent_scores, failures=failures,
+                              overused=overused)
         items = None
         last_err = None
         for attempt in (1, 2):   # one retry: truncation/parse flakes are

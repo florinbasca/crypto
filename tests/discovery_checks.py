@@ -567,6 +567,79 @@ check("capture floor: min_capture blocks fast-alpha promotion",
       bt_mod.promote(survivors_a, ROLL, ledger_a, cap_cfg) == [])
 
 # ---------------------------------------------------------------------------
+# 5e. feedback.md #1/#2/#3: diagnostic blend, AST diversity, incremental reward
+# ---------------------------------------------------------------------------
+print("--- 5e. diagnostic blend / AST diversity / incremental reward ---")
+
+# #1 nonlinearity + regime helpers: a U-shaped decile curve scores high even
+# with ~0 monotonic IC; a flat one scores ~0.
+check("diag: decile nonlinearity catches U-shape, ignores flat",
+      data_mod._decile_nonlinearity([0.01, -0.01, -0.02, -0.01, 0.01]) > 0.02
+      and data_mod._decile_nonlinearity([0.0, 0.0, 0.0]) == 0.0)
+check("diag: regime spread = max high-vs-low gap",
+      abs(data_mod._regime_spread({'r': {'high': 0.03, 'low': -0.01}}) - 0.04) < 1e-9
+      and data_mod._regime_spread({'r': {'high': None, 'low': 0.0}}) == 0.0)
+_r01 = data_mod._rank01({'a': 1.0, 'b': 3.0, 'c': 2.0})
+check("diag: rank01 percentile-ranks within the group",
+      _r01['b'] == 1.0 and _r01['a'] < _r01['c'] < _r01['b'])
+
+# #2 AST similarity: identical structure = 1; a shared concrete subtree gives
+# partial overlap; a pure column swap (no shared concrete block) = 0.
+_A = gen.Candidate('a', 'f', ('neg', ('square', ('col', 'res_zscore'))))
+_A2 = gen.Candidate('a2', 'f', ('neg', ('square', ('col', 'res_zscore'))))
+_Bclone = gen.Candidate('b', 'f',                       # shares 2 of _A's blocks
+                        ('tanh', ('neg', ('square', ('col', 'res_zscore')))))
+_C = gen.Candidate('c', 'f', ('mul', ('square', ('col', 'res_zscore')),
+                              ('col', 'res_mom')))
+_D = gen.Candidate('d', 'f', ('neg', ('square', ('col', 'res_mom'))))
+check("ast: identical structure -> 1.0", gen.ast_similarity(_A, _A2) == 1.0)
+check("ast: shared concrete subtree -> partial", 0.0 < gen.ast_similarity(_A, _C) < 1.0)
+check("ast: structural clone -> high (> 0.5)", gen.ast_similarity(_A, _Bclone) > 0.5)
+check("ast: column swap (no shared block) -> 0.0", gen.ast_similarity(_A, _D) == 0.0)
+check("ast: candidate_subtrees excludes bare leaves",
+      all(gen._depth(s) >= 2 for s in gen.candidate_subtrees(_C)))
+
+# select_survivors: a structural clone that is OUTPUT-uncorrelated with the
+# original - the AST gate must still drop the lower-reward one.
+_ts = pd.date_range('2024-01-01', periods=40, freq='1h')
+def _sig_panel(vals):
+    return pd.DataFrame({'timestamp': np.repeat(_ts, 3),
+                         'symbol': np.tile(['X', 'Y', 'Z'], 40),
+                         'signal': vals})
+rng_s = np.random.default_rng(3)
+v1 = rng_s.normal(size=120); v2 = rng_s.normal(size=120)  # ~uncorrelated
+pop_ast = [
+    {'candidate': _A, 'reward': 2.0, 'signal_train': _sig_panel(v1)},
+    {'candidate': _Bclone, 'reward': 1.0, 'signal_train': _sig_panel(v2)},
+    {'candidate': _D, 'reward': 0.5, 'signal_train': _sig_panel(rng_s.normal(size=120))},
+]
+kept_hashes = {s['candidate'].hash for s in
+               search_mod.select_survivors(pop_ast, 3, 0.99, max_ast_sim=0.5)}
+check("select_survivors: AST gate drops a structural clone",
+      _A.hash in kept_hashes and _Bclone.hash not in kept_hashes
+      and _D.hash in kept_hashes)
+check("select_survivors: AST gate off (1.0) keeps both clones",
+      len(search_mod.select_survivors(pop_ast, 3, 0.99, 1.0)) == 3)
+
+# #3 incremental reward: pooled_signal averages; the reward carries the term
+# and it lifts the reward for a positive marginal contribution.
+_pooled = search_mod.pooled_signal([_sig_panel(np.ones(120)),
+                                    _sig_panel(3 * np.ones(120))])
+check("pooled_signal: averages the panels", bool((_pooled['signal'] == 2.0).all()))
+_m = {'ic_mean': 0.02, 'ic_tstat': 4.0, 'liquid_ic_ratio': 0.5,
+      'target_dispersion': 0.01, 'n_days': 20}
+_t_hi = search_mod.reward_terms(_m, 36, 288, 0.0, _A, 0.0, incremental=0.01)
+_t_lo = search_mod.reward_terms(_m, 36, 288, 0.0, _A, 0.0, incremental=0.0)
+check("reward: incremental term present and passed through",
+      _t_hi['incremental'] == 0.01 and _t_lo['incremental'] == 0.0)
+_rwd_hi, _ = search_mod.compute_reward(_m, 36, 288, 0.0, _A, 0.0,
+                                       incremental=0.01, reward_cfg=CFG['reward'])
+_rwd_lo, _ = search_mod.compute_reward(_m, 36, 288, 0.0, _A, 0.0,
+                                       incremental=0.0, reward_cfg=CFG['reward'])
+check("reward: positive incremental raises the reward",
+      _rwd_hi > _rwd_lo)
+
+# ---------------------------------------------------------------------------
 # 6. Proposer providers + cost tracking (no API calls: clients are lazy)
 # ---------------------------------------------------------------------------
 print("--- 6. providers + cost tracking ---")

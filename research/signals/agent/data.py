@@ -326,6 +326,23 @@ FEATURE_DESCRIPTIONS = {
     'ib_vwap_dev': "close vs VWAP (where price settled within the bar)",
     'ib_zero_vol_share': "share of zero-volume minutes (illiquidity)",
     'ib_volume_herf_1h': "volume concentration across the hour (Herfindahl; bursty vs even)",
+    # order flow (directional aggressive-flow / informed-trading)
+    'of_kyle_lambda': "price move per unit of net aggressive (taker) flow — Kyle's lambda, an impact/illiquidity measure",
+    'of_signed_flow_return_corr': "does aggressive flow DRIVE price (high) or get ABSORBED by resting liquidity (low/negative)",
+    'of_toxicity': "how one-sided the aggressive flow is (VPIN-style) — a proxy for informed trading / adverse selection",
+    'of_flow_persistence': "autocorrelation of the taker imbalance — is aggressive flow trending or choppy",
+    'of_flow_imbalance_1d': "net signed taker flow over ~1d, normalized by volume (persistent directional pressure)",
+    'of_flow_accel': "recent taker imbalance minus its slow baseline (flow building or fading)",
+    'ms_ofi_normalized': "order-flow imbalance (taker buy minus sell) over recent bars, normalized by volume",
+    'ms_ofi_cumsum_short': "cumulative signed taker flow over a short window",
+    'ms_ofi_cumsum_long': "cumulative signed taker flow over a long window",
+    'ms_buy_ratio': "taker buy volume as a fraction of total volume (0.5 = balanced; >0.5 = buy-pressure)",
+    'ms_buy_pressure_momentum': "change in taker buy-ratio (rising or falling buy pressure)",
+    'ms_up_down_volume_ratio': "volume on up-bars vs down-bars (directional participation)",
+    'ms_vol_return_correlation': "correlation of volume with |return| (is volume informative or noise)",
+    'ms_trade_intensity': "number of trades vs its trailing average (activity spike)",
+    'vl_taker_buy_ratio': "taker buy volume fraction (aggressive-buy share)",
+    'vl_signed_volume_ratio': "signed (buy-minus-sell) volume as a fraction of total",
     # macro-beta (per-coin sensitivity to macro drivers)
     'mb_beta_rates': "coin's sensitivity (beta) to 2y rate changes",
     'mb_beta_dollar': "sensitivity to the US dollar index",
@@ -344,9 +361,10 @@ _DESC_PREFIX = [
     ('vr_', "volatility-regime feature (short vs long realized-vol ratios, breakouts, persistence)"),
     ('rb_', "range-based volatility estimator from OHLC (Parkinson / Garman-Klass / Rogers-Satchell)"),
     ('ib_', "intrabar microstructure feature from 1-min bars"),
+    ('of_', "order-flow feature: directional aggressive (taker) flow, impact, or informed-trading proxy"),
     ('lq_', "liquidity/illiquidity feature (Amihud, price impact)"),
-    ('vl_', "liquidity/volume feature"),
-    ('ms_', "market-microstructure feature"),
+    ('vl_', "volume / taker-flow feature"),
+    ('ms_', "market-microstructure feature (volume, trade size, order-flow imbalance)"),
     ('fr_', "perpetual funding-rate feature"),
     ('oi_', "open-interest / positioning feature"),
     ('pos_', "trader-positioning feature (retail vs top-trader, taker flow)"),
@@ -376,6 +394,30 @@ def describe_column(col: str) -> str:
 # =============================================================================
 # Diagnostics builder (the proposer's entire view of the world)
 # =============================================================================
+
+def _decile_nonlinearity(binned) -> float:
+    """Spread of a feature's decile forward-return curve. Large for U-shapes,
+    thresholds and sign-flips even when the monotonic IC is ~0 - so these
+    features are not hidden from the LLM by a t-stat-only ranking."""
+    vals = [v for v in (binned or []) if v is not None and np.isfinite(v)]
+    return float(max(vals) - min(vals)) if len(vals) >= 3 else 0.0
+
+
+def _regime_spread(regime_ic) -> float:
+    """Largest high-vs-low regime IC gap: a feature that works only in one
+    regime scores high here even with weak pooled IC."""
+    gaps = [abs(d['high'] - d['low']) for d in (regime_ic or {}).values()
+            if d.get('high') is not None and d.get('low') is not None]
+    return float(max(gaps)) if gaps else 0.0
+
+
+def _rank01(values: Dict[str, float]) -> Dict[str, float]:
+    """Percentile rank in [0, 1] within the group (ties averaged), so the
+    blend combines components measured on different scales fairly."""
+    if not values:
+        return {}
+    return pd.Series(values).rank(pct=True).to_dict()
+
 
 def _feature_ic(df: pd.DataFrame, col: str, tcol: str,
                 min_assets: int) -> dict:
@@ -462,12 +504,41 @@ def build_diagnostics(train_panel: pd.DataFrame,
                 }
             features[col] = entry
 
+    # The LLM only gets full diagnostics for the top few features per family.
+    # Rank them by a BLEND (each component rank-normalized within the family):
+    # monotonic IC t-stat + decile-curve nonlinearity + regime spread +
+    # stability - so U-shaped, threshold-only and regime-only primitives reach
+    # the proposer instead of being hidden by a t-stat-only sort. A small
+    # random quota keeps some lower-ranked features in rotation.
+    blend = diag_cfg.get('top_blend', {'monotonic': 1.0, 'nonlinear': 0.6,
+                                       'regime': 0.5, 'stability': 0.3})
+    quota = int(diag_cfg.get('top_random_quota', 0))
+    rng = np.random.default_rng(int(cfg['search']['seed']))
     top = {}
     for family, cols in family_columns.items():
-        scored = [(c, abs(features[c]['ic_tstat'])) for c in cols
-                  if c in features]
-        scored.sort(key=lambda x: -x[1])
-        top[family] = [c for c, _ in scored[:top_k]]
+        fam = [c for c in cols if c in features]
+        if not fam:
+            top[family] = []
+            continue
+        comps = {
+            'monotonic': {c: abs(features[c]['ic_tstat']) for c in fam},
+            'nonlinear': {c: _decile_nonlinearity(features[c]['binned_fwd'])
+                          for c in fam},
+            'regime': {c: _regime_spread(features[c]['regime_ic']) for c in fam},
+            'stability': {c: float(features[c]['stable_thirds']) for c in fam},
+        }
+        score = {c: 0.0 for c in fam}
+        for key, w in blend.items():
+            for c, r in _rank01(comps.get(key, {})).items():
+                score[c] += float(w) * r
+        ranked = sorted(fam, key=lambda c: -score[c])
+        keep = max(top_k - quota, 0)
+        chosen, rest = ranked[:keep], ranked[keep:]
+        if quota > 0 and rest:
+            idx = rng.choice(len(rest), size=min(quota, len(rest)),
+                             replace=False)
+            chosen += [rest[int(i)] for i in idx]
+        top[family] = chosen[:top_k]
 
     return {'target': tcol, 'lag_bars': int(lag_bars),
             'features': features, 'top_by_family': top}

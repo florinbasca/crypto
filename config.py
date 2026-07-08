@@ -249,6 +249,13 @@ config = {
         'ms_short_window': 18,                      # 3h (microstructure short MA)
         'ms_long_window': 144,                      # 1d (microstructure long MA)
 
+        # Order-flow (of_) windows: signed aggressive-flow impact/toxicity.
+        'order_flow': {
+            'fast_window': 6,                       # 1h
+            'short_window': 18,                     # 3h
+            'long_window': 144,                     # 1d
+        },
+
         'sma_periods': [36, 144, 432],
         'rsi_period': 84,                           # 14h
         'bollinger_period': 144,
@@ -418,7 +425,7 @@ config = {
         'start_date': '2023-08-01',      # First roll's train start
         'end_date': '2026-06-01',        # No roll's OOS end may exceed this
         'train_months': 5,               # Candidates generated/fit here
-        'select_months': 1,              # Search reward scored here (only)
+        'select_months': 1,              # Held out from the search; promotion tests it ONCE
         'oos_months': 1,                 # Promoted book traded here (never searched)
         'roll_step_months': 1,
         # Purge at window boundaries: drop the last (max target lag + embargo)
@@ -441,7 +448,17 @@ config = {
         'families': {
             'residual_shape':    ['res_', 'ou_'],
             'volatility_regime': ['vr_', 'rb_', 'ib_'],
-            'liquidity':         ['lq_', 'vl_', 'ms_', 'cap_turnover'],
+            # Liquidity/cost = how EXPENSIVE/illiquid a name is to trade.
+            'liquidity':         ['lq_', 'vl_volume', 'ms_avg_trade',
+                                  'ms_large_trades', 'ms_dollar_volume',
+                                  'cap_turnover'],
+            # Order flow = DIRECTIONAL aggressive-flow / informed-trading
+            # signals (its own bandit arm, documented orthogonal breadth).
+            # Split out of the crowded liquidity family so the OFI/toxicity/
+            # signed-flow columns stop getting capped away.
+            'order_flow':        ['of_', 'ms_ofi', 'ms_buy', 'ms_up_down',
+                                  'ms_vol_return', 'ms_trade_intensity',
+                                  'vl_taker', 'vl_signed'],
             'derivatives':       ['fr_', 'oi_', 'pos_'],
             'cross_sectional':   ['cs_'],
             'factor_context':    ['fl_', 'mk_'],
@@ -454,7 +471,10 @@ config = {
             'macro':             ['mx_'],
             'macro_beta':        ['mb_'],
         },
-        'max_features_per_family': 12,   # cap resolved columns per family
+        'max_features_per_family': 16,   # cap resolved columns per family
+        # (16 so the order_flow family holds both the existing ms_/vl_ flow
+        # columns and the new of_ primitives after a feature rebuild; the LLM
+        # still only sees diagnostics.top_per_family of them per call)
         # DSL bounds (hypothesis space)
         'dsl': {
             'windows': [6, 36, 144, 432],   # allowed rolling windows (bars)
@@ -469,7 +489,14 @@ config = {
             'batch_size': 32,
             'survivors': 12,                 # population carried between generations
             'mutation_prob': 0.6,            # mutate a parent vs sample fresh
-            'diversity_max_corr': 0.8,       # survivor de-correlation ceiling
+            'diversity_max_corr': 0.8,       # survivor de-correlation ceiling (output)
+            # Structural de-dup: reject a survivor whose AST (subtree) overlap
+            # with a kept one exceeds this - catches clones that slip under the
+            # output-correlation ceiling. 1.0 disables.
+            'diversity_max_ast_sim': 0.6,
+            # Frequent-subtree avoidance: how many over-mined building blocks to
+            # show the LLM each generation (with a 'vary away' instruction).
+            'overused_subtrees_shown': 6,
             'bandit_ucb_c': 1.0,             # family-bandit exploration constant
         },
         # Reward = sum_k weight_k * term_k / scale_k, TRAIN window ONLY.
@@ -490,7 +517,11 @@ config = {
         # actually be exposed to - NOT a cost model: duration, not bps. At
         # kappa ~ 0.048/bar: 1h half-life keeps 0.29 of its t, 6h 0.71,
         # 12h 0.83, 2d+ ~0.95 - the search breeds toward persistence.
-        # liquid_ic_ratio is itself an IC (liquid-half vs full);
+        # liquid_ic_ratio is itself an IC (liquid-half vs full).
+        # incremental is the train IC the candidate ADDS to the current
+        # survivor book (combined pooled IC minus the book's own IC): rewards
+        # MARGINAL edge, not another copy of the dominant signal (AlphaGen /
+        # Lucky-Factors). 0 disables (skips the extra IC computations).
         # complexity/instability/similarity are search hygiene, not
         # economics: parsimony, train-thirds consistency, and population
         # diversity.
@@ -498,6 +529,7 @@ config = {
             'weights': {
                 'ic_tstat': 1.0,
                 'liquid_ic_ratio': 0.25,
+                'incremental': 0.5,
                 'complexity': -0.15,
                 'instability': -0.75,
                 'similarity': -0.5,
@@ -505,6 +537,7 @@ config = {
             'scales': {
                 'ic_tstat': 2.0,
                 'liquid_ic_ratio': 1.0,
+                'incremental': 0.01,
                 'complexity': 10.0,
                 'instability': 0.05,
                 'similarity': 0.5,
@@ -602,6 +635,13 @@ config = {
             'regime_columns': ['res_vol_short', 'cs_rel_volume',
                                'mx_vix_z', 'ev_hours_since_event'],
             'top_per_family': 6,             # compressed view size
+            # Ranking blend for which features get full diagnostics (each term
+            # rank-normalized within the family): monotonic IC t-stat + decile
+            # nonlinearity + regime spread + stability, so U-shaped/threshold/
+            # regime-only features are not hidden by a t-stat-only sort.
+            'top_blend': {'monotonic': 1.0, 'nonlinear': 0.6,
+                          'regime': 0.5, 'stability': 0.3},
+            'top_random_quota': 1,           # of top_per_family, reserved for exploration
         },
         # Persisted tables. Discovery is purely statistical: it emits
         # promotions (and its trial ledger); the walk-forward is the ONLY

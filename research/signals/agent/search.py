@@ -41,7 +41,9 @@ from config import BARS_PER_DAY, get
 from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
 from research.signals.agent.data import (Roll, purge_bars, slice_window,
                                          strided_stamps, target_col)
-from research.signals.agent.generation import (Candidate, Proposer,
+from research.signals.agent.generation import (_to_list, ast_similarity,
+                                               candidate_subtrees,
+                                               Candidate, Proposer,
                                                ValidationError,
                                                compile_candidate, complexity,
                                                validate_candidate)
@@ -166,6 +168,14 @@ def day_equivalent_tstat(m: dict, lag_bars: int) -> float:
     return float(t) / math.sqrt(stamps_per_day)
 
 
+def pooled_signal(signals: List[pd.DataFrame]) -> pd.DataFrame:
+    """Average several [timestamp, symbol, signal] panels into one alpha panel
+    (rank IC is scale-invariant, so a plain mean is enough)."""
+    wide = pd.concat([s.set_index(['timestamp', 'symbol'])['signal']
+                      for s in signals], axis=1)
+    return wide.mean(axis=1).rename('signal').reset_index()
+
+
 def alpha_term_structure(m_by_lag: Dict[int, dict]) -> Dict[int, float]:
     """Cumulative expected alpha per bet at each horizon: A(L) = ic_mean(L) *
     target_dispersion(L). This is the empirical alpha_k curve of SLS
@@ -271,7 +281,7 @@ def max_signal_correlation(signal: pd.DataFrame, others: list) -> float:
 
 def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
                  instability: float, cand: Candidate,
-                 similarity: float) -> dict:
+                 similarity: float, incremental: float = 0.0) -> dict:
     """The raw (unscaled) reward terms - TRAIN window only. All finite.
 
     ic_tstat is the CAPTURE-WEIGHTED day-equivalent train t at the
@@ -280,7 +290,10 @@ def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
     (see persistence_weight - duration, never bps). A 6h-half-life signal
     outscores a 1h one of equal strength ~2.4x, so the search breeds toward
     persistence. instability is the std of the train-thirds ICs (temporal
-    consistency inside train - select is never consulted)."""
+    consistency inside train - select is never consulted). incremental is the
+    IC the candidate ADDS to the current survivor book (marginal edge, not a
+    redundant copy of the dominant signal - AlphaGen / Lucky-Factors idea),
+    measured on train."""
     def _f(x, default=0.0):
         return float(x) if x is not None and np.isfinite(x) else default
 
@@ -288,6 +301,7 @@ def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
     return {
         'ic_tstat': day_equivalent_tstat(train_metrics, best_lag) * capture,
         'liquid_ic_ratio': _f(train_metrics.get('liquid_ic_ratio')),
+        'incremental': _f(incremental),
         'complexity': float(complexity(cand)),
         'instability': _f(instability),
         'similarity': _f(similarity),
@@ -296,6 +310,7 @@ def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
 
 def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
                    instability: float, cand: Candidate, similarity: float,
+                   incremental: float = 0.0,
                    reward_cfg: Optional[dict] = None) -> tuple:
     """reward = sum_k weight_k * term_k / scale_k. TRAIN window only, fixed
     scales from config. Returns (reward, terms)."""
@@ -303,7 +318,7 @@ def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
     weights = cfg['weights']
     scales = cfg['scales']
     terms = reward_terms(train_metrics, best_lag, half_life_bars,
-                         instability, cand, similarity)
+                         instability, cand, similarity, incremental)
     total = 0.0
     for key, w in weights.items():
         total += float(w) * terms[key] / float(scales[key])
@@ -473,20 +488,26 @@ def allocate_batch(bandit: Dict[str, dict], families: List[str],
     return alloc
 
 
-def select_survivors(population: List[dict], k: int,
-                     max_corr: float) -> List[dict]:
-    """Best-first greedy de-correlation: keep the highest-reward candidates
-    whose TRAIN-window signal correlates below max_corr with every already-
-    kept one (train, like everything else survival touches - select stays
-    unseen until promotion). Prevents the population collapsing to
-    near-duplicates."""
+def select_survivors(population: List[dict], k: int, max_corr: float,
+                     max_ast_sim: float = 1.0) -> List[dict]:
+    """Best-first greedy de-duplication: keep the highest-reward candidates
+    that are novel on TWO axes vs every already-kept one - OUTPUT correlation
+    (train signal corr <= max_corr) AND STRUCTURE (AST similarity <=
+    max_ast_sim). Correlation alone misses structural clones (same recipe,
+    one column/window swapped, weakly correlated by luck); the AST check
+    catches them. Train only - select stays unseen until promotion."""
     ranked = sorted(population, key=lambda s: -s['reward'])
     kept: List[dict] = []
     for cand in ranked:
         if len(kept) >= k:
             break
-        if max_signal_correlation(cand['signal_train'],
-                                  [x['signal_train'] for x in kept]) <= max_corr:
+        corr_ok = max_signal_correlation(
+            cand['signal_train'],
+            [x['signal_train'] for x in kept]) <= max_corr
+        ast_ok = max_ast_sim >= 1.0 or all(
+            ast_similarity(cand['candidate'], x['candidate']) <= max_ast_sim
+            for x in kept)
+        if corr_ok and ast_ok:
             kept.append(cand)
     return kept
 
@@ -536,6 +557,15 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     bandit = {f: {'n': 0, 'sum': 0.0} for f in families}
     population: List[dict] = []
     seen = ledger.seen_hashes(roll.roll_id)
+    # Frequent-subtree memory: how often each structural building block has been
+    # tried this roll, so the LLM can be told which recipes are over-mined.
+    from collections import Counter
+    subtree_counts: "Counter" = Counter()
+    # Incremental-contribution reward: the current survivor book (directed train
+    # signals) and a per-lag cache of its pooled IC, refreshed each generation.
+    incr_weight = float(cfg['reward']['weights'].get('incremental', 0.0))
+    book_signals: List[pd.DataFrame] = []
+    book_ic_cache: Dict[int, float] = {}
 
     def try_candidate(cand, gen: int) -> None:
         """Validate, compile, evaluate the FULL train+select profile, reward
@@ -551,6 +581,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             return
         if sig.empty:
             return
+        subtree_counts.update(candidate_subtrees(cand))
 
         # Train profile across the whole horizon grid. best_lag by the
         # DAY-EQUIVALENT t (per-bet-fair: no sqrt(stamps/day) advantage for
@@ -592,9 +623,24 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                                                best_lag, min_assets)
         similarity = max_signal_correlation(
             sig_train, [s['signal_train'] for s in population])
+        # Marginal contribution: how much train IC the candidate ADDS to the
+        # current survivor book at its best lag (combined pooled IC minus the
+        # book's own IC). 0 when the book is empty or the reward ignores it.
+        incremental = 0.0
+        if incr_weight != 0.0 and book_signals:
+            tcol_b = target_col(best_lag)
+            if best_lag not in book_ic_cache:
+                bk = evaluate_window(pooled_signal(book_signals), train,
+                                     tcol_b, best_lag, min_assets)['ic_mean']
+                book_ic_cache[best_lag] = bk if np.isfinite(bk) else 0.0
+            comb = evaluate_window(pooled_signal(book_signals + [sig_train]),
+                                   train, tcol_b, best_lag,
+                                   min_assets)['ic_mean']
+            comb = comb if np.isfinite(comb) else 0.0
+            incremental = comb - book_ic_cache[best_lag]
         rwd, terms = compute_reward(m_train, best_lag, half_life,
                                     instability, cand, similarity,
-                                    cfg['reward'])
+                                    incremental, cfg['reward'])
         profile = {
             str(l): {'train': {k: (None if v is None or not np.isfinite(v)
                                    else round(float(v), 8))
@@ -643,6 +689,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             'half_life_bars': int(s.get('half_life_bars', 0) or 0),
         } for s in pop}
 
+    n_overused = int(search_cfg.get('overused_subtrees_shown', 6))
+    max_ast_sim = float(search_cfg.get('diversity_max_ast_sim', 1.0))
     for gen in range(int(search_cfg['n_generations'])):
         alloc = allocate_batch(bandit, families,
                                int(search_cfg['batch_size']),
@@ -653,6 +701,12 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                       'conditions': c.to_dict()['conditions'],
                       'reward': round(float(r), 3)}
                      for c, r in sorted(failures, key=lambda x: x[1])[:6]]
+        # Refresh the survivor book the incremental-contribution reward scores
+        # against (directed train signals from the last cull).
+        book_signals[:] = [s['signal_train'] for s in population]
+        book_ic_cache.clear()
+        # Over-mined structural building blocks: tell the LLM to vary away.
+        overused = [_to_list(st) for st, _ in subtree_counts.most_common(n_overused)]
         for family in families:
             n_fam = alloc[family]
             if n_fam <= 0:
@@ -660,12 +714,13 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             cands = proposer.propose(n_fam, family, diagnostics, parents,
                                      family_columns, rng,
                                      parent_scores=parent_scores,
-                                     failures=fail_hint)
+                                     failures=fail_hint, overused=overused)
             for cand in cands:
                 try_candidate(cand, gen)
         pre_cull = population
         population = select_survivors(population, int(search_cfg['survivors']),
-                                      float(search_cfg['diversity_max_corr']))
+                                      float(search_cfg['diversity_max_corr']),
+                                      max_ast_sim)
         # Whatever was tried this gen but did not survive is a failure to
         # remember (low reward first is selected at prompt time).
         kept = {s['candidate'].hash for s in population}

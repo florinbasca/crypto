@@ -128,10 +128,13 @@ Good primitive data groups for the crypto repo:
 ```text
 1. residual path: residual_return, cumulative residual, zscore, drawdown, runup, autocorr
 2. volatility: residual vol, raw vol, vol ratios, vol shocks
-3. liquidity: volume, dollar volume, spread proxies, Amihud, zero-volume share
-4. derivatives: funding, OI, taker imbalance, top trader positioning
-5. cross-sectional context: ranks, cluster-relative values, dispersion
-6. factor context: betas, beta drift, factor residual correlations
+3. liquidity/cost: dollar volume, avg trade size, spread proxies, Amihud, turnover
+4. order flow: taker imbalance (OFI), signed volume, Kyle's lambda, VPIN-style
+   toxicity, flow persistence — DIRECTIONAL aggressive-flow, largely orthogonal
+   to price signals (independent breadth, its own bandit arm)
+5. derivatives: funding, OI, top-trader positioning
+6. cross-sectional context: ranks, cluster-relative values, dispersion
+7. factor context: betas, beta drift, factor residual correlations
 ```
 
 Allowed transforms:
@@ -305,8 +308,11 @@ cannot reach. That is what stops the search from fooling itself.
                           batch of new candidates as DSL JSON. In genetic terms,
                           the mutation/recombination operator. Swappable; untrusted.
 3. Compiler             - turns a DSL candidate into a per-(timestamp, symbol)
-                          signal panel, then runs the causality (truncation) test;
-                          anything that peeks at the future is rejected.
+                          signal panel. Causality is guaranteed PER-OPERATOR
+                          (every operator reads only data through bar t, proven
+                          by tests/discovery_checks.py's truncation test over
+                          the whole operator registry); the search path does not
+                          re-run a per-candidate truncation check.
 4. Evaluator            - scores each candidate at EVERY horizon on TRAIN and on
                           the held-out SELECT window, using the same rank-IC /
                           HAC-t-stat math as the production pipeline. Keeps the
@@ -370,8 +376,8 @@ FOR each roll (train 5mo / select 1mo, advancing 1 month at a time):
   2. SEARCH  ── repeat until the candidate budget for this roll is spent ──
      a. PROPOSE   the LLM reads the compressed diagnostics + the current best
                   candidates, and emits a batch of new candidates in the DSL.
-     b. COMPILE   each candidate -> cross-sectional signal panel; run the
-                  causality (truncation) test; drop anything that peeks ahead.
+     b. COMPILE   each candidate -> cross-sectional signal panel (causality is
+                  per-operator, proven once in tests - not re-checked here).
      c. EVALUATE  score on TRAIN at EVERY horizon (purge/embargo at the
                   boundary): cross-sectional rank IC per horizon -> the alpha
                   profile + fitted half-life. Direction fixed on train.
@@ -438,6 +444,13 @@ Output:
 feature family -> promising columns -> likely shape -> likely horizon
 ```
 
+The LLM gets FULL diagnostics only for the top few columns per family. Those
+are ranked by a BLEND (each term rank-normalized within the family): monotonic
+IC t-stat + decile-curve nonlinearity + regime spread + stability, plus a small
+random quota. Ranking by monotonic t-stat alone would hide U-shaped,
+threshold-only and regime-only features - exactly the nonlinear structure the
+LLM is best placed to exploit - so the blend surfaces them instead.
+
 ### Stage 2: Hypothesis Proposal
 
 The LLM sees only compressed diagnostics (including a one-line description of
@@ -474,6 +487,8 @@ prompt carries:
   working and drops the ones that scored near zero
 - avoid_these: recently-culled low-scoring candidates - so it does not
   re-propose dead ideas
+- overused_building_blocks: the most-tried subtrees this roll - so it varies
+  the structure instead of piling onto one recipe
 ```
 
 The LLM is the mutation/recombination OPERATOR; the harness runs the evolution
@@ -494,6 +509,7 @@ reward = Σ  w_k · term_k / scale_k          # weights + scales live in config.
 
   + ic_tstat          (CAPTURE-WEIGHTED day-equivalent train IC t-stat, see below)
   + liquid_ic_ratio   (IC on the liquid half / full-cross IC - a capacity read)
+  + incremental       (train IC the candidate ADDS to the current survivor book)
   - complexity        (node + condition count)
   - instability       (std of the IC across the three thirds of TRAIN)
   - similarity        (max corr vs the survivors kept so far this generation)
@@ -502,6 +518,14 @@ reward = Σ  w_k · term_k / scale_k          # weights + scales live in config.
 Cost is NOT a term. A signal is scored gross - cost is a property of the
 portfolio (judged in the walk-forward), never of a signal. IC is the only
 performance measure.
+
+The **incremental** term rewards MARGINAL edge over redundancy: the survivors
+are pooled into one alpha and the candidate's contribution is the combined
+pooled IC minus the book's own IC, at its best lag, on TRAIN. A strong signal
+that just re-expresses the dominant factor scores ~0 here; a weaker but
+orthogonal one scores high. This is the AlphaGen pooled-IC reward / Harvey-Liu
+"Lucky Factors" incremental test, done in-sample so the select window stays
+untouched. It complements (does not replace) standalone IC.
 
 Two design choices make the IC term honest across horizons:
 
@@ -515,9 +539,18 @@ Two design choices make the IC term honest across horizons:
    equally-strong 1h one, so the search breeds toward persistence. Duration, not
    a cost model.
 
-Weights and scales are config, not hardcoded, so they can be tuned. The
-similarity penalty matters - otherwise the agent generates many near-duplicates.
-Because the search never touches SELECT, the promotion t-stats stay honest.
+Weights and scales are config, not hardcoded, so they can be tuned. Because the
+search never touches SELECT, the promotion t-stats stay honest.
+
+**Diversity is enforced on two axes**, because formula homogenization (the
+population collapsing onto one recipe) is the field's central failure mode.
+(a) OUTPUT: survivors must de-correlate (train-signal corr <= diversity_max_corr)
+and the reward penalizes similarity. (b) STRUCTURE: a survivor whose AST
+(subtree) overlap with a kept one exceeds diversity_max_ast_sim is dropped -
+this catches clones that share a concrete building block yet slip under the
+correlation ceiling. The over-mined subtrees this roll are also fed back to the
+LLM each generation ("overused_building_blocks") with a vary-away instruction
+(frequent-subtree avoidance).
 
 ### Stage 4: ML Ceiling Probe
 

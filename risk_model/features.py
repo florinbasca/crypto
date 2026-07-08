@@ -314,6 +314,75 @@ def calculate_microstructure_features(df: pd.DataFrame, config: Dict) -> Dict[st
 
 
 # ============================================================================
+# Order Flow (of_) — directional aggressive-flow / informed-trading proxies
+# ============================================================================
+# Built from the taker-buy volume and trade count Binance klines already carry
+# (aggregated exactly to 10-min bars in etl/prices.py). These are the SIGNED /
+# toxicity dimensions the microstructure (ms_) family lacks: how much price
+# moves per unit of net aggressive flow (Kyle's lambda), how one-sided the flow
+# is (VPIN-style toxicity), whether flow drives price or is absorbed, and the
+# persistence/acceleration of that flow. Order flow is documented as largely
+# ORTHOGONAL to price-based signals (independent breadth), which the Fundamental
+# Law says is the scarce input. All knowable at bar t (targets start t+1).
+
+OF_FEATURE_NAMES = [
+    'of_kyle_lambda', 'of_signed_flow_return_corr', 'of_toxicity',
+    'of_flow_persistence', 'of_flow_imbalance_1d', 'of_flow_accel',
+]
+
+
+def calculate_order_flow_features(df: pd.DataFrame, config: Dict) -> Dict[str, pd.Series]:
+    prefix = 'of_'
+    features = {n: pd.Series(np.nan, index=df.index) for n in OF_FEATURE_NAMES}
+    need = ('quote_asset_volume', 'taker_buy_quote_asset_volume', 'close')
+    if not all(c in df.columns for c in need):
+        return features
+
+    cfg = config.get('order_flow', {})
+    w_fast = int(cfg.get('fast_window', 6))      # 1h
+    w_short = int(cfg.get('short_window', 18))   # 3h
+    w_long = int(cfg.get('long_window', 144))    # 1d
+
+    quote_vol = df['quote_asset_volume'].clip(lower=1e-10)
+    buy_ratio = (df['taker_buy_quote_asset_volume'] / quote_vol).clip(0.0, 1.0)
+    imbalance = 2.0 * buy_ratio - 1.0            # signed [-1, 1]; +1 = all buys
+    signed_flow = imbalance * quote_vol          # net aggressive $ flow
+    ret = df['close'].pct_change()
+
+    # Kyle's lambda: $ price move per $ of net aggressive flow (rolling slope of
+    # return on signed flow). High = illiquid/impactful; low = deep book.
+    cov = ret.rolling(w_long, min_periods=w_short).cov(signed_flow)
+    var = signed_flow.rolling(w_long, min_periods=w_short).var()
+    features['of_kyle_lambda'] = cov / (var + 1e-18)
+
+    # Does aggressive flow DRIVE price (high corr) or get ABSORBED (low/neg)?
+    features['of_signed_flow_return_corr'] = ret.rolling(
+        w_long, min_periods=w_short).corr(signed_flow)
+
+    # VPIN-style toxicity: one-sidedness of flow (|imbalance| smoothed) — a
+    # proxy for informed trading / adverse selection.
+    features['of_toxicity'] = imbalance.abs().rolling(
+        w_short, min_periods=max(2, w_fast)).mean()
+
+    # Persistence of aggressive flow: lag-1 autocorrelation of the imbalance
+    # (trending taker pressure vs choppy).
+    features['of_flow_persistence'] = imbalance.rolling(
+        w_long, min_periods=w_short).corr(imbalance.shift(1))
+
+    # Slow net signed flow normalized by volume: persistent directional pressure.
+    net_flow = signed_flow.rolling(w_long, min_periods=w_short).sum()
+    tot_vol = quote_vol.rolling(w_long, min_periods=w_short).sum()
+    features['of_flow_imbalance_1d'] = net_flow / (tot_vol + 1e-10)
+
+    # Flow acceleration: recent imbalance vs its slow baseline (flow building).
+    imb_short = imbalance.rolling(w_short, min_periods=2).mean()
+    imb_long = imbalance.rolling(w_long, min_periods=w_short).mean()
+    features['of_flow_accel'] = imb_short - imb_long
+
+    return features
+
+
+# ============================================================================
 # Intra-Bar Features (raw 1-minute data)
 # ============================================================================
 
@@ -1496,6 +1565,7 @@ def calculate_all_features(df: pd.DataFrame, config: Dict, symbol: str,
     feature_dfs.append(pd.DataFrame(calculate_liquidity_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_range_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_microstructure_features(df, config), index=df.index))
+    feature_dfs.append(pd.DataFrame(calculate_order_flow_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_momentum_quality_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_statistical_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_price_features(df, config), index=df.index))
