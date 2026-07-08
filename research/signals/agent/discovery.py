@@ -28,7 +28,7 @@ existing tables. Ledger and promotions are flushed EVERY roll - a run
 killed at roll 20 keeps its first 20 rolls.
 
 Usage:
-    python research/signals/agent/run_discovery.py
+    python research/signals/agent/discovery.py
         [--max-rolls N] [--no-fresh] [--no-save]
 
 NO PINNING: every candidate is evaluated at every lag in
@@ -144,7 +144,7 @@ def main():
         # the search is the bottleneck.
         probe = search_mod.run_ml_probe(panel, roll, feature_cols, cfg)
         for lag_i, m in sorted(probe['metrics_by_lag'].items()):
-            print(f"ML ceiling @ {lag_i:>3d} bars: IC {m['ic_mean']:.4f} "
+            print(f"ML probe @ {lag_i:>3d} bars: IC {m['ic_mean']:.4f} "
                   f"(t={m['ic_tstat']:.2f})")
 
         if not seeds and roll.roll_id > 0:

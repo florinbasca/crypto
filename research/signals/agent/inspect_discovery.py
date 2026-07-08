@@ -72,7 +72,7 @@ def main():
 
     if led.empty:
         raise SystemExit(f"No {tables['ledger']} table - run "
-                         "research/signals/agent/run_discovery.py first")
+                         "research/signals/agent/discovery.py first")
 
     pd.set_option('display.width', 220)
     pd.set_option('display.float_format', lambda x: f'{x:,.4f}')

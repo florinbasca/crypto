@@ -744,7 +744,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
 
 
 # =============================================================================
-# ML ceiling probe
+# ML probe (predictability ceiling)
 # =============================================================================
 
 def run_ml_probe(panel: pd.DataFrame, roll: Roll, feature_cols: List[str],

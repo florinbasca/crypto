@@ -25,7 +25,7 @@ uv run risk_model/residual_returns.py  # causal betas, residuals, fwd targets
 uv run risk_model/features.py
 
 # 3. Agentic signal discovery: multi-lag LLM search over the feature panel
-uv run research/signals/agent/run_discovery.py
+uv run research/signals/agent/discovery.py
 
 # 4. Portfolio walk-forward: scores the discovered signals, then
 #    builds and backtests a factor-neutral portfolio.
@@ -79,8 +79,8 @@ significant on a held-out month. The promoted formulas are the only signals the
 portfolio trades — discovery itself never trades.
 
 ```bash
-uv run research/signals/agent/run_discovery.py --max-rolls 2   # quick test
-uv run research/signals/agent/run_discovery.py                 # full history
+uv run research/signals/agent/discovery.py --max-rolls 2   # quick test
+uv run research/signals/agent/discovery.py                 # full history
 uv run research/signals/agent/inspect_discovery.py             # review a run
 ```
 

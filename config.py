@@ -448,6 +448,21 @@ config = {
         'families': {
             'residual_shape':    ['res_', 'ou_'],
             'volatility_regime': ['vr_', 'rb_', 'ib_'],
+            # Return efficiency / diffusion: clean information diffusion vs
+            # noisy overshoot - mechanism-rich, strong as standalone AND gate.
+            'efficiency':        ['ef_'],
+            # Distribution shape: skew/kurtosis - regime/gate primitives for
+            # crashy/squeeze-prone names and post-shock reversion.
+            'distribution_shape': ['st_'],
+            # Tokenomics: supply-inflation/unlock pressure (economically
+            # distinct from liquidity/size); log-mcap is the size gate.
+            'tokenomics':        ['cap_supply_inflation', 'cap_log_mcap'],
+            # Classic price TA (momentum quality, RSI, MACD, Bollinger,
+            # ADX/DMI, ATR, Chandelier). Weak standalone on RESIDUAL returns -
+            # best as GATES/interactions (prompt says so): "reversal only when
+            # the trend is exhausted/choppy".
+            'trend_state':       ['mq_', 'ma_', 'rs_', 'bb_', 'mc_', 'dm_',
+                                  'at_', 'ch_'],
             # Liquidity/cost = how EXPENSIVE/illiquid a name is to trade.
             'liquidity':         ['lq_', 'vl_volume', 'ms_avg_trade',
                                   'ms_large_trades', 'ms_dollar_volume',
@@ -470,6 +485,9 @@ config = {
             'events':            ['ev_'],
             'macro':             ['mx_'],
             'macro_beta':        ['mb_'],
+            # Calendar: perp funding-settlement proximity. Cross-sectionally
+            # CONSTANT (same for all coins) -> gate-only, like ev_/mx_.
+            'calendar':          ['tm_funding_window'],
         },
         'max_features_per_family': 16,   # cap resolved columns per family
         # (16 so the order_flow family holds both the existing ms_/vl_ flow
@@ -578,9 +596,9 @@ config = {
             # matter. 0 disables. Duration-based, never a cost model.
             'min_capture': 0.5,
         },
-        # ML ceiling probe (mode=ml): gradient boosting on ALL resolved
-        # primitives, fit on TRAIN, scored on SELECT. Its IC estimates how much
-        # predictability the feature set contains at all.
+        # ML probe: gradient boosting on ALL resolved primitives, fit on TRAIN,
+        # scored on SELECT. Its IC is the predictability CEILING (upper bound)
+        # of the feature set at each horizon.
         'ml_probe': {
             'max_iter': 200,
             'max_depth': 3,
@@ -615,7 +633,7 @@ config = {
             # default.
             'gemini_thinking_budget': 3072,
             # $ per million tokens, per provider - used ONLY for the cost
-            # estimate printed/persisted by run_discovery. Prices change, so
+            # estimate printed/persisted by discovery.py. Prices change, so
             # pin your provider's current rates here; None disables the
             # dollar estimate (token counts are always tracked).
             'price_per_mtok': {

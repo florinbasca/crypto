@@ -1,13 +1,13 @@
 """
 Bridge: promoted discovery candidates -> first-class production signals.
 
-run_discovery promotes candidates (bounded-DSL programs) through its gates
+discovery.py promotes candidates (bounded-DSL programs) through its gates
 and stores them in the discovery promotions table(s). This module turns those
 rows into registry entries of the SAME shape as the curated spaces
 (research/lib/spaces.py), so the ordinary pipeline picks them up with no
 manual translation step:
 
-    run_discovery.py    # promotes candidates
+    discovery.py        # promotes candidates
     walk_forward.py     # scores disc_* in memory, selects, backtests
 
 Timing honesty: a candidate's EXPRESSION was chosen by a search that saw data

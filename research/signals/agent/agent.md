@@ -132,9 +132,16 @@ Good primitive data groups for the crypto repo:
 4. order flow: taker imbalance (OFI), signed volume, Kyle's lambda, VPIN-style
    toxicity, flow persistence — DIRECTIONAL aggressive-flow, largely orthogonal
    to price signals (independent breadth, its own bandit arm)
-5. derivatives: funding, OI, top-trader positioning
-6. cross-sectional context: ranks, cluster-relative values, dispersion
-7. factor context: betas, beta drift, factor residual correlations
+5. efficiency: efficiency ratio, variance ratio, reversal tendency, diffusion
+   speed — clean information diffusion vs noisy overshoot (great as a gate)
+6. derivatives: funding, OI, top-trader positioning
+7. cross-sectional context: ranks, cluster-relative values, dispersion
+8. factor context: betas, beta drift, factor residual correlations
+9. distribution shape: skew, kurtosis — crash/squeeze regime gates
+10. tokenomics: supply inflation / unlock pressure; log market cap (size gate)
+11. trend state (classic price TA — momentum quality, RSI, MACD, Bollinger,
+    ADX, ATR): weak standalone on residual returns, used mainly as GATES
+12. calendar / events / macro: cross-sectionally CONSTANT — gate-only
 ```
 
 Allowed transforms:
@@ -162,7 +169,7 @@ IMPLEMENTED (what a candidate can be):
 
 NOT a candidate class (design options):
   small tree, spline/GAM, random forest, gradient boosted tree, ensemble.
-  The only tree model in the code is the GBM ML-ceiling probe (Stage 4), which
+  The only tree model in the code is the GBM ML probe (Stage 4), which
   is a diagnostic - it is never promoted or traded.
 ```
 
@@ -363,7 +370,7 @@ Written out step by step:
 ```text
 FOR each roll (train 5mo / select 1mo, advancing 1 month at a time):
 
-  0. ML CEILING (diagnostic)
+  0. ML PROBE (diagnostic)
      Fit a gradient-boosting model on ALL features per horizon (train->select):
      the upper bound on what any search could find. Barren features and a failed
      search look identical without it. Printed, never gates anything.
@@ -420,7 +427,7 @@ Comparability    - reuses the same IC / t-stat / de-correlation functions as the
                    signal's.
 ```
 
-The harness is a **separate program the user runs** (`run_discovery.py`);
+The harness is a **separate program the user runs** (`discovery.py`);
 the LLM is a component invoked inside it, not the thing in charge. The stages
 below detail each component.
 
@@ -552,7 +559,7 @@ correlation ceiling. The over-mined subtrees this roll are also fed back to the
 LLM each generation ("overused_building_blocks") with a vary-away instruction
 (frequent-subtree avoidance).
 
-### Stage 4: ML Ceiling Probe
+### Stage 4: ML Probe (predictability ceiling)
 
 A gradient-boosting model is fit on ALL features each roll (train -> select),
 per horizon, and its select IC is printed. This is a **ceiling diagnostic, not
