@@ -11,7 +11,7 @@ Reads the three persisted tables and prints a review:
 is the only money judge.)
 
 Usage:
-    python research/signals/agent/inspect_discovery.py [--top N] [--roll N]
+    python research/signals/inspect_discovery.py [--top N] [--roll N]
         [--survivors-only] [--expressions]
 
     --top N            candidates to show (default 10, ranked by reward)
@@ -22,7 +22,7 @@ Usage:
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import argparse
 import json
@@ -72,7 +72,7 @@ def main():
 
     if led.empty:
         raise SystemExit(f"No {tables['ledger']} table - run "
-                         "research/signals/agent/discovery.py first")
+                         "research/signals/discovery.py first")
 
     pd.set_option('display.width', 220)
     pd.set_option('display.float_format', lambda x: f'{x:,.4f}')
@@ -148,7 +148,7 @@ def main():
     else:
         # Rows persisted before prices were configured have NaN estimates;
         # re-price them from the CURRENT config rates.
-        from research.signals.agent.generation import estimate_cost_usd
+        from research.signals.generation import estimate_cost_usd
         llm_cfg = get('discovery.llm')
         usage['est_cost_usd'] = [
             estimate_cost_usd({'input_tokens': r.input_tokens,

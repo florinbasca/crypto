@@ -190,7 +190,7 @@ check("registry: discovery is the only signal source",
       f"({len(registry)} entries)")
 
 from research.lib.discovered import entries_from_promotions
-from research.signals.agent.generation import Candidate
+from research.signals.generation import Candidate
 
 _cand = Candidate(name='syn', family='residual_shape',
                   expression=('col', 'res_zscore'))
@@ -502,7 +502,7 @@ check("hurst: OU spread gives H < 0.5", hurst < 0.4, f"(H {hurst:.3f})")
 # 13. Schema completeness: the discovery families resolve real feature
 #     columns (the DSL search space is non-empty in every family)
 # ---------------------------------------------------------------------------
-from research.signals.agent.data import resolve_family_columns
+from research.signals.data import resolve_family_columns
 from config import get as _get
 produced = set(full.columns) - {'timestamp', 'symbol'}
 fams = resolve_family_columns(sorted(produced), _get('discovery'))

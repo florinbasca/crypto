@@ -205,7 +205,7 @@ for names, full, trunc, label in full_sets:
 
 # --- wiring: discovery families resolve the new prefixes --------------------------
 from config import get
-from research.signals.agent.data import resolve_family_columns
+from research.signals.data import resolve_family_columns
 
 fams = resolve_family_columns(EV_FEATURE_NAMES + MX_FEATURE_NAMES
                               + MB_FEATURE_NAMES + ['res_zscore'],

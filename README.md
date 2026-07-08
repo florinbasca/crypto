@@ -25,7 +25,7 @@ uv run risk_model/residual_returns.py  # causal betas, residuals, fwd targets
 uv run risk_model/features.py
 
 # 3. Agentic signal discovery: multi-lag LLM search over the feature panel
-uv run research/signals/agent/discovery.py
+uv run research/signals/discovery.py
 
 # 4. Portfolio walk-forward: scores the discovered signals, then
 #    builds and backtests a factor-neutral portfolio.
@@ -79,10 +79,10 @@ significant on a held-out month. The promoted formulas are the only signals the
 portfolio trades — discovery itself never trades.
 
 ```bash
-uv run research/signals/agent/discovery.py --max-rolls 2   # quick test
-uv run research/signals/agent/discovery.py                 # full history
-uv run research/signals/agent/discovery.py --resume        # continue an interrupted run
-uv run research/signals/agent/inspect_discovery.py             # review a run
+uv run research/signals/discovery.py --max-rolls 2   # quick test
+uv run research/signals/discovery.py                 # full history
+uv run research/signals/discovery.py --resume        # continue an interrupted run
+uv run research/signals/inspect_discovery.py             # review a run
 ```
 
 Uses `gemini-2.5-flash` (config `discovery.llm`, key in `.env` as `LLM_KEY=...`).
@@ -92,7 +92,7 @@ each only from its promotion date onward (using it earlier would be look-ahead).
 
 **The full design — DSL grammar, the LLM prompt, the reward, the promotion
 gates, the walk-forward windows — is documented in
-[`research/signals/agent/agent.md`](research/signals/agent/agent.md).**
+[`research/signals/agent.md`](research/signals/agent.md).**
 
 
 ## Limitations

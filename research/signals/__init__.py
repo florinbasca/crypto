@@ -1,6 +1,7 @@
-"""Pluggable signal families.
+"""Agentic signal discovery.
 
-Drop a Python module in this package with a `generate_signals(context)`
-function to add signals without editing the core generator.
+The bounded-DSL search that discovers cross-sectional signals: discovery
+(harness), search (scoring/reward/ledger), generation (DSL + LLM proposers),
+promotion (statistical gates), data (panel/diagnostics). Design in agent.md.
 """
 

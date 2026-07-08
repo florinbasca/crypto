@@ -50,7 +50,7 @@ def _S(name, col, theme, rationale, op='direct', lag=0, col2=None, halflife=None
 # The space library. Each line is one hypothesis. Grouped by economic theme.
 # =============================================================================
 # The hand-curated signal library is RETIRED: discovery
-# (research/signals/agent/) is the only signal source - promoted
+# (research/signals/) is the only signal source - promoted
 # candidates enter the registry as disc_* entries via
 # research/lib/discovered.py. The SpaceDef machinery below is kept
 # because those entries reuse it (compute_space_raw's 'dsl' op), and a
@@ -88,7 +88,7 @@ def compute_space_raw(space: SpaceDef, features: pd.DataFrame) -> pd.Series:
         # way. Its output is already cross-sectionally z-scored; evaluate's
         # final z-score on top is idempotent in distribution, so a discovered
         # signal's numbers mean the same thing as a curated space's.
-        from research.signals.agent.generation import compile_candidate
+        from research.signals.generation import compile_candidate
         sig = compile_candidate(space.candidate,
                                 features[['timestamp', 'symbol'] + list(c)])
         aligned = features[['timestamp', 'symbol']].merge(

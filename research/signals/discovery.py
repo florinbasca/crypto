@@ -28,7 +28,7 @@ existing tables. Ledger and promotions are flushed EVERY roll - a run
 killed at roll 20 keeps its first 20 rolls.
 
 Usage:
-    python research/signals/agent/discovery.py
+    python research/signals/discovery.py
         [--max-rolls N] [--no-fresh] [--resume] [--no-save]
 
     --resume continues an interrupted run: keeps the tables and skips the
@@ -43,7 +43,7 @@ the reward here and the persistence discount in the walk-forward.
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import argparse
 import logging
@@ -52,10 +52,10 @@ import time
 import pandas as pd
 
 from config import config as global_config, get
-from research.signals.agent import promotion as bt
-from research.signals.agent import data as data_mod
-from research.signals.agent import search as search_mod
-from research.signals.agent.generation import Candidate, make_proposer
+from research.signals import promotion as bt
+from research.signals import data as data_mod
+from research.signals import search as search_mod
+from research.signals.generation import Candidate, make_proposer
 
 logging.basicConfig(level=logging.INFO,
                     format=global_config['logging']['format'],
@@ -191,7 +191,7 @@ def main():
         usage_after = proposer.usage_snapshot()
         roll_usage = {k: usage_after[k] - usage_before[k] for k in usage_after}
         if roll_usage['calls'] > 0:
-            from research.signals.agent.generation import estimate_cost_usd
+            from research.signals.generation import estimate_cost_usd
             cost = estimate_cost_usd(roll_usage, cfg['llm'], provider)
             cost_str = f", ~${cost:,.2f}" if cost is not None else ""
             print(f"LLM usage: {roll_usage['calls']} calls, "
@@ -221,14 +221,18 @@ def main():
                 'promoted_lags': ','.join(str(l) for l in
                                           p.get('promoted_lags', [])),
                 'candidate_json': c.to_json(),
-                'select_ic_tstat': p['metrics_select']['ic_tstat'],
+                # Select t at the STRONGEST promoted lag (the evidence the
+                # signal actually cleared on), not the best-TRAIN-lag t.
+                'select_ic_tstat': p.get('select_ic_tstat',
+                                         p['metrics_select']['ic_tstat']),
                 'reward': p['reward'],
                 'n_looks_at_promotion': p.get('n_looks_at_promotion', 0),
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
             })
             print(f"  + {c.name} ({c.family}) "
-                  f"select t={p['metrics_select']['ic_tstat']:.2f} "
-                  f"@ lags [{roll_promo_rows[-1]['promoted_lags']}] "
+                  f"select t={roll_promo_rows[-1]['select_ic_tstat']:.2f} "
+                  f"@ lag {p.get('select_lag', p.get('target_lag'))} "
+                  f"of [{roll_promo_rows[-1]['promoted_lags']}] "
                   f"half-life {p.get('half_life_bars', 0):,.0f} bars "
                   f"(capture {p.get('capture', 0):.2f})")
         promo_rows.extend(roll_promo_rows)
@@ -256,7 +260,7 @@ def main():
 
     # Always shown, every run: what this run cost in LLM tokens/dollars.
     if usage_rows:
-        from research.signals.agent.generation import estimate_cost_usd
+        from research.signals.generation import estimate_cost_usd
         total = {k: sum(r[k] for r in usage_rows)
                  for k in ('calls', 'input_tokens', 'output_tokens')}
         cost = estimate_cost_usd(total, cfg['llm'], provider)

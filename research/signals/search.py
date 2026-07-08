@@ -39,9 +39,9 @@ import pandas as pd
 
 from config import BARS_PER_DAY, get
 from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
-from research.signals.agent.data import (Roll, purge_bars, slice_window,
+from research.signals.data import (Roll, purge_bars, slice_window,
                                          strided_stamps, target_col)
-from research.signals.agent.generation import (_to_list, ast_similarity,
+from research.signals.generation import (_to_list, ast_similarity,
                                                candidate_subtrees,
                                                Candidate, Proposer,
                                                ValidationError,
@@ -534,7 +534,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     # and select - the per-lag profile is its alpha term structure. best_lag
     # (day-equivalent train t) only picks direction and the reward term.
     # target_lag_bars stays the reference lag for proposer diagnostics only.
-    from research.signals.agent.data import resolve_search_lags
+    from research.signals.data import resolve_search_lags
     search_lags = resolve_search_lags(cfg)
     diag_lag = int(cfg['target_lag_bars'])
     diag_tcol = target_col(diag_lag)
@@ -547,7 +547,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     train = slice_window(roll_panel, roll.train_start, roll.select_start, pb)
     select = slice_window(roll_panel, roll.select_start, roll.oos_start, pb)
 
-    from research.signals.agent.data import (all_family_columns,
+    from research.signals.data import (all_family_columns,
                                              build_diagnostics)
     allowed_cols = all_family_columns(family_columns)
     diagnostics = build_diagnostics(train, family_columns, diag_tcol,
@@ -755,7 +755,7 @@ def run_ml_probe(panel: pd.DataFrame, roll: Roll, feature_cols: List[str],
     barren ground at that speed - this is the cheap map of where (if
     anywhere) alpha lives before the search spends its budget."""
     from sklearn.ensemble import HistGradientBoostingRegressor
-    from research.signals.agent.data import resolve_search_lags
+    from research.signals.data import resolve_search_lags
 
     cfg = cfg or get('discovery', {})
     ml_cfg = cfg['ml_probe']

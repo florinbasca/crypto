@@ -1040,7 +1040,7 @@ class WalkForwardPortfolio:
         if not self.registry:
             raise RuntimeError(
                 "signal registry is empty - run "
-                "research/signals/agent/discovery.py first (promoted "
+                "research/signals/discovery.py first (promoted "
                 "candidates are the only signal source)")
         logging.info(f"Scoring {len(self.registry)} promoted signals across "
                      f"the {len(LAG_GRID)}-lag grid...")

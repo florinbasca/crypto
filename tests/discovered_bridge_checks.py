@@ -25,7 +25,7 @@ import pandas as pd
 
 from research.lib.discovered import entries_from_promotions
 from research.lib.spaces import compute_space_raw
-from research.signals.agent.generation import Candidate
+from research.signals.generation import Candidate
 
 FAILURES = []
 

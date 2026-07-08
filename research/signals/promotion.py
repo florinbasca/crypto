@@ -11,9 +11,11 @@ is the FIRST and ONLY look at select - a survivor promotes if ANY lag of its
 profile clears:
   1. BY/BH FDR across every (survivor, lag) select p-value - Student-t with
      (n_days - 1) dof, since a 1-month select is ~30 daily IC observations
-  2. deflation haircut: |t| must clear deflation_mult x E[max |N(0,1)|] over
-     the ACTUAL looks at select (n_survivors x n_lags) - the multiplicity of
-     promotion itself, now that the search adds none
+  2. directed select t (positive in the traded direction) must clear BOTH
+     min_select_ic_tstat AND the deflation haircut deflation_mult x
+     E[max |N(0,1)|] over the ACTUAL looks at select (n_survivors x n_lags) -
+     the multiplicity of promotion itself. Directed, not |t|: a lag that
+     REVERSES sign out-of-sample is rejected, not admitted on magnitude.
   3. minimum daily observations behind the t (min_select_days)
 and the candidate as a whole must pass:
   4. profile sign agreement: the train term structure must mostly share the
@@ -37,8 +39,8 @@ import numpy as np
 from config import get
 from research.lib.portfolio_opt import (benjamini_hochberg,
                                         benjamini_yekutieli)
-from research.signals.agent.data import Roll
-from research.signals.agent.search import (DiscoveryLedger,
+from research.signals.data import Roll
+from research.signals.search import (DiscoveryLedger,
                                            day_equivalent_tstat,
                                            max_signal_correlation,
                                            persistence_weight,
@@ -121,7 +123,12 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
         out = []
         for j, lag in enumerate(lags):
             m = sel(s, lag)
-            t = abs(float(m.get('ic_tstat', 0.0) or 0.0))
+            # DIRECTED select t: the profile is already in the traded
+            # direction, so a NEGATIVE t means the signal REVERSED on the
+            # hold-out month at this lag - not validated alpha, reject it.
+            # (abs() here would admit anti-predictive lags on magnitude alone,
+            # promoting a signal that trades the wrong way out-of-sample.)
+            t = float(m.get('ic_tstat', 0.0) or 0.0)
             if (bool(fdr_mask[i, j]) and t >= min_t
                     and (float(promo['deflation_mult']) <= 0
                          or t >= deflation_bar)
@@ -172,8 +179,18 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
                 [p['signal_select'] for p in promoted]) <= max_book_corr,
         }
         if all(gates.values()):
+            # Report the select t at the STRONGEST lag that actually cleared
+            # the gates - the evidence the signal promoted on. This is NOT
+            # metrics_select's t: that is the best-TRAIN-lag select t, which is
+            # frequently not a promoted lag and can be ~0 or negative even when
+            # a different lag clears cleanly.
+            best_ok = max(ok_lags, key=lambda lag:
+                          abs(float(sel(s, lag).get('ic_tstat', 0.0) or 0.0)))
             promoted.append({**s, 'roll_promoted': roll.roll_id,
                              'promoted_lags': ok_lags,
+                             'select_lag': int(best_ok),
+                             'select_ic_tstat': float(
+                                 sel(s, best_ok).get('ic_tstat', 0.0) or 0.0),
                              'capture': capture(s),
                              'n_looks_at_promotion': n_looks,
                              'n_trials_at_promotion': n_trials})

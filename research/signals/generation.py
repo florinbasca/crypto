@@ -3,10 +3,10 @@ GENERATION: everything that creates and compiles candidate signals.
 
 1. The bounded DSL - Candidate programs, the operator registry, validation
    (only allowed columns/ops/windows/size caps get through).
-2. The compiler - Candidate -> cross-sectional signal panel with the exact
-   per-timestamp demean + z-score + clip normalization evaluate.py applies to
-   production signals, plus the truncation spot-check (causality on full
-   compiled programs).
+2. The compiler - Candidate -> cross-sectional signal panel with the same
+   per-timestamp demean + z-score + clip (+-3) that research/lib/signal_eval.py
+   applies to every registered signal, plus the truncation spot-check
+   (causality on full compiled programs).
 3. The proposers - the ONLY components allowed to invent candidates:
    RandomProposer (no-API baseline and control experiment) and LLMProposer
    (untrusted; sees compressed diagnostics only, emits DSL JSON; everything it
@@ -422,8 +422,9 @@ def compile_candidate(cand: Candidate, panel: pd.DataFrame,
     passes it; tests may skip). Pipeline (hard requirement from agent.md):
     evaluate the expression, apply gate conditions (gated-off rows are neutral
     0, keeping the cross-section intact), then per-timestamp cross-sectional
-    demean + z-score + clip - identical to production signal normalization, so
-    a discovered signal's numbers mean the same thing as a production one's.
+    demean + z-score + clip (+-3) - the same normalization
+    research/lib/signal_eval.py applies to every registered signal, so a
+    discovered signal's numbers are on the same scale as any other's.
     """
     if allowed_columns is not None:
         validate_candidate(cand, allowed_columns, dsl_cfg)
@@ -668,73 +669,11 @@ def _named(family: str, expression: tuple, conditions: tuple,
                      rationale=rationale)
 
 
-_LLM_SYSTEM = """You are a senior quantitative researcher on a market-neutral \
-crypto statistical-arbitrage desk. THE STRATEGY: the book holds ~130 \
-Hyperliquid perpetual futures at once — long the coins it judges underpriced, \
-short the overpriced — and is kept dollar- and factor-neutral (market, size, \
-momentum, volatility, meme), so it profits ONLY from coin-specific mispricing, \
-never from the market rising or falling. Your job is to produce signals that \
-rank the coins by their expected RESIDUAL return — the return left after those \
-factors are stripped out — over the next few hours to a day. The book trades \
-SLOWLY to keep costs down, so a signal whose edge PERSISTS for hours is worth \
-far more than one that decays in minutes.
-
-Crypto perps hand you data equities never had: funding rates (the cost of \
-leverage, and a live gauge of crowding), open interest and liquidations, \
-retail-vs-smart-money positioning, nonstop 24/7 flow, BTC leading the alts, \
-and reflexive meme dynamics. That is usually where the edge hides.
-
-For each feature you are told WHAT IT MEASURES, its recent correlation with the \
-forward residual target, the shape of that relationship (decile curve), its \
-stability, and how it shifts across market regimes. Treat these as EVIDENCE — \
-then reason about the MECHANISM: WHY would this predict? (positioning unwinds, \
-funding carry and its mean-reversion, liquidity provision and short-horizon \
-reversal, information diffusion and lead-lag between coins, volatility-regime \
-shifts, event-driven repricing.)
-
-BE CREATIVE — which here means specific things, not novelty for its own sake:
-- Propose a NEW MECHANISM, not a new formula for an old one — a different \
-economic reason to expect mispricing.
-- Exploit UNDERUSED structure: conditional/regime gates (act only when VIX is \
-high, an event is near, or funding just flipped), interactions between two \
-DIFFERENT features (funding × open interest, volume surprise × recent return), \
-lead-lag (a BTC move the alt hasn't reflected yet), positioning divergences \
-(retail long while top traders are short), post-event drift.
-- Second-order ideas: the CHANGE or ACCELERATION of a feature; a feature \
-relative to its cluster; a feature that only works in one regime.
-- Prefer mechanisms that PERSIST over hours (carry, slow unwinds, diffusion) \
-over sub-hour microstructure blips the slow book cannot harvest.
-
-Do NOT: restate price momentum or reversal on its own; multiply together the \
-two highest-correlation columns; stack transforms on a single column; or submit \
-minor variations of one idea. Every candidate in the batch must rest on a \
-DIFFERENT mechanism from the others and from the parents shown. The "rationale" \
-states the ECONOMIC mechanism in one line (WHY it should predict), not the \
-formula. You see only compressed diagnostics, never raw data, and everything \
-you emit is re-validated and re-scored by fixed code — a weak idea only wastes \
-budget, it cannot corrupt results.
-
-DSL (JSON S-expressions):
-  leaf: ["col", "<feature>"]  (only features listed in the diagnostics)
-  unary: neg, abs, sign, square (sign-preserving x*|x|), sqrt, log1p, tanh
-  binary: add, sub, mul, div (safe)
-  rolling (per symbol): roll_mean, roll_std, roll_sum, roll_zscore,
-    roll_delta - form ["roll_mean", expression, window]: the window is a bare
-    number from ALLOWED_WINDOWS and is ALWAYS the last element, never first
-  cross-sectional (per timestamp): cs_rank, cs_zscore, cs_demean
-  gate: ["where", condition, expr_if_true, expr_if_false]
-  condition: ["gt"|"lt"|"abs_gt"|"abs_lt", expression, threshold_number]
-
-You are shown the current best survivors WITH their scores (reward, IC t-stat, \
-alpha half-life) and a list of candidates that already scored poorly. Learn \
-from both: push further in the directions that scored well, drop the ones that \
-scored near zero, and never re-propose anything in avoid_these.
-
-Respond with ONLY a JSON array of candidate objects:
-  {"family": "...", "expression": [...], "conditions": [[...], ...],
-   "rationale": "one line"}
-Prefer simple, genuinely nonlinear or conditional hypotheses over stacked \
-transforms. Avoid near-duplicates of the parents shown."""
+# The fixed LLM system prompt (identical on every call) lives in prompt.md so it
+# can be read and edited as prose. Loaded once at import; the file holds ONLY
+# prompt text (no markdown title) because it is sent to the model verbatim.
+_LLM_SYSTEM = (Path(__file__).parent / 'prompt.md').read_text(
+    encoding='utf-8').strip()
 
 
 class _ApiProposer(Proposer):
@@ -774,7 +713,7 @@ class _ApiProposer(Proposer):
 
     def _prompt(self, n, family, diagnostics, parents, family_columns,
                 parent_scores=None, failures=None, overused=None) -> str:
-        from research.signals.agent.data import describe_column
+        from research.signals.data import describe_column
         # name -> what it measures, so the LLM reasons about the mechanism
         # rather than guessing from the abbreviation.
         allowed = family_columns.get(family, [])
@@ -976,7 +915,7 @@ def load_api_key(name: str, path: Optional[Path] = None) -> str:
     from config import load_env_key
     key = load_env_key(name, path)
     if not key:
-        env_path = path or Path(__file__).resolve().parents[3] / '.env'
+        env_path = path or Path(__file__).resolve().parents[2] / '.env'
         raise RuntimeError(
             f"no {name} in '{env_path}'. Add a line (file is gitignored):\n"
             f"  {name}=...")

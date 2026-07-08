@@ -12,7 +12,7 @@ Architecture (2026-06):
   from the data start).
 - Risk model: market (equal-weight) + size / momentum / vol (rank-weighted
   spreads). Residual[t] = r[t] - sum_f beta_f * factor_f[t], causal daily betas.
-- Signals: agentic discovery only (research/signals/agent/); promoted DSL
+- Signals: agentic discovery only (research/signals/); promoted DSL
   candidates are scored in-memory by the walk-forward.
 - Portfolio: Ledoit-Wolf MVO, dollar + factor-beta neutral, net of a 5bps
   all-in cost model and perp funding accrual.
@@ -417,9 +417,9 @@ config = {
         'liquidity_window_bars': 144,
     },
 
-    # Agentic signal discovery (research/signals/agent/): bounded-DSL search
+    # Agentic signal discovery (research/signals/): bounded-DSL search
     # over residual-predictive cross-sectional signals with a train/select/OOS
-    # walk-forward. Design in research/signals/agent/agent.md. Everything here
+    # walk-forward. Design in research/signals/agent.md. Everything here
     # is read via config.get('discovery.<...>') - never hardcoded.
     'discovery': {
         'start_date': '2023-08-01',      # First roll's train start

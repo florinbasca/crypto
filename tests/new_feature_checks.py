@@ -155,7 +155,7 @@ check("missing leader series -> all NaN",
       all(ll_none[c].isna().all() for c in LL_NAMES))
 
 # --- wiring: discovery families resolve the new prefixes -----------------------
-from research.signals.agent.data import resolve_family_columns
+from research.signals.data import resolve_family_columns
 
 available = SN_FEATURE_NAMES + LL_NAMES + ['res_zscore', 'timestamp', 'symbol']
 fams = resolve_family_columns(available, get('discovery'))

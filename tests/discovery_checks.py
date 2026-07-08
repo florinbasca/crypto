@@ -1,6 +1,6 @@
 """
 Synthetic-data checks for the agentic signal discovery engine
-(research/signals/agent/). No database required.
+(research/signals/). No database required.
 
 1. Evaluator calibration - the measurement instrument recovers a planted
    IC (and reports ~0 on a zero-IC panel).
@@ -26,10 +26,10 @@ import numpy as np
 import pandas as pd
 
 from config import get
-from research.signals.agent import generation as gen
-from research.signals.agent import data as data_mod
-from research.signals.agent import search as search_mod
-from research.signals.agent import promotion as bt_mod
+from research.signals import generation as gen
+from research.signals import data as data_mod
+from research.signals import search as search_mod
+from research.signals import promotion as bt_mod
 
 rng = np.random.default_rng(7)
 FAILURES = []
@@ -310,6 +310,38 @@ check("e2e: planted effect promoted through the gates", len(promoted) >= 1,
       f"({len(promoted)} promoted)")
 check("e2e: ledger promoted flags set",
       len(ledger_a.to_frame().query('promoted')) == len(promoted))
+
+# Directional gate (regression): promotion tests the DIRECTED select t, not
+# |t|. Every promoted lag must be positive in the traded direction; a signal
+# that REVERSES sign out-of-sample must be rejected, not admitted on magnitude.
+# (passing_lags once used abs(ic_tstat) - two prod signals promoted while
+# trading the WRONG way on the hold-out month, at directed t of -5.2 and -3.8.)
+min_sel_t = float(CFG['promotion']['min_select_ic_tstat'])
+check("directional: every promoted lag has positive directed select t",
+      all(max((p['profile_select'][l].get('ic_tstat') or 0.0)
+              for l in p['promoted_lags']) >= min_sel_t
+          for p in promoted),
+      f"({len(promoted)} promoted)")
+
+# Flip the winner's select profile: same magnitude, opposite sign - abs()
+# would still pass, the directed gate must reject.
+reversed_s = copy.deepcopy(best)
+# metrics_select IS profile_select[best_lag] (same object), so dedupe by id -
+# flipping the same dict twice would cancel out.
+_seen = set()
+for m in (list(reversed_s['profile_select'].values())
+          + [reversed_s['metrics_select']]):
+    if id(m) in _seen:
+        continue
+    _seen.add(id(m))
+    for k in ('ic_mean', 'ic_tstat', 'icir'):
+        if m.get(k) is not None:
+            m[k] = -m[k]
+reversed_promoted = bt_mod.promote([reversed_s], ROLL, ledger_a, CFG)
+check("directional: sign-reversed hold-out signal is NOT promoted",
+      len(reversed_promoted) == 0,
+      f"(|t| {abs(best['metrics_select']['ic_tstat']):.1f} but reversed -> "
+      f"{len(reversed_promoted)} promoted)")
 
 # survivor carry-over: the next roll is seeded with this roll's survivors,
 # they re-earn survival on the new windows, and the N-consecutive-rolls

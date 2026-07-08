@@ -74,7 +74,7 @@ def entries_from_promotions(promos: pd.DataFrame,
     the EARLIEST promotion date seen for that hash. Names are hash-stable
     (disc_<family>_<hash>) so scored stats stay consistent across runs.
     """
-    from research.signals.agent.generation import Candidate, candidate_columns
+    from research.signals.generation import Candidate, candidate_columns
     import json
 
     if promos is None or promos.empty:
@@ -157,7 +157,7 @@ def load_discovered_entries() -> dict:
             return {}
         promos = pd.concat(frames, ignore_index=True)
 
-        from research.signals.agent.data import make_rolls
+        from research.signals.data import make_rolls
         rolls = make_rolls(get('discovery'))
         valid_from = {r.roll_id: r.oos_start for r in rolls}
 
