@@ -29,7 +29,11 @@ killed at roll 20 keeps its first 20 rolls.
 
 Usage:
     python research/signals/agent/discovery.py
-        [--max-rolls N] [--no-fresh] [--no-save]
+        [--max-rolls N] [--no-fresh] [--resume] [--no-save]
+
+    --resume continues an interrupted run: keeps the tables and skips the
+    rolls already completed (the ledger flushes per roll, so on-disk rolls
+    are complete), picking up at the first missing roll.
 
 NO PINNING: every candidate is evaluated at every lag in
 discovery.horizon_lags_bars (train AND select) - the per-lag profile is its
@@ -81,12 +85,17 @@ def _save(table: str, df: pd.DataFrame, fresh: bool, save: bool):
 def main():
     parser = argparse.ArgumentParser(
         description='Agentic signal discovery: bounded-DSL search + '
-                    'walk-forward promotion + OOS backtest')
+                    'statistical promotion (the walk-forward is the money judge)')
     parser.add_argument('--max-rolls', type=int, default=0,
                         help='Only run the first N rolls (0 = all)')
     parser.add_argument('--no-fresh', action='store_true',
                         help='Keep existing discovery tables (default is a '
                              'fresh start: tables cleared before running)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Continue an interrupted run: keep existing '
+                             'tables and SKIP already-completed rolls, picking '
+                             'up at the first roll not in the ledger (seeded '
+                             'from the last completed roll\'s survivors)')
     parser.add_argument('--no-save', action='store_true',
                         help='Do not persist ledger/promotions/returns')
     args = parser.parse_args()
@@ -94,7 +103,8 @@ def main():
     cfg = get('discovery')
     tables = cfg['tables']
     save = not args.no_save
-    fresh = not args.no_fresh
+    # --resume implies --no-fresh (never wipe the completed rolls).
+    fresh = not (args.no_fresh or args.resume)
 
     if fresh and save:
         from dbutil import delete_table
@@ -123,6 +133,22 @@ def main():
           f"select {cfg['select_months']}mo / OOS {cfg['oos_months']}mo")
 
     ledger = search_mod.DiscoveryLedger(tables['ledger'] if save else None)
+
+    # --resume: skip rolls already fully completed (the ledger flushes only at
+    # the END of a roll, so every roll on disk is complete). Continue at the
+    # first missing roll; the loop below re-seeds it from the previous roll's
+    # survivors via ledger.survivor_candidates.
+    if args.resume:
+        done = ledger.to_frame()
+        last_done = int(done['roll_id'].max()) if not done.empty else -1
+        rolls = [r for r in rolls if r.roll_id > last_done]
+        if not rolls:
+            print(f"Resume: all rolls already complete (last = {last_done}); "
+                  "nothing to do.")
+            return
+        print(f"Resume: {last_done + 1} rolls already complete; continuing "
+              f"from roll {rolls[0].roll_id} ({len(rolls)} remaining)")
+
     proposer = make_proposer('llm')
     provider = getattr(proposer, 'provider', '')
     if provider:

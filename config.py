@@ -626,6 +626,12 @@ config = {
             # the parser salvages the prefix if a batch is ever cut.
             'max_tokens': 10240,
             'candidates_per_call': 8,
+            # Per-request timeout (seconds). A dropped connection (e.g. wifi
+            # blip) then RAISES instead of hanging the whole run forever - the
+            # proposer retries once, then degrades to an empty batch and the
+            # search continues on parents. SDK auto-retries are disabled so
+            # this is the only wait.
+            'request_timeout_s': 120,
             # Gemini 2.5 thinking budget (tokens). The whole point of using an
             # LLM here is economic reasoning, so give it room to deliberate
             # before emitting JSON (weigh mechanisms, diversify the batch).

@@ -991,7 +991,12 @@ class AnthropicProposer(_ApiProposer):
     def _complete(self, prompt: str) -> str:
         if self._client is None:
             import anthropic
-            self._client = anthropic.Anthropic(api_key=self._api_key())
+            # Per-request timeout so a dropped connection raises instead of
+            # hanging the whole run forever (retry-once then empty batch).
+            self._client = anthropic.Anthropic(
+                api_key=self._api_key(),
+                timeout=float(self.llm_cfg.get('request_timeout_s', 120)),
+                max_retries=0)
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=int(self.llm_cfg['max_tokens']),
@@ -1012,10 +1017,16 @@ class GeminiProposer(_ApiProposer):
     provider = 'gemini'
 
     def _complete(self, prompt: str) -> str:
+        from google.genai import types as genai_types
         if self._client is None:
             from google import genai
-            self._client = genai.Client(api_key=self._api_key())
-        from google.genai import types as genai_types
+            # HttpOptions.timeout is in MILLISECONDS: a dropped connection
+            # raises instead of hanging the run (retry-once then empty batch).
+            timeout_ms = int(float(self.llm_cfg.get('request_timeout_s', 120))
+                             * 1000)
+            self._client = genai.Client(
+                api_key=self._api_key(),
+                http_options=genai_types.HttpOptions(timeout=timeout_ms))
         # response_mime_type forces native JSON mode (no markdown fences, no
         # almost-JSON). A thinking budget of 0 stops 2.5-model thoughts from
         # eating the output-token budget and truncating the array mid-way.

@@ -81,6 +81,7 @@ portfolio trades — discovery itself never trades.
 ```bash
 uv run research/signals/agent/discovery.py --max-rolls 2   # quick test
 uv run research/signals/agent/discovery.py                 # full history
+uv run research/signals/agent/discovery.py --resume        # continue an interrupted run
 uv run research/signals/agent/inspect_discovery.py             # review a run
 ```
 
