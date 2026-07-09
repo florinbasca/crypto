@@ -680,10 +680,8 @@ print("--- 6. providers + cost tracking ---")
 class _BrokenSDKProposer(gen.GeminiProposer):
     """Simulates a missing SDK: _complete raises ImportError."""
     def __init__(self):
-        pass
+        super().__init__(llm_cfg={'candidates_per_call': 8})
     provider = 'gemini'
-    llm_cfg = {'candidates_per_call': 8}
-    usage = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0}
 
     def _prompt(self, *args, **kwargs):
         return 'x'
@@ -726,12 +724,40 @@ except Exception as e:
     check("providers: missing SDK aborts the run (fail fast)", False,
           f"(wrong exception: {type(e).__name__}: {e})")
 
+
+class _RetiredModelProposer(gen.GeminiProposer):
+    """Simulates a retired/mis-named model: the API 404s on every call
+    (Google retired gemini-2.5-flash mid-2026 exactly this way). Permanent,
+    not transient - must abort, not degrade to empty batches per family."""
+    def __init__(self):
+        super().__init__(llm_cfg={'candidates_per_call': 8,
+                                  'model': {'gemini': 'gemini-2.5-flash'}})
+
+    def _prompt(self, *args, **kwargs):
+        return 'x'
+
+    def _complete(self, prompt):
+        raise Exception(
+            "404 NOT_FOUND. {'error': {'code': 404, 'message': 'This model "
+            "models/gemini-2.5-flash is no longer available.'}}")
+
+
+try:
+    _RetiredModelProposer().propose(4, 'residual_shape', {}, [], {}, rng)
+    check("providers: retired model (404) aborts the run (fail fast)", False,
+          "(no exception raised)")
+except SystemExit as e:
+    check("providers: retired model (404) aborts the run (fail fast)",
+          'discovery.llm.model' in str(e), f"({str(e)[:80]}...)")
+except Exception as e:
+    check("providers: retired model (404) aborts the run (fail fast)", False,
+          f"(wrong exception: {type(e).__name__}: {e})")
+
 class _FlakyProposer(gen.GeminiProposer):
     """First call truncates INSIDE the first object (nothing salvageable);
     the retry returns a clean array."""
     def __init__(self, fail_times=1):
-        self.llm_cfg = {'candidates_per_call': 8}
-        self.usage = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0}
+        super().__init__(llm_cfg={'candidates_per_call': 8})
         self._fails_left = fail_times
 
     def _prompt(self, *args, **kwargs):
@@ -754,6 +780,49 @@ dead = _FlakyProposer(fail_times=2)
 check("providers: unusable twice -> empty batch, no exception",
       dead.propose(4, 'residual_shape', {}, [], {}, rng) == []
       and dead.usage['calls'] == 2)
+
+
+# Parallel proposals: within a generation the per-family API calls run
+# concurrently (they share one immutable snapshot); scoring stays sequential.
+# Verify the pool actually fans out, results are collected per family, and
+# the locked usage counters stay exact under concurrency.
+class _ParallelProposer(gen.GeminiProposer):
+    """Records the thread of each call; returns one distinct candidate per
+    family (column varies so hashes differ)."""
+    def __init__(self):
+        super().__init__(llm_cfg={'candidates_per_call': 8})
+        self.threads = set()
+
+    def _prompt(self, n, family, *args, **kwargs):
+        return family   # _complete keys its response off the family
+
+    def _complete(self, prompt):
+        import threading as _th, time as _t
+        self.threads.add(_th.current_thread().name)
+        _t.sleep(0.05)          # force overlap so the pool must use >1 thread
+        col = {'residual_shape': 'res_zscore',
+               'volatility_regime': 'vol_ratio'}.get(prompt, 'res_zscore')
+        return (f'[{{"family": "{prompt}", '
+                f'"expression": ["col", "{col}"], "conditions": []}}]')
+
+
+par = _ParallelProposer()
+par_cfg = copy.deepcopy(CFG)
+par_cfg['llm']['parallel_requests'] = 8
+par_cfg['search'].update({'n_generations': 1, 'batch_size': 8})
+par_ledger = search_mod.DiscoveryLedger(None)
+par_pop = search_mod.run_search(make_panel(plant=0.002, seed=33), ROLL,
+                                family_cols, par, par_ledger, par_cfg)
+check("parallel: per-family proposals fan out across threads",
+      len(par.threads) >= 2, f"({len(par.threads)} threads)")
+check("parallel: both families' candidates evaluated",
+      par_ledger.n_trials(0) >= 2
+      and {s['candidate'].family for s in par_pop}
+      == {'residual_shape', 'volatility_regime'},
+      f"({par_ledger.n_trials(0)} trials)")
+check("parallel: locked usage counters exact under concurrency",
+      par.usage['calls'] == len(family_cols),
+      f"({par.usage['calls']} calls for {len(family_cols)} families)")
 
 check("providers: 'random' -> RandomProposer",
       isinstance(gen.make_proposer('random'), gen.RandomProposer))

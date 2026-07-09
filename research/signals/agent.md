@@ -165,7 +165,17 @@ tradable in the walk-forward only from their promotion date. All knobs live unde
 
 ## Cost and run time
 
-A full run is 28 rolls (windows) × 16 generations. The model for now is Gemini 2.5-flash ($0.30 / $2.50 per million input / output tokens), which works out to roughly **$1–3 per roll, order $30–80 for the full run**. 
+A full run is 28 rolls (windows) × 16 generations. The model for now is Gemini
+3.1-flash-lite ($0.25 / $1.50 per million input / output tokens — the
+price-equivalent successor to 2.5-flash, which Google retired mid-2026). That
+works out to roughly **$1–3 per roll, order $30–80 for the full run**. The
+script prints the measured tokens and dollars per roll; trust that over these
+estimates.
 
-Run time is about 1.5 hours per roll, total about 40 hours, dominated by the sequential API round-trips (scoring is fast by comparison).
+Run time is dominated by the LLM round-trips (scoring is fast by comparison).
+The per-family proposal calls within a generation run concurrently
+(`discovery.llm.parallel_requests`, default 8), cutting a roll from ~1.5–3
+hours sequential to roughly 15–30 minutes; lower the setting if the provider
+rate-limits. Progress bars (per-generation, per-call, per-candidate, ML probe)
+show the run is alive.
 

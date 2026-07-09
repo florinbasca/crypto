@@ -35,6 +35,7 @@ causal by construction; compile-time validation guarantees the second half
 import hashlib
 import json
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -697,6 +698,17 @@ class _ApiProposer(Proposer):
         self.dsl_cfg = dsl_cfg or get('discovery.dsl', {})
         self._client = None
         self.usage = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0}
+        # propose() is called concurrently across families (see run_search):
+        # one lock guards lazy client init, the other the usage counters.
+        self._client_lock = threading.Lock()
+        self._usage_lock = threading.Lock()
+
+    def _add_usage(self, calls: int = 0, input_tokens: int = 0,
+                   output_tokens: int = 0) -> None:
+        with self._usage_lock:
+            self.usage['calls'] += calls
+            self.usage['input_tokens'] += input_tokens
+            self.usage['output_tokens'] += output_tokens
 
     @property
     def model(self) -> str:
@@ -709,7 +721,8 @@ class _ApiProposer(Proposer):
         return load_api_key(self.llm_cfg.get('key_name', 'LLM_KEY'))
 
     def usage_snapshot(self) -> dict:
-        return dict(self.usage)
+        with self._usage_lock:
+            return dict(self.usage)
 
     def _prompt(self, n, family, diagnostics, parents, family_columns,
                 parent_scores=None, failures=None, overused=None) -> str:
@@ -792,7 +805,7 @@ class _ApiProposer(Proposer):
         items = None
         last_err = None
         for attempt in (1, 2):   # one retry: truncation/parse flakes are
-            self.usage['calls'] += 1   # transient; twice in a row is real
+            self._add_usage(calls=1)   # transient; twice in a row is real
             try:
                 items = _parse_json_array(self._complete(prompt))
                 break
@@ -809,6 +822,17 @@ class _ApiProposer(Proposer):
                     f"'uv add anthropic' for anthropic) or switch "
                     f"discovery.llm.provider.") from e
             except Exception as e:
+                # A 404 means the configured model no longer exists (Google
+                # retired gemini-2.5-flash mid-2026 this way). It is permanent,
+                # not transient: every later call fails too, and the search
+                # silently degrades to re-breeding seeds - rolls LOOK complete
+                # but had no proposer. Abort instead (same fail-fast rule as a
+                # missing SDK).
+                if getattr(e, 'code', None) == 404 or 'NOT_FOUND' in str(e):
+                    raise SystemExit(
+                        f"{self.provider} model '{self.model}' not found "
+                        f"(retired or mis-named): {e}. Update "
+                        f"discovery.llm.model in config.py.") from e
                 last_err = e
         if items is None:
             logging.warning(f"{self.provider} proposer: unusable response "
@@ -928,14 +952,16 @@ class AnthropicProposer(_ApiProposer):
     provider = 'anthropic'
 
     def _complete(self, prompt: str) -> str:
-        if self._client is None:
-            import anthropic
-            # Per-request timeout so a dropped connection raises instead of
-            # hanging the whole run forever (retry-once then empty batch).
-            self._client = anthropic.Anthropic(
-                api_key=self._api_key(),
-                timeout=float(self.llm_cfg.get('request_timeout_s', 120)),
-                max_retries=0)
+        with self._client_lock:
+            if self._client is None:
+                import anthropic
+                # Per-request timeout so a dropped connection raises instead
+                # of hanging the whole run forever (retry-once then empty
+                # batch).
+                self._client = anthropic.Anthropic(
+                    api_key=self._api_key(),
+                    timeout=float(self.llm_cfg.get('request_timeout_s', 120)),
+                    max_retries=0)
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=int(self.llm_cfg['max_tokens']),
@@ -944,8 +970,9 @@ class AnthropicProposer(_ApiProposer):
         )
         u = getattr(resp, 'usage', None)
         if u is not None:
-            self.usage['input_tokens'] += int(getattr(u, 'input_tokens', 0) or 0)
-            self.usage['output_tokens'] += int(getattr(u, 'output_tokens', 0) or 0)
+            self._add_usage(
+                input_tokens=int(getattr(u, 'input_tokens', 0) or 0),
+                output_tokens=int(getattr(u, 'output_tokens', 0) or 0))
         return ''.join(b.text for b in resp.content
                        if getattr(b, 'type', '') == 'text')
 
@@ -957,15 +984,17 @@ class GeminiProposer(_ApiProposer):
 
     def _complete(self, prompt: str) -> str:
         from google.genai import types as genai_types
-        if self._client is None:
-            from google import genai
-            # HttpOptions.timeout is in MILLISECONDS: a dropped connection
-            # raises instead of hanging the run (retry-once then empty batch).
-            timeout_ms = int(float(self.llm_cfg.get('request_timeout_s', 120))
-                             * 1000)
-            self._client = genai.Client(
-                api_key=self._api_key(),
-                http_options=genai_types.HttpOptions(timeout=timeout_ms))
+        with self._client_lock:
+            if self._client is None:
+                from google import genai
+                # HttpOptions.timeout is in MILLISECONDS: a dropped connection
+                # raises instead of hanging the run (retry-once then empty
+                # batch).
+                timeout_ms = int(
+                    float(self.llm_cfg.get('request_timeout_s', 120)) * 1000)
+                self._client = genai.Client(
+                    api_key=self._api_key(),
+                    http_options=genai_types.HttpOptions(timeout=timeout_ms))
         # response_mime_type forces native JSON mode (no markdown fences, no
         # almost-JSON). A thinking budget of 0 stops 2.5-model thoughts from
         # eating the output-token budget and truncating the array mid-way.
@@ -985,11 +1014,11 @@ class GeminiProposer(_ApiProposer):
         )
         um = getattr(resp, 'usage_metadata', None)
         if um is not None:
-            self.usage['input_tokens'] += int(
-                getattr(um, 'prompt_token_count', 0) or 0)
-            self.usage['output_tokens'] += int(
-                (getattr(um, 'candidates_token_count', 0) or 0)
-                + (getattr(um, 'thoughts_token_count', 0) or 0))
+            self._add_usage(
+                input_tokens=int(getattr(um, 'prompt_token_count', 0) or 0),
+                output_tokens=int(
+                    (getattr(um, 'candidates_token_count', 0) or 0)
+                    + (getattr(um, 'thoughts_token_count', 0) or 0)))
         return resp.text or ''
 
 

@@ -616,9 +616,15 @@ config = {
         'llm': {
             'provider': 'gemini',
             'key_name': 'LLM_KEY',       # .env variable holding the API key
+            # gemini-2.5-flash was RETIRED by Google mid-2026 (generate calls
+            # 404 even though models.list still shows it). 3.1-flash-lite is
+            # the price-equivalent replacement ($0.25/$1.50 vs the old
+            # $0.30/$2.50), a generation newer, and accepts the same call
+            # shape (JSON mode + thinking budget). The stronger 3.5-flash
+            # works too but costs ~4x ($1.50/$9.00).
             'model': {
                 'anthropic': 'claude-sonnet-4-6',
-                'gemini': 'gemini-2.5-flash',
+                'gemini': 'gemini-3.1-flash-lite',
             },
             # max_output_tokens must cover BOTH the reasoning budget below
             # AND the JSON (8 candidates ~= 2-3k tokens). 10240 leaves the
@@ -632,6 +638,12 @@ config = {
             # search continues on parents. SDK auto-retries are disabled so
             # this is the only wait.
             'request_timeout_s': 120,
+            # Concurrent per-family proposal calls within a generation. The
+            # calls are independent (same parents/diagnostics snapshot), and
+            # the sequential round-trips were the roll's entire wall-clock
+            # (~17 families x 16 gens x 30-60s/call = hours). 1 = sequential;
+            # lower it if the provider rate-limits.
+            'parallel_requests': 8,
             # Gemini 2.5 thinking budget (tokens). The whole point of using an
             # LLM here is economic reasoning, so give it room to deliberate
             # before emitting JSON (weigh mechanisms, diversify the batch).
@@ -644,10 +656,10 @@ config = {
             # dollar estimate (token counts are always tracked).
             'price_per_mtok': {
                 'anthropic': {'input': None, 'output': None},
-                # gemini-2.5-flash paid tier (ai.google.dev/gemini-api/docs/
-                # pricing, checked 2026-07): output price includes thinking
-                # tokens. Update here if the model or Google's rates change.
-                'gemini': {'input': 0.30, 'output': 2.50},
+                # gemini-3.1-flash-lite (checked 2026-07): output price
+                # includes thinking tokens. Update here if the model or
+                # Google's rates change.
+                'gemini': {'input': 0.25, 'output': 1.50},
             },
         },
         'diagnostics': {

@@ -85,7 +85,7 @@ uv run research/signals/discovery.py --resume        # continue an interrupted r
 uv run research/signals/inspect_discovery.py             # review a run
 ```
 
-Uses `gemini-2.5-flash` (config `discovery.llm`, key in `.env` as `LLM_KEY=...`).
+Uses `gemini-3.1-flash-lite` (config `discovery.llm`, key in `.env` as `LLM_KEY=...`).
 Promotions land in `discovery_promotions` and become `disc_*` registry entries
 (`research/lib/discovered.py`), which the walk-forward then scores and trades —
 each only from its promotion date onward (using it earlier would be look-ahead).

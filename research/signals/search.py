@@ -36,6 +36,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from config import BARS_PER_DAY, get
 from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
@@ -691,47 +693,82 @@ def run_search(panel: pd.DataFrame, roll: Roll,
 
     n_overused = int(search_cfg.get('overused_subtrees_shown', 6))
     max_ast_sim = float(search_cfg.get('diversity_max_ast_sim', 1.0))
-    for gen in range(int(search_cfg['n_generations'])):
-        alloc = allocate_batch(bandit, families,
-                               int(search_cfg['batch_size']),
-                               float(search_cfg['bandit_ucb_c']))
-        parents = [s['candidate'] for s in population]
-        parent_scores = _parent_scores(population)
-        fail_hint = [{'expression': c.to_dict()['expression'],
-                      'conditions': c.to_dict()['conditions'],
-                      'reward': round(float(r), 3)}
-                     for c, r in sorted(failures, key=lambda x: x[1])[:6]]
-        # Refresh the survivor book the incremental-contribution reward scores
-        # against (directed train signals from the last cull).
-        book_signals[:] = [s['signal_train'] for s in population]
-        book_ic_cache.clear()
-        # Over-mined structural building blocks: tell the LLM to vary away.
-        overused = [_to_list(st) for st, _ in subtree_counts.most_common(n_overused)]
-        for family in families:
-            n_fam = alloc[family]
-            if n_fam <= 0:
-                continue
-            cands = proposer.propose(n_fam, family, diagnostics, parents,
-                                     family_columns, rng,
-                                     parent_scores=parent_scores,
-                                     failures=fail_hint, overused=overused)
-            for cand in cands:
+    # API proposal calls within a generation are independent (same
+    # parents/diagnostics snapshot), so they run CONCURRENTLY - the LLM
+    # round-trips are the roll's wall-clock, not the scoring. Sequential for
+    # non-API proposers (RandomProposer: instant, and the shared rng is not
+    # thread-safe). Scoring stays sequential: it mutates shared state and its
+    # order must be deterministic.
+    n_parallel = (int(cfg['llm'].get('parallel_requests', 1))
+                  if getattr(proposer, 'provider', '') else 1)
+
+    def propose_generation(alloc, parents, parent_scores, fail_hint,
+                           overused) -> List:
+        funded = [f for f in families if alloc[f] > 0]
+        kw = dict(parent_scores=parent_scores, failures=fail_hint,
+                  overused=overused)
+        if n_parallel > 1 and len(funded) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(
+                    max_workers=min(n_parallel, len(funded))) as ex:
+                futs = {f: ex.submit(proposer.propose, alloc[f], f,
+                                     diagnostics, parents, family_columns,
+                                     rng, **kw)
+                        for f in funded}
+                for _ in tqdm(as_completed(futs.values()), total=len(futs),
+                              desc='  propose (LLM)', unit='call',
+                              leave=False):
+                    pass
+                # Collect in fixed family order: deterministic scoring order.
+                return [(f, c) for f in funded for c in futs[f].result()]
+        return [(f, c) for f in funded
+                for c in proposer.propose(alloc[f], f, diagnostics, parents,
+                                          family_columns, rng, **kw)]
+
+    gen_bar = tqdm(range(int(search_cfg['n_generations'])),
+                   desc=f"roll {roll.roll_id} search", unit='gen')
+    with logging_redirect_tqdm():
+        for gen in gen_bar:
+            alloc = allocate_batch(bandit, families,
+                                   int(search_cfg['batch_size']),
+                                   float(search_cfg['bandit_ucb_c']))
+            parents = [s['candidate'] for s in population]
+            parent_scores = _parent_scores(population)
+            fail_hint = [{'expression': c.to_dict()['expression'],
+                          'conditions': c.to_dict()['conditions'],
+                          'reward': round(float(r), 3)}
+                         for c, r in sorted(failures, key=lambda x: x[1])[:6]]
+            # Refresh the survivor book the incremental-contribution reward
+            # scores against (directed train signals from the last cull).
+            book_signals[:] = [s['signal_train'] for s in population]
+            book_ic_cache.clear()
+            # Over-mined structural building blocks: tell the LLM to vary away.
+            overused = [_to_list(st)
+                        for st, _ in subtree_counts.most_common(n_overused)]
+            batch = propose_generation(alloc, parents, parent_scores,
+                                       fail_hint, overused)
+            for _, cand in tqdm(batch, desc='  score', unit='cand',
+                                leave=False):
                 try_candidate(cand, gen)
-        pre_cull = population
-        population = select_survivors(population, int(search_cfg['survivors']),
-                                      float(search_cfg['diversity_max_corr']),
-                                      max_ast_sim)
-        # Whatever was tried this gen but did not survive is a failure to
-        # remember (low reward first is selected at prompt time).
-        kept = {s['candidate'].hash for s in population}
-        for s in pre_cull:
-            if s['candidate'].hash not in kept:
-                failures.append((s['candidate'], s['reward']))
-        failures = sorted(failures, key=lambda x: x[1])[:50]   # keep worst 50
-        logging.info(f"roll {roll.roll_id} gen {gen}: "
-                     f"{ledger.n_trials(roll.roll_id)} trials, "
-                     f"best reward "
-                     f"{max((s['reward'] for s in population), default=0):.3f}")
+            pre_cull = population
+            population = select_survivors(population,
+                                          int(search_cfg['survivors']),
+                                          float(search_cfg['diversity_max_corr']),
+                                          max_ast_sim)
+            # Whatever was tried this gen but did not survive is a failure to
+            # remember (low reward first is selected at prompt time).
+            kept = {s['candidate'].hash for s in population}
+            for s in pre_cull:
+                if s['candidate'].hash not in kept:
+                    failures.append((s['candidate'], s['reward']))
+            failures = sorted(failures, key=lambda x: x[1])[:50]  # worst 50
+            best = max((s['reward'] for s in population), default=0)
+            gen_bar.set_postfix(trials=ledger.n_trials(roll.roll_id),
+                                best=f"{best:.3f}", pop=len(population))
+            logging.info(f"roll {roll.roll_id} gen {gen}: "
+                         f"{ledger.n_trials(roll.roll_id)} trials, "
+                         f"best reward {best:.3f}")
+    gen_bar.close()
 
     lag_mix: Dict[int, int] = {}
     for s in population:
@@ -769,7 +806,8 @@ def run_ml_probe(panel: pd.DataFrame, roll: Roll, feature_cols: List[str],
     metrics_by_lag: Dict[int, dict] = {}
     n_train_rows = 0
     degenerate_logged = False
-    for lag in resolve_search_lags(cfg):
+    for lag in tqdm(resolve_search_lags(cfg), desc='ML probe', unit='lag',
+                    leave=False):
         tcol = target_col(lag)
         tr = train.dropna(subset=[tcol])
         tr = tr[tr[cols].notna().any(axis=1)]
