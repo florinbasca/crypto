@@ -1,7 +1,8 @@
 """
 PROMOTION: the gates that admit a survivor to the promotions table.
 
-Discovery is purely statistical - it measures IC, never PnL. The promotions
+Discovery is purely statistical - it measures per-bet returns
+(alpha in return units), never traded PnL. The promotions
 this module emits are consumed by research/portfolio/walk_forward.py (via
 research/lib/discovered.py), which is the ONLY money judge: costs, execution
 and the equity curve live there and nowhere else.
@@ -10,9 +11,9 @@ The search never touches the select window (train-only reward), so promotion
 is the FIRST and ONLY look at select - a survivor promotes if ANY lag of its
 profile clears:
   1. BY/BH FDR across every (survivor, lag) select p-value - Student-t with
-     (n_days - 1) dof, since a 1-month select is ~30 daily IC observations
+     (n_days - 1) dof, since a 1-month select is ~30 daily alpha observations
   2. directed select t (positive in the traded direction) must clear BOTH
-     min_select_ic_tstat AND the deflation haircut deflation_mult x
+     min_select_alpha_tstat AND the deflation haircut deflation_mult x
      E[max |N(0,1)|] over the ACTUAL looks at select (n_survivors x n_lags) -
      the multiplicity of promotion itself. Directed, not |t|: a lag that
      REVERSES sign out-of-sample is rejected, not admitted on magnitude.
@@ -46,6 +47,7 @@ from research.lib.portfolio_opt import (benjamini_hochberg,
 from research.signals.data import Roll
 from research.signals.search import (DiscoveryLedger,
                                            day_equivalent_tstat,
+                                           effective_persistence_bars,
                                            max_signal_correlation,
                                            persistence_weight,
                                            trade_rate_per_bar)
@@ -53,7 +55,7 @@ from research.signals.search import (DiscoveryLedger,
 
 def _tstat_pvalue(t: float, n_days: Optional[int] = None) -> float:
     """Two-sided p-value for a t-stat. With n_days given, Student-t with
-    (n_days - 1) dof - a 1-month select window has ~30 daily IC observations,
+    (n_days - 1) dof - a 1-month select window has ~30 daily alpha observations,
     where the normal approximation is anti-conservative. Falls back to
     normal when n_days is missing."""
     t = abs(float(t))
@@ -100,7 +102,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
     # FDR across EVERY (survivor, lag) select p-value - Student-t dof from
     # each cell's own daily-observation count.
     pvals = np.array([
-        _tstat_pvalue(sel(s, lag).get('ic_tstat', 0.0) or 0.0,
+        _tstat_pvalue(sel(s, lag).get('alpha_tstat', 0.0) or 0.0,
                       sel(s, lag).get('n_days'))
         for s in survivors for lag in lags
     ])
@@ -116,7 +118,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
                      * expected_max_abs_normal(n_looks))
     n_trials = ledger.n_trials(roll.roll_id)
 
-    min_t = float(promo['min_select_ic_tstat'])
+    min_t = float(promo['min_select_alpha_tstat'])
     min_days = int(promo.get('min_select_days', 0))
     min_agree = float(promo.get('min_profile_sign_agreement', 0.0))
     min_capture = float(promo.get('min_capture', 0.0))
@@ -146,7 +148,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
             # hold-out month at this lag - not validated alpha, reject it.
             # (abs() here would admit anti-predictive lags on magnitude alone,
             # promoting a signal that trades the wrong way out-of-sample.)
-            t = float(m.get('ic_tstat', 0.0) or 0.0)
+            t = float(m.get('alpha_tstat', 0.0) or 0.0)
             if (bool(fdr_mask[i, j]) and t >= min_t
                     and (float(promo['deflation_mult']) <= 0
                          or t >= deflation_bar)
@@ -155,19 +157,21 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
         return out
 
     def sign_agreement(s) -> float:
-        """Fraction of profile lags whose train IC shares the traded sign
-        (direction already applied: agreement = train ic_mean > 0)."""
+        """Fraction of profile lags whose train alpha shares the traded sign
+        (direction already applied: agreement = train alpha_mean > 0)."""
         prof = s.get('profile_train') or {}
-        ics = [m.get('ic_mean') for m in prof.values()
-               if m.get('ic_mean') is not None
-               and np.isfinite(m.get('ic_mean'))]
+        ics = [m.get('alpha_mean') for m in prof.values()
+               if m.get('alpha_mean') is not None
+               and np.isfinite(m.get('alpha_mean'))]
         if not ics:
             return 0.0
         return float(np.mean([ic > 0 for ic in ics]))
 
     def capture(s) -> float:
         hl = s.get('half_life_bars') or s.get('target_lag') or 1.0
-        return persistence_weight(hl, rate)
+        p_eff = effective_persistence_bars(hl, int(s.get('target_lag') or 6),
+                                           s.get('turnover'))
+        return persistence_weight(p_eff, rate)
 
     # Slot order: CAPTURE-WEIGHTED day-equivalent select strength -
     # per-bet-fair across horizons AND persistent evidence outranks
@@ -204,12 +208,12 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
             # frequently not a promoted lag and can be ~0 or negative even when
             # a different lag clears cleanly.
             best_ok = max(ok_lags, key=lambda lag:
-                          abs(float(sel(s, lag).get('ic_tstat', 0.0) or 0.0)))
+                          abs(float(sel(s, lag).get('alpha_tstat', 0.0) or 0.0)))
             promoted.append({**s, 'roll_promoted': roll.roll_id,
                              'promoted_lags': ok_lags,
                              'select_lag': int(best_ok),
-                             'select_ic_tstat': float(
-                                 sel(s, best_ok).get('ic_tstat', 0.0) or 0.0),
+                             'select_alpha_tstat': float(
+                                 sel(s, best_ok).get('alpha_tstat', 0.0) or 0.0),
                              'capture': capture(s),
                              'n_looks_at_promotion': n_looks,
                              'n_trials_at_promotion': n_trials})

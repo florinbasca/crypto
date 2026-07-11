@@ -74,9 +74,11 @@ from the persisted `wf_portfolio_*` tables.
 
 Signals aren't written by hand. An LLM proposes small formulas (feature columns
 combined with a few operators and optional gates); a deterministic search scores
-them on rolling monthly windows and promotes only those that stay statistically
-significant on a held-out month. The promoted formulas are the only signals the
-portfolio trades — discovery itself never trades.
+each one by the return of the book it implies (per-bet, in return units — not a
+rank correlation) on rolling monthly windows, and promotes only those whose
+return stays statistically significant on a held-out month. The promoted
+formulas are the only signals the portfolio trades — discovery itself never
+trades.
 
 ```bash
 uv run research/signals/discovery.py --max-rolls 2   # quick test
@@ -117,10 +119,10 @@ How far the backtested numbers should be trusted out of sample:
 - **Costs: conservative 5 bps/side + volume-participation cap.**
   `portfolio.cost_bps = 5.0` is a deliberately conservative all-in per-side
   assumption (for reference, Hyperliquid perp maker is 0.000% at tier 4+ and
-  0.4–1.5 bps below; taker 2.4–4.5 bps). Signals are scored NET of this cost
-  (selection amortizes it by the Garleanu-Pedersen fill factor so it prices
-  the turnover the executor actually trades), and the backtest additionally
-  enforces `portfolio.participation`: no name trades more than 10% of its
+  0.4–1.5 bps below; taker 2.4–4.5 bps). Discovery scores signals GROSS (in
+  return units) but caps their churn (`max_turnover`) and discounts fast
+  alpha (capture weight); costs are charged only here, in the backtest, which
+  also enforces `portfolio.participation`: no name trades more than 10% of its
   trailing 10-bar average $ volume per bar at the configured
   `book_size_usd` — re-run at several book sizes for a capacity curve. Perp
   funding on held positions is accrued at settlement stamps (Binance

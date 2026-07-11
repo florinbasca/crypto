@@ -87,7 +87,9 @@ def main():
         trials=('cand_hash', 'size'),
         survivors=('survivor', 'sum'),
         promoted=('promoted', 'sum'),
-        best_select_t=('select_ic_tstat', lambda s: s.abs().max()),
+        best_select_t=('select_alpha_tstat'
+                       if 'select_alpha_tstat' in led.columns
+                       else 'select_ic_tstat', lambda s: s.abs().max()),
         best_reward=('reward', 'max'),
     ).join(seeded).fillna({'seeded': 0}).astype({'seeded': int})
     # Median survivor book turnover per bar (diagnostic column; absent on runs
@@ -121,11 +123,11 @@ def main():
         print(f"\n{r['name']}  [{r['family']}]  roll {r['roll_id']}  "
               f"dir {r['direction']:+d}  best lag {r.get('target_lag', '?')}b"
               f"  {flags}")
-        print(f"      reward {r['reward']:.3f} | select IC "
-              f"{r['select_ic_mean']:.4f} (t={r['select_ic_tstat']:.2f}) | "
-              f"train t={r['train_ic_tstat']:.2f} | "
-              f"ICIR {r.get('select_icir', float('nan')):.3f} | "
-              f"liquid ratio {r.get('select_liquid_ic_ratio', float('nan')):.2f}"
+        print(f"      reward {r['reward']:.3f} | select $/bet "
+              f"{r['select_alpha_mean']:+.5f} (t={r['select_alpha_tstat']:.2f}) | "
+              f"train t={r['train_alpha_tstat']:.2f} | "
+              f"rank IC {r.get('select_rank_ic_mean', float('nan')):.4f} | "
+              f"liquid ratio {r.get('select_liquid_alpha_ratio', float('nan')):.2f}"
               f"{hl_str}{tv_str}")
         print(f"      {_fmt_expr(r['candidate_json'], args.expressions)}")
 
@@ -140,7 +142,8 @@ def main():
               "rolls and clear FDR/deflation/capture/orthogonality)")
     else:
         cols = ['roll_id', 'name', 'family', 'direction', 'promoted_lags',
-                'half_life_bars', 'capture', 'select_ic_tstat', 'reward',
+                'half_life_bars', 'capture', 'turnover', 'select_alpha_tstat',
+                'reward',
                 'n_looks_at_promotion', 'n_trials_at_promotion']
         print(promos[[c for c in cols if c in promos.columns]]
               .to_string(index=False))

@@ -24,9 +24,6 @@ loop that decides what gets tried next.
   persistence gate.
 - run_search(): the per-roll evolutionary loop with a UCB bandit over
   candidate families.
-- run_ml_probe(): gradient-boosting ceiling estimator on ALL resolved
-  primitives, per search lag - where (if anywhere) does the feature set
-  contain predictability at all?
 """
 
 import json
@@ -59,29 +56,44 @@ DAYS_PER_YEAR = 365
 
 def empty_metrics() -> dict:
     return {
-        'ic_mean': np.nan, 'ic_tstat': 0.0, 'icir': np.nan,
-        'liquid_ic_ratio': np.nan, 'target_dispersion': np.nan,
+        'alpha_mean': np.nan, 'alpha_tstat': 0.0, 'alpha_ir': np.nan,
+        'liquid_alpha_ratio': np.nan, 'rank_ic_mean': np.nan,
+        'rank_ic_tstat': 0.0, 'target_dispersion': np.nan,
         'n_cross_sections': 0, 'n_days': 0,
     }
 
 
-def _annualized_sharpe(daily_returns: np.ndarray) -> float:
-    x = np.asarray(daily_returns, dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) < 3 or x.std() == 0:
-        return 0.0
-    return float(x.mean() / x.std() * np.sqrt(DAYS_PER_YEAR))
+def _book_returns(df: pd.DataFrame, tcol: str, min_assets: int) -> pd.Series:
+    """Per-stamp return of the gross-1 dollar-neutral book built from the
+    signal cross-section: v_t = sum_i w_i * target_i with w = demeaned signal
+    scaled to gross 1. Return units per bet - money, not correlation."""
+    d = df[['timestamp', 'signal', tcol]].dropna()
+    if d.empty:
+        return pd.Series(dtype=float)
+    g = d.groupby('timestamp')
+    n = g['signal'].transform('size')
+    d = d[n >= min_assets]
+    if d.empty:
+        return pd.Series(dtype=float)
+    g = d.groupby('timestamp')
+    w = d['signal'] - g['signal'].transform('mean')
+    gross = w.abs().groupby(d['timestamp']).transform('sum')
+    w = w / gross.replace(0, np.nan)
+    return (w * d[tcol]).groupby(d['timestamp']).sum(min_count=1).dropna()
 
 
 def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
                     tcol: str, lag_bars: int,
                     min_assets: Optional[int] = None) -> dict:
-    """Score one compiled signal on one window - IC statistics ONLY.
+    """Score one compiled signal on one window in RETURN UNITS.
 
-    Signals are judged purely on rank IC vs the forward residual target
-    (signals are not tradeable objects: cost/PnL are properties of the
-    portfolio layer, never of a signal). liquid_ic_ratio is itself an IC
-    (liquid-half vs full cross-section - a capacity read).
+    alpha_mean is the mean per-bet return of the gross-1 dollar-neutral book
+    built from the signal and held for the horizon - money per bet, not a
+    correlation. Rank IC is kept as a DIAGNOSTIC only: a signal can order
+    names correctly (high rank IC) while the large moves run against its
+    positions (negative alpha) - rank IC never selects anything.
+    liquid_alpha_ratio is the liquid-half alpha vs the full cross-section
+    (a capacity read).
 
     signal: [timestamp, symbol, signal] (from compile_candidate)
     window_panel: the window's slice of the roll panel (must contain tcol;
@@ -104,53 +116,60 @@ def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
     if df.empty:
         return empty_metrics()
 
-    ics = rank_ic_per_timestamp(df[['timestamp', 'signal', tcol]], tcol,
-                                min_assets=min_assets)
-    if ics.empty:
+    bets = _book_returns(df, tcol, min_assets)
+    if bets.empty:
         return empty_metrics()
-
-    ic_mean = float(ics['ic'].mean())
-    ic_std = float(ics['ic'].std())
-    daily_ic = ics.set_index('timestamp')['ic'].groupby(
-        lambda ts: ts.normalize()).mean()
+    alpha_mean = float(bets.mean())
+    alpha_std = float(bets.std())
+    daily_alpha = bets.groupby(lambda ts: ts.normalize()).mean()
 
     if 'is_liquid' in df.columns:
-        liq_ics = rank_ic_per_timestamp(
-            df[df['is_liquid']][['timestamp', 'signal', tcol]], tcol,
-            min_assets=max(3, min_assets // 2))
-        liq_ic = float(liq_ics['ic'].mean()) if not liq_ics.empty else np.nan
+        liq = _book_returns(df[df['is_liquid']], tcol,
+                            max(3, min_assets // 2))
+        liq_alpha = float(liq.mean()) if not liq.empty else np.nan
     else:
-        liq_ic = np.nan
-    # Signed ratio capped at 1: same-sign liquid IC of at least equal
+        liq_alpha = np.nan
+    # Signed ratio capped at 1: same-sign liquid alpha of at least equal
     # magnitude scores 1; opposite sign goes negative (capacity red flag).
-    if np.isfinite(liq_ic) and abs(ic_mean) > 1e-12:
-        liquid_ic_ratio = float(np.clip(liq_ic / ic_mean, -1.0, 1.0))
+    if np.isfinite(liq_alpha) and abs(alpha_mean) > 1e-12:
+        liquid_alpha_ratio = float(np.clip(liq_alpha / alpha_mean, -1.0, 1.0))
     else:
-        liquid_ic_ratio = np.nan
+        liquid_alpha_ratio = np.nan
 
-    # Mean per-stamp cross-sectional std of the forward target: with the
-    # signal z-scored, alpha_k = ic_mean * target_dispersion is the Grinold
-    # expected-return-per-bet at this horizon - the profile of these across
-    # lags is the signal's alpha term structure (SLS "Multi-Period").
+    # Diagnostic rank IC (ordering quality; never selects).
+    ics = rank_ic_per_timestamp(df[['timestamp', 'signal', tcol]], tcol,
+                                min_assets=min_assets)
+    if not ics.empty:
+        daily_ic = ics.set_index('timestamp')['ic'].groupby(
+            lambda ts: ts.normalize()).mean()
+        rank_ic_mean = float(ics['ic'].mean())
+        rank_ic_tstat = float(_nw_tstat(daily_ic.values, 'auto'))
+    else:
+        rank_ic_mean, rank_ic_tstat = np.nan, 0.0
+
     disp = float(df.groupby('timestamp')[tcol].std().mean())
 
     return {
-        'ic_mean': ic_mean,
-        'ic_tstat': float(_nw_tstat(daily_ic.values, 'auto')),
-        'icir': ic_mean / ic_std if ic_std > 0 else 0.0,
-        'liquid_ic_ratio': liquid_ic_ratio,
+        'alpha_mean': alpha_mean,
+        'alpha_tstat': float(_nw_tstat(daily_alpha.values, 'auto')),
+        'alpha_ir': alpha_mean / alpha_std if alpha_std > 0 else 0.0,
+        'liquid_alpha_ratio': liquid_alpha_ratio,
+        'rank_ic_mean': rank_ic_mean,
+        'rank_ic_tstat': rank_ic_tstat,
         'target_dispersion': disp,
-        'n_cross_sections': int(len(ics)),
-        'n_days': int(len(daily_ic)),
+        'n_cross_sections': int(len(bets)),
+        'n_days': int(len(daily_alpha)),
     }
 
 
 def flip_metrics(m: dict) -> dict:
-    """Metrics of the sign-flipped signal, analytically: rank IC is exactly
-    antisymmetric under negation (ic/tstat/icir flip sign; liquid_ic_ratio is
-    a ratio of two flipped ICs, unchanged; dispersion/counts unchanged)."""
+    """Metrics of the sign-flipped signal, analytically: the per-bet return is
+    exactly antisymmetric under negation (alpha/tstat/ir and rank IC flip
+    sign; liquid_alpha_ratio is a ratio of two flipped alphas, unchanged;
+    dispersion/counts unchanged)."""
     out = dict(m)
-    for k in ('ic_mean', 'ic_tstat', 'icir'):
+    for k in ('alpha_mean', 'alpha_tstat', 'alpha_ir',
+              'rank_ic_mean', 'rank_ic_tstat'):
         v = out.get(k)
         if v is not None and np.isfinite(v):
             out[k] = -v
@@ -160,10 +179,9 @@ def flip_metrics(m: dict) -> dict:
 def day_equivalent_tstat(m: dict, lag_bars: int) -> float:
     """Cross-lag-FAIR strength: t / sqrt(stamps per day). A raw t-stat grows
     ~sqrt(number of bets), handing 1h signals a mechanical ~sqrt(24) edge
-    over 24h ones for the SAME per-bet IC; dividing by sqrt(stamps/day) puts
-    every horizon on one bets-per-day-free scale (= ic_mean * sqrt(n_days) up
-    to the daily-IC noise normalization)."""
-    t = m.get('ic_tstat', 0.0)
+    over 24h ones for the SAME per-bet alpha; dividing by sqrt(stamps/day)
+    puts every horizon on one bets-per-day-free scale."""
+    t = m.get('alpha_tstat', 0.0)
     if t is None or not np.isfinite(t):
         return 0.0
     stamps_per_day = max(BARS_PER_DAY // max(int(lag_bars), 1), 1)
@@ -204,16 +222,14 @@ def signal_turnover(sig: pd.DataFrame) -> float:
 
 
 def alpha_term_structure(m_by_lag: Dict[int, dict]) -> Dict[int, float]:
-    """Cumulative expected alpha per bet at each horizon: A(L) = ic_mean(L) *
-    target_dispersion(L). This is the empirical alpha_k curve of SLS
-    "Multi-Period Optimisation" (regression of cumulative forward returns on
-    a unit-variance signal)."""
+    """Cumulative alpha per bet at each horizon: A(L) = alpha_mean(L),
+    measured directly in return units (the book's held return per bet - no
+    IC x dispersion proxy)."""
     out = {}
     for lag, m in m_by_lag.items():
-        ic, disp = m.get('ic_mean'), m.get('target_dispersion')
-        if (ic is not None and disp is not None
-                and np.isfinite(ic) and np.isfinite(disp)):
-            out[int(lag)] = float(ic) * float(disp)
+        a = m.get('alpha_mean')
+        if a is not None and np.isfinite(a):
+            out[int(lag)] = float(a)
     return out
 
 
@@ -228,9 +244,26 @@ def trade_rate_per_bar(cfg: Optional[dict] = None) -> float:
     if gp.get('enabled', False) and urgency is not None:
         ref = float(gp.get('ref_cost_bps', port['cost_bps']) or port['cost_bps'])
         omega = float(urgency) * (ref / float(port['cost_bps']))
-        return omega / (1.0 + omega)
-    hl = float(port.get('weight_smoothing_halflife', 6) or 6)
-    return 1.0 - math.exp(-math.log(2.0) / max(hl, 1e-9))
+        rate = omega / (1.0 + omega)
+    else:
+        hl = float(port.get('weight_smoothing_halflife', 6) or 6)
+        rate = 1.0 - math.exp(-math.log(2.0) / max(hl, 1e-9))
+    return rate
+
+
+def effective_persistence_bars(half_life_bars: float, lag_bars: int,
+                               turnover: Optional[float]) -> float:
+    """Persistence the capture weight prices: min(alpha half-life,
+    turnover-implied position life lag/turnover). The half-life says how long
+    the ALPHA lives; lag/turnover says how long the POSITIONS live (a churny
+    signal reshuffles every rebalance regardless of its fitted half-life).
+    The discount must honor the shorter. Turnover clipped to [1e-2, 2];
+    missing/NaN turnover falls back to the half-life alone. Mirrors the
+    walk-forward's hold_bars (cost_holding_bars capped by half-life)."""
+    hl = max(float(half_life_bars), 1e-9)
+    if turnover is None or not np.isfinite(turnover) or turnover <= 0:
+        return hl
+    return min(hl, float(lag_bars) / min(max(float(turnover), 1e-2), 2.0))
 
 
 def persistence_weight(half_life_bars: float, rate_bar: float) -> float:
@@ -308,26 +341,27 @@ def max_signal_correlation(signal: pd.DataFrame, others: list) -> float:
 
 def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
                  instability: float, cand: Candidate,
-                 similarity: float, incremental: float = 0.0) -> dict:
+                 similarity: float, incremental: float = 0.0,
+                 turnover: Optional[float] = None) -> dict:
     """The raw (unscaled) reward terms - TRAIN window only. All finite.
 
-    ic_tstat is the CAPTURE-WEIGHTED day-equivalent train t at the
-    candidate's best per-bet lag: strength x the fraction of it a book
-    trading at the portfolio rate can hold long enough to be exposed to
-    (see persistence_weight - duration, never bps). A 6h-half-life signal
-    outscores a 1h one of equal strength ~2.4x, so the search breeds toward
-    persistence. instability is the std of the train-thirds ICs (temporal
-    consistency inside train - select is never consulted). incremental is the
-    IC the candidate ADDS to the current survivor book (marginal edge, not a
-    redundant copy of the dominant signal - AlphaGen / Lucky-Factors idea),
-    measured on train."""
+    alpha_tstat is the CAPTURE-WEIGHTED day-equivalent train t of the
+    candidate's PER-BET RETURN (not rank IC) at its best lag,
+    discounted by the fraction of it a book trading at the portfolio rate
+    can hold long enough to be exposed to (see persistence_weight - duration,
+    never bps). instability is the std of the alpha across train thirds.
+    incremental is the per-bet return the candidate ADDS to the current
+    survivor book (marginal edge), measured on train."""
     def _f(x, default=0.0):
         return float(x) if x is not None and np.isfinite(x) else default
 
-    capture = persistence_weight(half_life_bars, trade_rate_per_bar())
+    # Capture prices the persistence the book can actually monetize:
+    # min(alpha half-life, position life lag/turnover) at the GP fill rate.
+    p_eff = effective_persistence_bars(half_life_bars, best_lag, turnover)
+    capture = persistence_weight(p_eff, trade_rate_per_bar())
     return {
-        'ic_tstat': day_equivalent_tstat(train_metrics, best_lag) * capture,
-        'liquid_ic_ratio': _f(train_metrics.get('liquid_ic_ratio')),
+        'alpha_tstat': day_equivalent_tstat(train_metrics, best_lag) * capture,
+        'liquid_alpha_ratio': _f(train_metrics.get('liquid_alpha_ratio')),
         'incremental': _f(incremental),
         'complexity': float(complexity(cand)),
         'instability': _f(instability),
@@ -338,14 +372,16 @@ def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
 def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
                    instability: float, cand: Candidate, similarity: float,
                    incremental: float = 0.0,
-                   reward_cfg: Optional[dict] = None) -> tuple:
+                   reward_cfg: Optional[dict] = None,
+                   turnover: Optional[float] = None) -> tuple:
     """reward = sum_k weight_k * term_k / scale_k. TRAIN window only, fixed
     scales from config. Returns (reward, terms)."""
     cfg = reward_cfg or get('discovery.reward', {})
     weights = cfg['weights']
     scales = cfg['scales']
     terms = reward_terms(train_metrics, best_lag, half_life_bars,
-                         instability, cand, similarity, incremental)
+                         instability, cand, similarity, incremental,
+                         turnover=turnover)
     total = 0.0
     for key, w in weights.items():
         total += float(w) * terms[key] / float(scales[key])
@@ -355,19 +391,18 @@ def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
 def train_thirds_instability(sig: pd.DataFrame, train: pd.DataFrame,
                              tcol: str, lag_bars: int,
                              min_assets: int) -> float:
-    """Std of the signal's IC over three contiguous time-thirds of TRAIN -
-    the search-hygiene consistency term (replaces the old train-vs-select
-    gap, which leaked select into survival)."""
+    """Std of the signal's per-bet alpha over three contiguous time-thirds of
+    TRAIN - the search-hygiene consistency term (select is never consulted)."""
     stamps = np.sort(train['timestamp'].unique())
     if len(stamps) < 9:
         return 0.0
-    ics = []
+    alphas = []
     for part in np.array_split(stamps, 3):
         sub = train[train['timestamp'].isin(part)]
         m = evaluate_window(sig, sub, tcol, lag_bars, min_assets)
-        ic = m.get('ic_mean')
-        ics.append(float(ic) if ic is not None and np.isfinite(ic) else 0.0)
-    return float(np.std(ics))
+        a = m.get('alpha_mean')
+        alphas.append(float(a) if a is not None and np.isfinite(a) else 0.0)
+    return float(np.std(alphas))
 
 
 # =============================================================================
@@ -628,8 +663,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                        key=lambda l: abs(day_equivalent_tstat(
                            m_train_by_lag[l], l)))
         # Traded sign is fixed on TRAIN; the flip mirrors the whole profile
-        # (rank IC is exactly antisymmetric under signal negation).
-        direction = 1 if m_train_by_lag[best_lag]['ic_mean'] >= 0 else -1
+        # (the per-bet return is exactly antisymmetric under signal negation).
+        direction = 1 if m_train_by_lag[best_lag]['alpha_mean'] >= 0 else -1
         if direction < 0:
             sig = sig.assign(signal=-sig['signal'])
             m_train_by_lag = {l: flip_metrics(m)
@@ -660,24 +695,26 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                                                best_lag, min_assets)
         similarity = max_signal_correlation(
             sig_train, [s['signal_train'] for s in population])
-        # Marginal contribution: how much train IC the candidate ADDS to the
-        # current survivor book at its best lag (combined pooled IC minus the
-        # book's own IC). 0 when the book is empty or the reward ignores it.
+        # Marginal contribution: the train per-bet return the candidate ADDS to
+        # the current survivor book at its best lag (pooled alpha minus the
+        # book's own). 0 when the book is empty or the reward ignores it.
         incremental = 0.0
         if incr_weight != 0.0 and book_signals:
             tcol_b = target_col(best_lag)
             if best_lag not in book_ic_cache:
                 bk = evaluate_window(pooled_signal(book_signals), train,
-                                     tcol_b, best_lag, min_assets)['ic_mean']
+                                     tcol_b, best_lag,
+                                     min_assets)['alpha_mean']
                 book_ic_cache[best_lag] = bk if np.isfinite(bk) else 0.0
             comb = evaluate_window(pooled_signal(book_signals + [sig_train]),
                                    train, tcol_b, best_lag,
-                                   min_assets)['ic_mean']
+                                   min_assets)['alpha_mean']
             comb = comb if np.isfinite(comb) else 0.0
             incremental = comb - book_ic_cache[best_lag]
         rwd, terms = compute_reward(m_train, best_lag, half_life,
                                     instability, cand, similarity,
-                                    incremental, cfg['reward'])
+                                    incremental, cfg['reward'],
+                                    turnover=turnover)
         profile = {
             str(l): {'train': {k: (None if v is None or not np.isfinite(v)
                                    else round(float(v), 8))
@@ -712,7 +749,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     for cand in (seed_candidates or []):
         try_candidate(cand, -1)
     if seed_candidates:
-        logging.info(f"roll {roll.roll_id}: seeded {len(population)} of "
+        logging.debug(f"roll {roll.roll_id}: seeded {len(population)} of "
                      f"{len(seed_candidates)} previous survivors")
 
     # Failure memory: recently-culled low-reward candidates, so the LLM can be
@@ -722,8 +759,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     def _parent_scores(pop) -> Dict[str, dict]:
         return {s['candidate'].hash: {
             'reward': round(float(s['reward']), 3),
-            'ic_tstat': round(day_equivalent_tstat(s['metrics_train'],
-                                                   s['target_lag']), 2),
+            'alpha_tstat': round(day_equivalent_tstat(s['metrics_train'],
+                                                      s['target_lag']), 2),
             'half_life_bars': int(s.get('half_life_bars', 0) or 0),
         } for s in pop}
 
@@ -801,7 +838,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             best = max((s['reward'] for s in population), default=0)
             gen_bar.set_postfix(trials=ledger.n_trials(roll.roll_id),
                                 best=f"{best:.3f}", pop=len(population))
-            logging.info(f"roll {roll.roll_id} gen {gen}: "
+            logging.debug(f"roll {roll.roll_id} gen {gen}: "
                          f"{ledger.n_trials(roll.roll_id)} trials, "
                          f"best reward {best:.3f}")
     gen_bar.close()
@@ -813,84 +850,9 @@ def run_search(panel: pd.DataFrame, roll: Roll,
              if s.get('turnover') is not None and np.isfinite(s['turnover'])]
     turn_str = (f", turnover/bar {np.median(turns):.1%} median "
                 f"[{min(turns):.1%}-{max(turns):.1%}]" if turns else "")
-    logging.info(f"roll {roll.roll_id}: survivor lag mix "
+    logging.debug(f"roll {roll.roll_id}: survivor lag mix "
                  f"{dict(sorted(lag_mix.items()))} (bars){turn_str}")
     ledger.mark_survivors(roll.roll_id,
                           [s['candidate'].hash for s in population])
     return population
 
-
-# =============================================================================
-# ML probe (predictability ceiling)
-# =============================================================================
-
-def run_ml_probe(panel: pd.DataFrame, roll: Roll, feature_cols: List[str],
-                 cfg: Optional[dict] = None) -> dict:
-    """Gradient boosting on ALL resolved primitives, fit on TRAIN, scored on
-    SELECT, at EVERY search lag: the predictability ceiling of the feature
-    set per horizon. If a lag's ceiling is ~0, the DSL search is digging in
-    barren ground at that speed - this is the cheap map of where (if
-    anywhere) alpha lives before the search spends its budget."""
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    from research.signals.data import resolve_search_lags
-
-    cfg = cfg or get('discovery', {})
-    ml_cfg = cfg['ml_probe']
-    pb = purge_bars(cfg)
-
-    roll_panel = slice_window(panel, roll.train_start, roll.oos_start, 0)
-    train = slice_window(roll_panel, roll.train_start, roll.select_start, pb)
-    select = slice_window(roll_panel, roll.select_start, roll.oos_start, pb)
-    cols = [c for c in feature_cols if c in train.columns]
-
-    metrics_by_lag: Dict[int, dict] = {}
-    n_train_rows = 0
-    degenerate_logged = False
-    for lag in tqdm(resolve_search_lags(cfg), desc='ML probe', unit='lag',
-                    leave=False):
-        tcol = target_col(lag)
-        tr = train.dropna(subset=[tcol])
-        tr = tr[tr[cols].notna().any(axis=1)]
-        cap = int(ml_cfg['subsample_rows'])
-        if len(tr) > cap:
-            tr = tr.sort_values('timestamp').tail(cap)   # recent-biased
-        if tr.empty:
-            metrics_by_lag[lag] = empty_metrics()
-            continue
-        n_train_rows = max(n_train_rows, len(tr))
-
-        # HistGradientBoosting's binner crashes on columns with < 2 distinct
-        # non-NaN values (all-NaN or constant in this training slice - e.g.
-        # futures columns before their data starts). Drop them per window;
-        # they carry no information for the fit anyway.
-        nun = tr[cols].nunique(dropna=True)
-        use_cols = [c for c in cols if nun.get(c, 0) >= 2]
-        if not use_cols:
-            metrics_by_lag[lag] = empty_metrics()
-            continue
-        if len(use_cols) < len(cols) and not degenerate_logged:
-            dropped = sorted(set(cols) - set(use_cols))
-            logging.info(f"ml probe: dropped {len(dropped)} degenerate "
-                         f"columns (all-NaN/constant in train): {dropped}")
-            degenerate_logged = True
-
-        model = HistGradientBoostingRegressor(
-            max_iter=int(ml_cfg['max_iter']),
-            max_depth=int(ml_cfg['max_depth']),
-            learning_rate=float(ml_cfg['learning_rate']),
-            min_samples_leaf=int(ml_cfg['min_samples_leaf']),
-            l2_regularization=float(ml_cfg['l2_regularization']),
-            random_state=int(cfg['search']['seed']),
-        )
-        model.fit(tr[use_cols].values, tr[tcol].values)
-
-        sel = select[select[use_cols].notna().any(axis=1)]
-        sig = sel[['timestamp', 'symbol']].copy()
-        sig['signal'] = model.predict(sel[use_cols].values)
-        g = sig.groupby('timestamp')['signal']
-        sig['signal'] = ((sig['signal'] - g.transform('mean'))
-                         / (g.transform('std') + 1e-10)).clip(-3, 3)
-        metrics_by_lag[lag] = evaluate_window(
-            sig.dropna(subset=['signal']), select, tcol, lag)
-
-    return {'metrics_by_lag': metrics_by_lag, 'n_train_rows': n_train_rows}

@@ -533,22 +533,17 @@ check("funding: long pays positive rate, short pays negative rate",
       f"(pnl {pnl_fund:+.5f})")
 
 # ---------------------------------------------------------------------------
-# 15. Execution-derived selection speed floor (min_holding_lag_bars: 'auto')
+# 15. Effective fill rate: the GP rate itself (no global turnover budget -
+#     the volume-participation cap is the only hard fill constraint)
 # ---------------------------------------------------------------------------
 import research.portfolio.walk_forward as wfmod
 
 nominal_rate, kappa_eff = wfmod.effective_fill_rate()
-gp_cfg = wfmod.PORT.get('gp_trading', {})
-budget_ann = wfmod.PORT.get('max_annual_turnover')
-per_bar_budget = budget_ann / (wfmod.BARS_PER_DAY * 365) if budget_ann else np.inf
-exp_kappa = max(nominal_rate, 1e-9)
-if gp_cfg.get('discount_at_realized_rate', True) and np.isfinite(per_bar_budget):
-    exp_kappa = max(min(exp_kappa,
-                        per_bar_budget / max(wfmod.PORT['gross_leverage'], 1e-9)),
-                    1e-9)
-check("fill rate: kappa = min(GP rate, budget-allowed rate)",
-      np.isclose(kappa_eff, exp_kappa),
+check("fill rate: kappa == GP nominal rate (no budget throttle)",
+      np.isclose(kappa_eff, max(nominal_rate, 1e-9)),
       f"(nominal {nominal_rate:.4f}, kappa {kappa_eff:.5f})")
+check("fill rate: no max_annual_turnover key in config",
+      wfmod.PORT.get('max_annual_turnover') is None)
 
 # ---------------------------------------------------------------------------
 # 16. Point-in-time universe membership: spell evolution + interval mask

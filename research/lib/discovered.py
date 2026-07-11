@@ -94,7 +94,9 @@ def entries_from_promotions(promos: pd.DataFrame,
                             f"({row.get('cand_hash', '?')}): {e}")
             continue
         name = f"disc_{cand.family}_{cand.hash[:10]}"
-        tstat = abs(float(row.get('select_ic_tstat', 0.0) or 0.0))
+        # alpha promotions carry select_alpha_tstat; pre-alpha tables the old name
+        tstat = abs(float(row.get('select_alpha_tstat',
+                                  row.get('select_ic_tstat', 0.0)) or 0.0))
         vf = valid_from_by_roll.get(int(row.get('roll_id', -1)))
 
         if name in entries:

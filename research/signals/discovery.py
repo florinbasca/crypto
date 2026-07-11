@@ -1,8 +1,9 @@
 """
 Agentic signal discovery - the deterministic harness (see agent.md).
 
-Discovery is PURELY STATISTICAL: it measures IC, fits alpha half-lives, and
-emits promotions. It never trades, never charges costs, never prints PnL -
+Discovery is PURELY STATISTICAL: it measures each candidate's per-bet return
+(alpha, in return units; rank IC kept as a diagnostic), fits alpha
+half-lives, and emits promotions. It never charges costs or trades -
 research/portfolio/walk_forward.py is the ONLY money judge.
 
 Outer loop per roll (train 5mo / select 1mo, advancing monthly; the roll's
@@ -11,9 +12,9 @@ OOS month exists only as the promotion's valid_from date):
   2. SEARCH: budgeted propose -> compile -> evaluate -> reward -> keep
      best+diverse survivors (evolutionary loop, family bandit). The search
      is TRAIN-ONLY: reward, survival, breeding and direction never see the
-     select window. The reward's IC term is CAPTURE-WEIGHTED (x 1/(1 +
-     phi/kappa)), so persistent signals outscore equally-strong fast ones
-     and the search breeds toward duration.
+     select window. The reward's alpha term is the candidate's
+     PER-BET RETURN (not rank IC), CAPTURE-WEIGHTED (x 1/(1 + phi/kappa)), so
+     persistent signals outscore equally-strong fast ones.
   3. PROMOTE survivors through the gates - the first and only look at
      select (per-lag profile FDR, deflation over the actual looks,
      persistence, sign agreement, capture floor, orthogonality)
@@ -57,7 +58,9 @@ from research.signals import data as data_mod
 from research.signals import search as search_mod
 from research.signals.generation import Candidate, make_proposer
 
-logging.basicConfig(level=logging.INFO,
+# WARNING level: the run's narrative is the print/tqdm output; warnings
+# (proposer retries, salvage) stay visible.
+logging.basicConfig(level=logging.WARNING,
                     format=global_config['logging']['format'],
                     datefmt=global_config['logging']['datefmt'])
 
@@ -163,16 +166,6 @@ def main():
               f"select {roll.select_start.date()} OOS {roll.oos_start.date()}"
               f"..{roll.oos_end.date()} ===")
 
-        # Predictability ceiling per horizon (always on): a GBM on ALL
-        # features - the upper bound on what any search over them could find.
-        # If a lag's ceiling is ~0 across rolls, the features are barren at
-        # that speed; if the ceiling is real but the search finds nothing,
-        # the search is the bottleneck.
-        probe = search_mod.run_ml_probe(panel, roll, feature_cols, cfg)
-        for lag_i, m in sorted(probe['metrics_by_lag'].items()):
-            print(f"ML probe @ {lag_i:>3d} bars: IC {m['ic_mean']:.4f} "
-                  f"(t={m['ic_tstat']:.2f})")
-
         if not seeds and roll.roll_id > 0:
             # resumed/partial runs: recover the previous roll's survivors
             seeds = ledger.survivor_candidates(roll.roll_id - 1)
@@ -218,23 +211,25 @@ def main():
                 'target_lag': int(p.get('target_lag', 0) or 0),
                 'half_life_bars': float(p.get('half_life_bars', 0) or 0),
                 'capture': float(p.get('capture', 0) or 0),
+                'turnover': float(p.get('turnover', float('nan'))),
                 'promoted_lags': ','.join(str(l) for l in
                                           p.get('promoted_lags', [])),
                 'candidate_json': c.to_json(),
-                # Select t at the STRONGEST promoted lag (the evidence the
-                # signal actually cleared on), not the best-TRAIN-lag t.
-                'select_ic_tstat': p.get('select_ic_tstat',
-                                         p['metrics_select']['ic_tstat']),
+                # Select alpha t at the STRONGEST promoted lag (the evidence
+                # the signal actually cleared on), not the best-TRAIN-lag t.
+                'select_alpha_tstat': p.get('select_alpha_tstat',
+                                            p['metrics_select']['alpha_tstat']),
                 'reward': p['reward'],
                 'n_looks_at_promotion': p.get('n_looks_at_promotion', 0),
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
             })
             print(f"  + {c.name} ({c.family}) "
-                  f"select t={roll_promo_rows[-1]['select_ic_tstat']:.2f} "
+                  f"select $t={roll_promo_rows[-1]['select_alpha_tstat']:.2f} "
                   f"@ lag {p.get('select_lag', p.get('target_lag'))} "
                   f"of [{roll_promo_rows[-1]['promoted_lags']}] "
                   f"half-life {p.get('half_life_bars', 0):,.0f} bars "
-                  f"(capture {p.get('capture', 0):.2f})")
+                  f"(capture {p.get('capture', 0):.2f}, "
+                  f"turnover {p.get('turnover', float('nan')):.3f}/bar)")
         promo_rows.extend(roll_promo_rows)
 
         # Flush EVERY roll: a run killed at roll N keeps rolls 0..N-1.

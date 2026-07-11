@@ -28,7 +28,7 @@ z-scores, and clips to ±3 (the demean is what makes each bar sum to ~0). Column
 A **roll** is one train/select window pair. Per roll, for 16 generations:
 
 1. The LLM proposes a batch of 32 candidates, its slots split across families by the rule below.
-2. Each candidate is compiled and scored on train dataset by rank **IC**
+2. Each candidate is compiled and scored on train by its **per-bet return** (see Reward)
 3. The best-by-reward survivors are kept, de-duplicated, and seed the next generation.
 
 The 32 slots are split across families by an upper-confidence-bound rule: a family's priority = its mean reward so far + an exploration bonus that decays as it is tried, so more of the batch goes to families that keep producing high-reward candidates, without starving untried ones.
@@ -52,44 +52,57 @@ Two windows per roll, advancing one month at a time:
 
 ## Reward (train only)
 
+The performance metric is the candidate's **per-bet return** ("alpha"):
+build the dollar-neutral, gross-1 long/short book from the signal's
+cross-section, hold it for the horizon, measure what it returned
+(e.g. +3bps per bet).
+**Rank IC is recorded as a diagnostic only and selects nothing**: this
+system's first full run proved a signal can order names correctly for a day
+(rank IC t≈15) while the large moves run against its positions (negative
+returns). Ordering and returns are different quantities; the reward uses
+returns.
+
 ```
 reward = Σ wₖ · termₖ / scaleₖ
 
-+ ic_tstat        capture-weighted, day-equivalent train IC t-stat
-+ liquid_ic_ratio IC on the liquid half vs the full cross-section
-+ incremental     IC the candidate adds to the current survivor book
-− complexity      node + condition count
-− instability     std of IC across train thirds
-− similarity      max correlation to kept survivors
++ alpha_tstat        capture-weighted, day-equivalent t of the per-bet return
++ liquid_alpha_ratio liquid-half alpha vs the full cross-section
++ incremental        per-bet return the candidate adds to the survivor pool
+− complexity         node + condition count
+− instability        std of per-bet alpha across train thirds
+− similarity         max correlation to kept survivors
 ```
 
-Each candidate is scored at every horizon. Its per-horizon IC profile and fitted half-life (bars for the edge to decay by half) carry to promotion.
+Each candidate is scored at every horizon. Its per-horizon alpha profile (the
+measured return term structure) and fitted half-life carry to promotion.
 
 A fast signal looks better than it really is, for two separate reasons, so the
-IC term is corrected for both:
+alpha term is corrected for both:
 
 - It places more bets, which inflates its t-stat (~√24× for a 1h vs a 1d signal)
   with no extra skill. **Day-equivalent** t-stat, `t / √(stamps per day)`,
   cancels that — it scores skill per bet, not bet count.
 - Even when the skill is real, a fast edge decays before the book can trade into
-  it, so only part of it is capturable. **Capture weight**, `1 / (1 + φ/κ)`
-  (φ = decay rate = ln2/half-life, κ = how fast the book trades), scales the IC
-  down to the tradable fraction: a 1h-half-life edge keeps ~0.29, a 12h one
-  ~0.83. This is about duration, not fees.
+  it, so only part of it is capturable. **Capture weight**, `1 / (1 + φ/κ)`,
+  scales the alpha down to the tradable fraction. φ = ln2 / *effective
+  persistence* = min(alpha half-life, position life lag/turnover) — the alpha
+  and the positions must BOTH live long enough. κ = the GP fill rate the
+  walk-forward actually trades at (~0.048/bar; per-name fills are further
+  capped at 10% of trailing volume). Duration, not fees.
 
 **Incremental** rewards adding something new instead of repeating what you
-already have: the **pooled IC** (the IC of all survivors averaged into one
-signal) *with* the candidate included minus *without* it. A near-duplicate adds
-~0; a signal that captures a mechanism the book was missing adds a lot. Cost is
-never a reward term — a signal's real cost depends on the whole book, so it is
-judged only in the walk-forward.
+already have: the pooled per-bet return of survivors *with* the candidate
+included minus *without* it. A near-duplicate adds ~0. Cost is never a reward
+term — a signal's real cost depends on the whole book, so it is judged only
+in the walk-forward.
 
-**Turnover** (mean per-bar book churn, `0.5·Σ|Δw|` on the gross-1 signal) is
-recorded per candidate in the ledger as a standalone tradeability diagnostic:
-0 = positions never change, 1 = the book is replaced every bar. It's the
-measured twin of the capture weight (fast signal ⇒ short half-life ⇒ high
-turnover). Diagnostic only — never a reward or promotion term, never read by
-the walk-forward.
+**Turnover** (mean per-bar book churn, `0.5·Σ|Δw|` on the gross-1 signal;
+0 = positions never change, 1 = replaced every bar) is recorded per candidate
+and enters selection twice: through the capture weight (position life
+`lag/turnover` caps effective persistence) and as a hard promotion ceiling
+`max_turnover = 0.01`/bar — tracking a 0.01/bar churner costs ~14bps/day at
+5bps/side, past any alpha measured here, so churnier signals are rejected
+outright. Never a cost term — cost stays in the walk-forward.
 
 ## Diversity
 
@@ -110,33 +123,34 @@ book. Two guards keep survivors genuinely distinct:
 
 ## Promotion
 
-Once per roll, on the held-out select month. A survivor promotes if any horizon
-of its profile clears all of:
+Once per roll, on the held-out select month. All statistical tests are on the
+**per-bet return**, not rank IC. A survivor promotes if any
+horizon of its profile clears all of:
 
 - **FDR** control (Benjamini-Yekutieli false-discovery-rate) across every
   (survivor, horizon) select p-value (Student-t, n_days−1 dof).
 - **Deflation**: the select t must beat `deflation_mult · E[max|N(0,1)|]` over
   the actual looks taken (survivors × horizons) — the multiple-testing haircut.
-- Minimum select t-stat and minimum daily observations. All three tests use the
-  **directed** t (positive in the traded direction), not |t| — a lag whose sign
-  reverses out-of-sample is rejected, never admitted on magnitude alone.
+- Minimum select alpha t-stat and minimum daily observations. All three tests
+  use the **directed** t (positive in the traded direction), not |t| — a lag
+  whose sign reverses out-of-sample is rejected, never admitted on magnitude.
 - Sign agreement: the train profile mostly shares the traded sign.
-- Capture floor: half-life long enough for the book to hold it.
-- Turnover ceiling (`max_turnover`, off by default): rejects a signal whose
-  per-bar book churn exceeds the cap — the direct-measurement sibling of the
-  capture floor, catching the untradeable-standalone case where alpha persists
-  but positions are noisy. Fails open when turnover is unknown.
+- Capture floor: effective persistence long enough for the book to hold.
+- Turnover ceiling (`max_turnover = 0.01`/bar): signals churnier than this
+  cannot pay for their own tracking at 5bps — rejected outright. Fails open
+  when turnover is unknown.
 - Orthogonality to signals already promoted this roll.
 
-Passers are written to the promotions table with profile, half-life, and
-direction. Promotion neither trades nor sizes.
+Passers are written to the promotions table with profile, half-life, turnover,
+and direction. Promotion neither trades nor sizes.
 
 ## What the LLM sees
 
 Train diagnostics only — never returns or the raw panel:
 
 - A one-line description of each column.
-- Per-column IC, decile curve, regime-split IC, stability.
+- Per-column rank IC, decile curve, regime-split IC, stability (proposer
+  diagnostics only — selection uses per-bet returns).
 - The top columns per family, ranked by a blend of monotonic IC, decile
   nonlinearity, regime spread, and stability (so U-shaped/threshold features
   aren't hidden by a t-stat-only rank).
@@ -147,13 +161,6 @@ It emits DSL JSON; everything it returns is re-validated and re-scored by code.
 The fixed system prompt (role, DSL rules, output format) is `prompt.md`; the
 per-call user prompt is assembled from the diagnostics above in
 `generation.py` (`_prompt`).
-
-## ML probe
-
-Each roll fits a gradient-boosting model on all features per horizon and prints
-its IC — the predictability ceiling. ~0 means the features are barren at that
-horizon; a real ceiling the search can't reach means the search, not the data,
-is the bottleneck. Diagnostic only, never used as signal.
 
 ## Overfitting
 
@@ -184,10 +191,10 @@ works out to roughly **$1–3 per roll, order $30–80 for the full run**. The
 script prints the measured tokens and dollars per roll; trust that over these
 estimates.
 
-Run time is dominated by the LLM round-trips (scoring is fast by comparison).
-The per-family proposal calls within a generation run concurrently
-(`discovery.llm.parallel_requests`, default 8), cutting a roll from ~1.5–3
-hours sequential to roughly 15–30 minutes; lower the setting if the provider
-rate-limits. Progress bars (per-generation, per-call, per-candidate, ML probe)
-show the run is alive.
+Run time is dominated by candidate scoring (~15–20s per candidate on the
+5-month train panel), not the LLM: proposal calls run concurrently
+(`discovery.llm.parallel_requests`, default 8). Expect roughly 2–2.5 hours per
+roll, ~2–3 days for the full 28. Progress bars (per-generation, per-call,
+per-candidate) show the run is alive; lower parallel_requests if the provider
+rate-limits.
 

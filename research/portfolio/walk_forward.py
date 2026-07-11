@@ -100,23 +100,14 @@ def gp_trade_rate(cost_bps: float, gp: dict, legacy_halflife: float) -> float:
 def effective_fill_rate() -> Tuple[float, float]:
     """(nominal per-bar trade rate, effective fill rate kappa).
 
-    The nominal rate is the GP cost-responsive trade-toward-aim rate; kappa is
-    the rate at which the book can ACTUALLY close the gap to the aim once the
-    hard `max_annual_turnover` budget is accounted for (at realistic settings
-    the budget binds long before the nominal rate). This one quantity drives
-    the aim discount in `_backtest_window`.
+    Both are the GP cost-responsive trade-toward-aim rate; per-name fills are
+    additionally capped by the volume-participation limit inside the bar loop
+    (the only hard constraint). Drives the aim discount in `_backtest_window`.
     """
     gp = PORT.get('gp_trading', {})
     nominal = gp_trade_rate(PORT['cost_bps'], gp,
                             PORT['weight_smoothing_halflife'])
-    kappa = max(nominal, 1e-9)
-    max_ann_to = PORT.get('max_annual_turnover')
-    per_bar_budget = (max_ann_to / (BARS_PER_DAY * 365)
-                      if max_ann_to else np.inf)
-    if gp.get('discount_at_realized_rate', True) and np.isfinite(per_bar_budget):
-        realized = per_bar_budget / max(PORT['gross_leverage'], 1e-9)
-        kappa = max(min(kappa, realized), 1e-9)
-    return nominal, kappa
+    return nominal, max(nominal, 1e-9)
 
 
 def edge_gross_multiplier(exp_edge: float, rt_cost: float,
@@ -264,7 +255,7 @@ class DataContext:
                 lf = lf.filter(pl.col(time_col) <
                                (end + pad_end if pad_end is not None else end))
             t0 = time.perf_counter()
-            logging.info(f"  loading {table_name}.{value_col} wide...")
+            logging.debug(f"  loading {table_name}.{value_col} wide...")
             df = lf.select([time_col, 'symbol', value_col]).collect()
             if df.is_empty():
                 return pd.DataFrame()
@@ -272,16 +263,16 @@ class DataContext:
                             aggregate_function='first').sort(time_col)
             out = wide.to_pandas().set_index(time_col)
             out.columns.name = 'symbol'
-            logging.info(f"  {table_name}.{value_col}: {out.shape[0]:,} bars x "
+            logging.debug(f"  {table_name}.{value_col}: {out.shape[0]:,} bars x "
                          f"{out.shape[1]} symbols ({time.perf_counter()-t0:.0f}s)")
             return out
 
         if start is not None or end is not None:
-            logging.info(f"Loading portfolio panels "
+            logging.debug(f"Loading portfolio panels "
                          f"{start if start is not None else '-inf'} -> "
                          f"{end if end is not None else '+inf'}...")
         else:
-            logging.info("Loading residual returns / loadings / universe...")
+            logging.debug("Loading residual returns / loadings / universe...")
         self.res_wide = _wide_panel('residual_returns', 'residual_return')
         self.fwd_raw_wide = _wide_panel('residual_returns',
                                         horizon_col(BASE_FREQUENCY, 'raw'))
@@ -353,7 +344,7 @@ class DataContext:
                 logging.warning(f"funding_pnl: no funding panel ({e}); "
                                 "backtest will accrue NO funding")
 
-        logging.info(f"Panels: {self.res_wide.shape[0]:,} bars x "
+        logging.debug(f"Panels: {self.res_wide.shape[0]:,} bars x "
                      f"{self.res_wide.shape[1]} symbols")
 
     def members_at(self, ts: pd.Timestamp) -> set:
@@ -422,8 +413,12 @@ class WalkForwardPortfolio:
         led_key = {}
         if led is not None and not led.empty:
             for r in led.itertuples():
+                # alpha ledgers carry train_alpha_mean; pre-alpha-metric
+                # ledgers carry train_ic_mean (fallback keeps old runs readable)
+                a = getattr(r, 'train_alpha_mean',
+                            getattr(r, 'train_ic_mean', np.nan))
                 led_key[(int(r.roll_id), r.cand_hash)] = (
-                    float(getattr(r, 'train_ic_mean', np.nan) or np.nan),
+                    float(a if a is not None else np.nan),
                     float(getattr(r, 'turnover', np.nan) or np.nan))
         oos_by_roll = {r.roll_id: pd.Timestamp(r.oos_start)
                        for r in make_rolls(get('discovery'))}
@@ -527,18 +522,11 @@ class WalkForwardPortfolio:
             composites[h] = acc.sub(mu, axis=0).div(sd, axis=0).clip(-3, 3)
         return composites
 
-    # ---------------- one window ----------------
-
-    def run_window(self, idx: int, train_start: pd.Timestamp,
-                   train_end: pd.Timestamp, test_end: pd.Timestamp,
-                   prev: Optional[WindowResult]) -> Optional[WindowResult]:
-        res = WindowResult(idx, train_start, train_end, test_end)
-
-        # This OOS month trades exactly its roll's promoted signals, sized
-        # from discovery metadata. Buckets = distinct promoted lags; weights
-        # within a bucket proportional to train IC (panels are already
-        # direction-applied by compute_signal_panel).
-        meta = self.month_meta.get(pd.Timestamp(train_end), [])
+    def month_book(self, meta: List[dict]):
+        """One OOS month's tradable book from discovery metadata: buckets =
+        distinct promoted lags, weights within a bucket proportional to train
+        IC. Returns (selected, weights, lag_of, bucket_ic, bucket_h,
+        bucket_to, bucket_hl)."""
         selected, weights, bucket_ic, bucket_h = {}, {}, {}, {}
         bucket_to, bucket_hl = {}, {}
         by_lag: Dict[int, List[dict]] = {}
@@ -547,11 +535,10 @@ class WalkForwardPortfolio:
         for lag in sorted(by_lag):
             lab = f'{lag}b'
             ms = by_lag[lag]
-            ics = np.array([m['ic'] if np.isfinite(m['ic']) else 0.0
-                            for m in ms])
-            ics = np.abs(ics)
-            w = ics / ics.sum() if ics.sum() > 1e-12 else np.full(len(ms),
-                                                                  1 / len(ms))
+            ics = np.abs(np.array([m['ic'] if np.isfinite(m['ic']) else 0.0
+                                   for m in ms]))
+            w = (ics / ics.sum() if ics.sum() > 1e-12
+                 else np.full(len(ms), 1 / len(ms)))
             selected[lab] = [m['name'] for m in ms]
             weights[lab] = {m['name']: float(wi) for m, wi in zip(ms, w)}
             bucket_ic[lab] = float(ics @ w)
@@ -564,6 +551,24 @@ class WalkForwardPortfolio:
             bucket_hl[lab] = (float(sum(wi * h for wi, h in hls)
                                     / max(sum(wi for wi, _ in hls), 1e-12))
                               if hls else None)
+        lag_of = {m['name']: m['lag'] for m in meta}
+        return (selected, weights, lag_of, bucket_ic, bucket_h,
+                bucket_to, bucket_hl)
+
+    # ---------------- one window ----------------
+
+    def run_window(self, idx: int, train_start: pd.Timestamp,
+                   train_end: pd.Timestamp, test_end: pd.Timestamp,
+                   prev: Optional[WindowResult]) -> Optional[WindowResult]:
+        res = WindowResult(idx, train_start, train_end, test_end)
+
+        # This OOS month trades exactly its roll's promoted signals, sized
+        # from discovery metadata. Buckets = distinct promoted lags; weights
+        # within a bucket proportional to train IC (panels are already
+        # direction-applied by compute_signal_panel).
+        meta = self.month_meta.get(pd.Timestamp(train_end), [])
+        (selected, weights, lag_of, bucket_ic, bucket_h,
+         bucket_to, bucket_hl) = self.month_book(meta)
 
         res.selected = selected
         res.weights = weights
@@ -571,16 +576,15 @@ class WalkForwardPortfolio:
         res.bucket_h = bucket_h
         res.bucket_to = bucket_to
         res.n_candidates = len(meta)
-        logging.info(f"W{idx:02d} OOS {train_end.date()}..{test_end.date()}: "
+        logging.debug(f"W{idx:02d} OOS {train_end.date()}..{test_end.date()}: "
                      f"{len(meta)} promoted signals in "
                      f"{len(selected)} lag buckets")
         if not selected:
-            logging.info(f"W{idx:02d}: no promotions this month - no new book "
+            logging.debug(f"W{idx:02d}: no promotions this month - no new book "
                          f"(carried positions re-target next traded month)")
             return res
 
         feat_start = train_end - pd.Timedelta(days=WARMUP_DAYS)
-        lag_of = {m['name']: m['lag'] for m in meta}
         composites = self.composite_scores(selected, weights, feat_start,
                                            train_end, test_end, lag_of=lag_of)
         if not composites:
@@ -620,7 +624,7 @@ class WalkForwardPortfolio:
         res.cost_to_alpha = (sum_cost / sum_alpha) if sum_alpha > 1e-12 else np.nan
         res.net_to_gross = (sum_net / sum_gross) if abs(sum_gross) > 1e-12 else np.nan
         if np.isfinite(res.cost_to_alpha):
-            logging.info(f"  half-alpha: cost/exp_alpha={res.cost_to_alpha:.2f} "
+            logging.debug(f"  half-alpha: cost/exp_alpha={res.cost_to_alpha:.2f} "
                          f"(~0.5 ideal), net/gross={res.net_to_gross:.2f}")
 
         return res
@@ -650,16 +654,11 @@ class WalkForwardPortfolio:
         cap = PORT['max_position']
         gross_target = PORT['gross_leverage']
         # Per-bar trade rate toward the gross-1 aim (cost-responsive; PnL costs
-        # unchanged). This is the SPEED at which the book fills toward the aim.
+        # unchanged). This is the SPEED at which the book fills toward the aim;
+        # the volume-participation cap below is the only hard fill constraint.
         gp = PORT.get('gp_trading', {})
         smooth_alpha = gp_trade_rate(PORT['cost_bps'], gp,
                                      PORT['weight_smoothing_halflife'])
-        # Hard turnover budget -> max voluntary turnover per bar. The trade rate
-        # is throttled below smooth_alpha whenever the aim is far enough that
-        # trading at full speed would breach the annual budget.
-        max_ann_to = PORT.get('max_annual_turnover')
-        per_bar_to_budget = (max_ann_to / (BARS_PER_DAY * 365)
-                             if max_ann_to else np.inf)
         cov_window = pd.Timedelta(days=PORT['cov_window_days'])
         vol_window = pd.Timedelta(days=PORT['residual_vol_window_days'])
         impl_lag = int(WF.get('implementation_lag_bars', 1))
@@ -701,7 +700,7 @@ class WalkForwardPortfolio:
                 h = min(h, float(hl))
             hold_bars[b] = h
         if composites:
-            logging.info(
+            logging.debug(
                 "  holding/persistence (bars): %s",
                 ", ".join(f"{b}:{hold_bars[b]:.0f} (to {(bucket_to or {}).get(b, float('nan')):.2f})"
                           for b in sorted(composites)))
@@ -731,7 +730,7 @@ class WalkForwardPortfolio:
         if gp_on:
             disc = {b: hold_bars[b] / (hold_bars[b] + 1.0 / kappa)
                     for b in composites}
-            logging.info(
+            logging.debug(
                 "  aim discounts (1/kappa=%.0f bars): %s",
                 1.0 / kappa,
                 ", ".join(f"{b}:{d:.3f}" for b, d in disc.items()))
@@ -1059,26 +1058,16 @@ class WalkForwardPortfolio:
             else:
                 w_prev_values = held_values
 
-            # Trade toward the aim at the GP rate, but never more than the
-            # per-bar turnover budget: the voluntary trade is a_eff * |aim - held|,
-            # so cap a_eff at budget / gap. Convex step preserves neutrality and
-            # the cap; gross still floats below the aim. Then re-neutralize.
-            gap = float(np.abs(target_values - w_prev_values).sum())
-            a_eff = min(smooth_alpha, per_bar_to_budget / gap) if gap > 1e-12 else smooth_alpha
-            # Which mechanism sets the trade speed this bar (observability):
-            # True -> the hard turnover budget, False -> the GP rate itself.
-            budget_bound = gap > 1e-12 and per_bar_to_budget / gap < smooth_alpha
+            # Trade toward the aim at the GP rate. Convex step preserves
+            # neutrality and the cap; gross floats below the aim. The
+            # participation clamp below is the only hard fill constraint.
+            a_eff = smooth_alpha
             # Liquidity-aware trade SPEED: liquid names fill toward the aim
             # faster, illiquid ones slower (impact persists -> trade slowly).
-            # Per-name rate a_i = clip(a_eff * speed_mult_i, 0, 1); re-throttle
-            # if the per-name trade breaches the turnover budget.
             if liq_on:
                 a_vec = np.clip(a_eff * speed_values, 0.0, 1.0)
-                trade = a_vec * (target_values - w_prev_values)
-                vol_to = float(np.abs(trade).sum())
-                if vol_to > per_bar_to_budget and vol_to > 1e-12:
-                    trade = trade * (per_bar_to_budget / vol_to)
-                w_new_values = w_prev_values + trade
+                w_new_values = (w_prev_values
+                                + a_vec * (target_values - w_prev_values))
             else:
                 w_new_values = (1 - a_eff) * w_prev_values + a_eff * target_values
             # Volume-participation cap: per-name |trade| <= max_dw this bar.
@@ -1207,7 +1196,6 @@ class WalkForwardPortfolio:
                 'n_positions': int(nz.sum()),
                 'n_at_cap': n_capped,
                 'trade_rate': float(a_eff),
-                'budget_bound': bool(budget_bound),
                 'n_vol_capped': n_vol_capped,
                 'vol_trade_blocked': vol_blocked,
                 'cov_eig_top_share': cov_eig_top_share,
@@ -1230,21 +1218,16 @@ class WalkForwardPortfolio:
         if not rows:
             return None
 
-        # Binding-constraint summary (production scheme): if the turnover budget
-        # binds on ~all bars, the GP trade_urgency knob is inert and the budget
-        # alone sets the book's speed - worth knowing before tuning either.
         if risk_rows:
-            n_bound = sum(1 for r in risk_rows if r['budget_bound'])
             rates = np.array([r['trade_rate'] for r in risk_rows], dtype=float)
-            logging.info(
+            logging.debug(
                 f"  trade speed: nominal {smooth_alpha:.4f}/bar, median "
-                f"effective {float(np.median(rates)):.5f}/bar; turnover budget "
-                f"binding on {n_bound / len(risk_rows):.0%} of bars")
+                f"effective {float(np.median(rates)):.5f}/bar")
             if part_on:
                 n_pb = sum(1 for r in risk_rows if r['n_vol_capped'] > 0)
                 blocked = float(np.mean([r['vol_trade_blocked']
                                          for r in risk_rows]))
-                logging.info(
+                logging.debug(
                     f"  participation cap ({part_rate:.0%} of "
                     f"{part_window_bars}-bar "
                     f"avg $vol, book ${book_size:,.0f}): binding for >=1 name "

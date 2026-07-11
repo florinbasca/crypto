@@ -524,40 +524,35 @@ config = {
         # deflation haircut cannot repair - hence the hard train/select split.
         # Scales are FIXED constants (not batch-relative) so rewards are
         # comparable across generations, rolls and resumed runs.
-        # IC is the ONLY performance term (signals are scored gross - cost is
-        # a property of execution, judged at the portfolio layer, never of a
-        # signal). ic_tstat is the CAPTURE-WEIGHTED day-equivalent train
-        # t-stat at the candidate's best per-bet lag:
+        # The performance term is the PER-BET RETURN (alpha in return
+        # units: gross-1 dollar-neutral book from the signal, held for the
+        # horizon) - money, not rank IC. Rank IC is recorded as a diagnostic
+        # only: this crop proved a signal can order names correctly (rank IC
+        # t~15 at 1d) while the large moves run against it (negative dollars).
+        # alpha_tstat is the CAPTURE-WEIGHTED day-equivalent train t of that
+        # per-bet return at the candidate's best lag:
         #   t / sqrt(stamps per day)  x  1/(1 + phi/kappa)
-        # The first factor removes the fast-lag sample-size advantage; the
-        # second (phi = ln2 / fitted alpha half-life, kappa = the portfolio
-        # trade rate) is the fraction of the IC a book trading at kappa can
-        # actually be exposed to - NOT a cost model: duration, not bps. At
-        # kappa ~ 0.048/bar: 1h half-life keeps 0.29 of its t, 6h 0.71,
-        # 12h 0.83, 2d+ ~0.95 - the search breeds toward persistence.
-        # liquid_ic_ratio is itself an IC (liquid-half vs full).
-        # incremental is the train IC the candidate ADDS to the current
-        # survivor book (combined pooled IC minus the book's own IC): rewards
-        # MARGINAL edge, not another copy of the dominant signal (AlphaGen /
-        # Lucky-Factors). 0 disables (skips the extra IC computations).
-        # complexity/instability/similarity are search hygiene, not
-        # economics: parsimony, train-thirds consistency, and population
-        # diversity.
+        # (phi = ln2 / effective persistence, kappa = the GP trade rate).
+        # liquid_alpha_ratio is the liquid-half alpha vs the full book.
+        # incremental is the train per-bet return the candidate ADDS to the
+        # current survivor book. Scale is in return units (~1bp per bet).
+        # complexity/instability/similarity are search hygiene; instability
+        # is the std of per-bet alpha across train thirds (return units).
         'reward': {
             'weights': {
-                'ic_tstat': 1.0,
-                'liquid_ic_ratio': 0.25,
+                'alpha_tstat': 1.0,
+                'liquid_alpha_ratio': 0.25,
                 'incremental': 0.5,
                 'complexity': -0.15,
                 'instability': -0.75,
                 'similarity': -0.5,
             },
             'scales': {
-                'ic_tstat': 2.0,
-                'liquid_ic_ratio': 1.0,
-                'incremental': 0.01,
+                'alpha_tstat': 2.0,
+                'liquid_alpha_ratio': 1.0,
+                'incremental': 0.0001,
                 'complexity': 10.0,
-                'instability': 0.05,
+                'instability': 0.0005,
                 'similarity': 0.5,
             },
         },
@@ -565,9 +560,11 @@ config = {
         'promotion': {
             'fdr_alpha': 0.10,
             'fdr_method': 'by',              # 'by' or 'bh'
-            'min_select_ic_tstat': 2.0,
+            # Minimum directed select t on the PER-BET RETURN (not rank IC)
+            # at a promoted lag.
+            'min_select_alpha_tstat': 2.0,
             # Select-window p-values use Student-t with (n_days - 1) dof: a
-            # 1-month select gives ~30 daily IC observations, where the
+            # 1-month select gives ~30 daily alpha observations, where the
             # normal approximation is anti-conservative.
             # A survivor promotes if ANY lag of its profile clears the gates;
             # multiplicity is priced by the deflation haircut over the ACTUAL
@@ -576,11 +573,11 @@ config = {
             # never touches select (train-only reward), so trials that never
             # looked at select do not inflate the bar. 0 disables.
             'deflation_mult': 1.0,
-            # Minimum daily IC observations behind a select t-stat.
+            # Minimum daily alpha observations behind a select t-stat.
             'min_select_days': 20,
-            # Fraction of profile lags whose train IC agrees in sign with the
-            # traded direction: a genuine alpha term structure has one sign
-            # across horizons; a mixed profile is a red flag.
+            # Fraction of profile lags whose train alpha agrees in sign with
+            # the traded direction: a genuine alpha term structure has one
+            # sign across horizons; a mixed profile is a red flag.
             'min_profile_sign_agreement': 0.75,
             'max_book_corr': 0.5,            # signal corr vs already-promoted book
             # Consecutive-roll survival required before promotion. 1 =
@@ -590,33 +587,21 @@ config = {
             'min_rolls_survived': 1,
             'max_book_size': 15,      # per roll (the book re-forms every roll)
             # Capture floor: minimum persistence weight 1/(1 + phi/kappa) a
-            # candidate needs to promote. 0.5 = alpha half-life of at least
-            # ~1/kappa bars (~2.4h at the current trade rate): the book
-            # structurally cannot hold anything faster long enough to
-            # matter. 0 disables. Duration-based, never a cost model.
+            # candidate needs to promote. phi uses EFFECTIVE persistence
+            # min(alpha half-life, position life lag/turnover); kappa is the
+            # GP fill rate the walk-forward trades at (~0.048/bar). 0.5 =
+            # effective persistence of at least ~15 bars (~2.4h). 0 disables.
+            # Duration-based, never a cost model.
             'min_capture': 0.5,
-            # Turnover CEILING: the direct-measurement sibling of the capture
-            # floor. Rejects a signal whose per-bar book churn (0.5*sum|dw| on
-            # the gross-1 signal, ledger 'turnover' column) exceeds this, i.e.
-            # the untradeable-standalone case where alpha persists but positions
-            # are noisy - which the (half-life-derived) capture floor misses.
-            # Raw signal turnover OVERSTATES what the smoothed book trades, so
-            # this is meant to catch EXTREMES, not fine-tune. Calibrate from the
-            # ledger's turnover distribution among promoted signals. None (or a
-            # non-finite value) DISABLES it - the default, so it never changes an
-            # in-flight run or resume unless you opt in.
-            'max_turnover': None,
-        },
-        # ML probe: gradient boosting on ALL resolved primitives, fit on TRAIN,
-        # scored on SELECT. Its IC is the predictability CEILING (upper bound)
-        # of the feature set at each horizon.
-        'ml_probe': {
-            'max_iter': 200,
-            'max_depth': 3,
-            'learning_rate': 0.05,
-            'min_samples_leaf': 200,
-            'l2_regularization': 1.0,
-            'subsample_rows': 200000,        # cap training rows (recent-biased)
+            # Turnover CEILING: rejects a signal whose per-bar book churn
+            # (0.5*sum|dw| on the gross-1 signal, ledger 'turnover' column)
+            # exceeds the cap. Arithmetic behind 0.01: tracking a signal that
+            # churns X/bar costs 2 x cost_bps x X x 144 per day; at X = 0.01
+            # that is ~14bps/day - already past any daily alpha measured here,
+            # so this is a loose extremes-killer (the 0.1-0.6 churners), with
+            # the graded discount below the cap left to the capture weight.
+            # None disables.
+            'max_turnover': 0.01,
         },
         # LLM proposer (untrusted: sees compressed diagnostics only, emits DSL
         # JSON; everything it returns is re-validated and re-scored by code).
@@ -834,17 +819,13 @@ config = {
             'meme':     0.10,
         },
         'weight_smoothing_halflife': 6,      # legacy fixed EWM rate (fallback only)
-        # HARD turnover budget (x gross per year); None -> uncapped. Also
-        # sets the effective fill rate kappa and thereby the 'auto' selection
-        # speed floor (f/(1-f)/kappa bars): at 100 the floor is ~93 bars of
-        # persistence; a much tighter budget excludes every signal.
-        'max_annual_turnover': 100,
+        # No global turnover budget: the volume-participation cap below is the
+        # only hard fill constraint (a budget throttled the fill to ~3.6 days
+        # on 1-day alpha and flipped a +52% OOS composite into a losing book).
         # Garleanu-Pedersen multi-period trading toward the gross-1 aim. Two pieces:
         # 1) TRADE RATE (per bar): the myopic optimal gamma/(gamma+lambda) balance
         #    of off-aim penalty vs quadratic trade cost, made COST-RESPONSIVE:
         #        omega = trade_urgency * (ref_cost_bps / cost_bps);  rate = omega/(1+omega)
-        #    Set LOW here to trade SLOWLY toward the target (~0.001 ~ 5-day
-        #    halflife, ~15x/yr turnover); max_annual_turnover is the hard backstop.
         #    null -> fall back to the fixed halflife. PnL costs unchanged (linear).
         # 2) AIM DISCOUNT: bucket alpha scaled by h/(h + 1/rate) - alpha that decays
         #    faster than the (slow) trade rate can't be monetized, so it is
