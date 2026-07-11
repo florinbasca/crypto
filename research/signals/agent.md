@@ -170,9 +170,10 @@ uv run research/signals/discovery.py --resume   # continue an interrupted run
 uv run research/signals/inspect_discovery.py    # review a run
 ```
 
-Promoted signals become `disc_*` registry entries (`research/lib/discovered.py`),
-tradable in the walk-forward only from their promotion date. All knobs live under
-`discovery.*` in `config.py`.
+Promoted signals become `disc_*` registry entries (`research/lib/discovered.py`).
+The walk-forward mirrors discovery month by month: each roll's promoted signals
+are traded in that roll's OOS month only. All knobs live under `discovery.*` in
+`config.py`.
 
 ## Cost and run time
 

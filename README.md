@@ -27,8 +27,8 @@ uv run risk_model/features.py
 # 3. Agentic signal discovery: multi-lag LLM search over the feature panel
 uv run research/signals/discovery.py
 
-# 4. Portfolio walk-forward: scores the discovered signals, then
-#    builds and backtests a factor-neutral portfolio.
+# 4. Portfolio walk-forward: one window per discovery roll - each OOS month
+#    trades that month's promoted signals in a factor-neutral MVO backtest.
 uv run research/portfolio/walk_forward.py
 ```
 
@@ -87,8 +87,8 @@ uv run research/signals/inspect_discovery.py             # review a run
 
 Uses `gemini-3.1-flash-lite` (config `discovery.llm`, key in `.env` as `LLM_KEY=...`).
 Promotions land in `discovery_promotions` and become `disc_*` registry entries
-(`research/lib/discovered.py`), which the walk-forward then scores and trades —
-each only from its promotion date onward (using it earlier would be look-ahead).
+(`research/lib/discovered.py`). The walk-forward trades each roll's promoted
+signals in that roll's OOS month only — the month discovery never saw.
 
 **The full design — DSL grammar, the LLM prompt, the reward, the promotion
 gates, the walk-forward windows — is documented in

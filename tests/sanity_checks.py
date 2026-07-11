@@ -550,28 +550,6 @@ check("fill rate: kappa = min(GP rate, budget-allowed rate)",
       np.isclose(kappa_eff, exp_kappa),
       f"(nominal {nominal_rate:.4f}, kappa {kappa_eff:.5f})")
 
-lag_floor = wfmod.resolve_min_holding_lag()
-mhl_cfg = wfmod.WF.get('min_holding_lag_bars')
-if mhl_cfg == 'auto' and gp_cfg.get('enabled'):
-    frac = float(wfmod.WF['min_monetizable_alpha_fraction'])
-    disc = lambda h: h / (h + 1.0 / kappa_eff)
-    check("speed floor: smallest lag whose aim discount clears the fraction",
-          lag_floor >= 1 and disc(lag_floor) >= frac
-          and (lag_floor == 1 or disc(lag_floor - 1) < frac),
-          f"(floor {lag_floor} bars, discount {disc(lag_floor):.3f} >= {frac})")
-else:
-    check("speed floor: manual config passthrough",
-          lag_floor == int(mhl_cfg or 0), f"(floor {lag_floor})")
-
-# corr().values can be READ-ONLY under pandas copy-on-write; breadth /
-# combination must take writable copies before fill_diagonal (regression:
-# ValueError "underlying array is read-only" crashed select_decay).
-rets_cow = pd.DataFrame(rng.normal(size=(60, 3)), columns=list('abc'),
-                        index=pd.date_range('2024-01-01', periods=60))
-eb_cow = wfmod.SignalSelector._effective_breadth(rets_cow, list('abc'))
-check("selector: effective breadth CoW-safe", 1.0 <= eb_cow <= 3.0,
-      f"(effN {eb_cow:.2f})")
-
 # ---------------------------------------------------------------------------
 # 16. Point-in-time universe membership: spell evolution + interval mask
 # ---------------------------------------------------------------------------

@@ -1,31 +1,22 @@
 """
-Walk-Forward Market-Neutral Portfolio.
+Walk-Forward Market-Neutral Portfolio - the per-month mirror of discovery.
 
-Per rolling window (train_months -> test_days):
-1. SCORE the promoted disc_* signals in memory (signal_eval.score_registry),
-   then SELECT per window (training data only, from the daily aggregates):
-   - Pooled IC stats per (signal, horizon); Bonferroni correction across
-     horizons and Benjamini-Yekutieli FDR across dependent signal variants.
-   - Threshold filters (IC band, ICIR, Sharpe of daily net returns, turnover).
-   - Composite ranking, family cap, greedy de-correlation on daily returns.
-2. COMBINE: recompute selected signals at full resolution on the test window
-   using the same full-history/current-universe convention as research, then
-   IC/cost-weight.
-3. ALPHA (Grinold): alpha_i[t] = sum_h IC_h * sigma_i * z_{i,h}[t] / sqrt(p_h)
-   where IC_h is the pooled training IC of the horizon composite, sigma_i the
-   per-asset single-bar residual vol, p_h the horizon length in bars.
-4. OPTIMIZE: Ledoit-Wolf shrunk-covariance MVO on single-bar RESIDUAL
-   returns (refreshed daily), under equality constraints [dollar,
-   market/size/momentum/vol beta] within neutrality bands, per-name cap and
-   gross leverage 1 scaled by expected-edge-vs-cost.
-5. BACKTEST at asset level on RAW forward returns (the honest test - the
-   neutrality constraints, not the residual bookkeeping, must do the hedging),
-   with per-side costs on turnover, a volume-participation cap on per-bar
-   trades (portfolio.participation: no name trades more than a fraction of
-   its trailing average bar $ volume, converted to weight units by the
-   configured book size), and perp funding accrued on held positions at
-   settlement stamps (longs pay positive rates). Realized factor exposures
-   are tracked and reported - this is the market-neutrality acceptance check.
+One window per discovery roll. Roll r's signals were discovered on its train +
+select months, which end exactly where its OOS month begins (with a purge so
+forward targets cannot cross the boundary) - the traded month was never seen
+by the discovery that produced its signals. Each OOS month trades exactly its
+roll's promoted signals; no scoring pipeline, no re-selection.
+
+1. COMBINE: each signal is recomputed on the OOS month and z-scored per bar;
+   signals sharing a holding lag are averaged into one composite, weighted by
+   their discovery train IC. A composite becomes an expected residual return
+   per name by scaling with the name's residual vol and the bucket's IC,
+   discounted for how much of it a slow book captures before it decays.
+2. OPTIMIZE: mean-variance on a daily-refreshed shrunk covariance. The
+   portfolio is optimized to be dollar- and factor-neutral within the
+   configured bands (portfolio.neutrality_band), per-name cap, gross 1.
+3. BACKTEST on raw forward returns, reported gross AND net of per-side
+   trading costs, participation caps, the turnover budget, and perp funding.
 
 Outputs: wf_portfolio_returns, wf_portfolio_windows, wf_portfolio_exposures.
 """
@@ -49,16 +40,13 @@ from dbutil import load_data, save_data, delete_table, delete_rows_where, _scan
 from config import (config as global_config, get, horizon_col,
                     horizon_bars, BASE_FREQUENCY, BARS_PER_DAY)
 from research.lib.portfolio_opt import (shrunk_covariance, solve_constrained_mvo,
-                                              benjamini_hochberg,
-                                              benjamini_yekutieli,
                                               residual_clusters,
                                               cluster_penalty_matrix)
 from research.lib.signal_eval import (build_registry, compute_signal_panel,
                                       effective_halflife_for,
                                       signal_feature_columns,
                                       load_universe_membership,
-                                      universe_member_mask, score_registry,
-                                      LAG_GRID, SCREENING_GRID, lag_label)
+                                      universe_member_mask, SCREENING_GRID)
 
 warnings.filterwarnings('ignore')
 # INFO to stdout; force=True so it wins even if a module configured first.
@@ -90,76 +78,6 @@ LEGACY_BACKTEST_TABLES = ('wf_portfolio_equity', 'wf_portfolio_returns_ew',
                           'wf_portfolio_returns_bench')
 
 
-def _nw_tstat(x: np.ndarray, lags='auto') -> float:
-    """Newey-West (Bartlett) HAC t-stat for the mean of a serially-correlated
-    series. Daily cross-sectional ICs persist across days, so the iid t-stat
-    mean/(std/sqrt(N)) is optimistic; this widens the SE for that persistence."""
-    x = np.asarray(x, dtype=float)
-    x = x[~np.isnan(x)]
-    n = len(x)
-    if n < 3:
-        return 0.0
-    e = x - x.mean()
-    var = float(e @ e) / n                       # gamma_0
-    L = (int(np.floor(4 * (n / 100.0) ** (2.0 / 9.0)))
-         if lags in ('auto', None) else int(lags))
-    L = max(0, min(L, n - 1))
-    for k in range(1, L + 1):
-        w = 1.0 - k / (L + 1.0)                   # Bartlett kernel
-        var += 2.0 * w * float(e[k:] @ e[:-k]) / n
-    if var <= 0:
-        return 0.0
-    return float(x.mean() / np.sqrt(var / n))
-
-
-def grouped_nw_tstat(dd: pd.DataFrame, lags='auto') -> pd.Series:
-    """Vectorized Newey-West HAC t-stat of the mean, per signal_name.
-
-    Bit-for-bit equivalent to grouping `dd` by signal_name and applying
-    `_nw_tstat` to each group's date-ordered `ic_day` series, but computed with
-    grouped numpy ops instead of a per-signal Python apply (the relevance phase
-    runs over the full candidate set every window, so this is the hot loop).
-
-    `dd` needs columns ['signal_name', 'date', 'ic_day']; NaN ic_day rows are
-    dropped exactly as `_nw_tstat` drops them per group. Returns a Series indexed
-    by signal_name (signals with <3 finite obs or non-positive variance -> 0.0,
-    matching `_nw_tstat`).
-    """
-    sub = dd[['signal_name', 'date', 'ic_day']]
-    sub = sub[np.isfinite(sub['ic_day'].to_numpy())]
-    if sub.empty:
-        return pd.Series(dtype=float)
-    # Contiguous, date-ordered groups (sort within group preserved by mergesort).
-    sub = sub.sort_values(['signal_name', 'date'], kind='mergesort')
-    x = sub['ic_day'].to_numpy(dtype=float)
-    codes, uniq = pd.factorize(sub['signal_name'].to_numpy(), sort=False)
-    G = len(uniq)
-    n = np.bincount(codes, minlength=G).astype(float)
-    mean = np.bincount(codes, weights=x, minlength=G) / n
-    e = x - mean[codes]                                   # demeaned within group
-    s0 = np.bincount(codes, weights=e * e, minlength=G)   # gamma_0 * n
-
-    if lags in ('auto', None):
-        L = np.floor(4.0 * (n / 100.0) ** (2.0 / 9.0)).astype(int)
-    else:
-        L = np.full(G, int(lags), dtype=int)
-    L = np.clip(L, 0, (n - 1).astype(int))
-
-    accum = np.zeros(G)
-    for k in range(1, int(L.max()) + 1 if G else 1):
-        same = codes[k:] == codes[:-k]                    # within-group pairs only
-        prod = np.where(same, e[k:] * e[:-k], 0.0)
-        sk = np.bincount(codes[k:], weights=prod, minlength=G)  # gamma_k * n
-        w = np.where(L >= k, 1.0 - k / (L + 1.0), 0.0)    # Bartlett kernel
-        accum += 2.0 * w * sk
-
-    var = (s0 + accum) / n                                # long-run variance
-    tstat = np.zeros(G)
-    good = (n >= 3) & (var > 0)
-    tstat[good] = mean[good] / np.sqrt(var[good] / n[good])
-    return pd.Series(tstat, index=uniq)
-
-
 def gp_trade_rate(cost_bps: float, gp: dict, legacy_halflife: float) -> float:
     """Per-bar trade rate: the fraction of the gap to the aim portfolio traded
     each bar (book_t = (1-rate)*book_{t-1} + rate*aim_t).
@@ -186,9 +104,7 @@ def effective_fill_rate() -> Tuple[float, float]:
     the rate at which the book can ACTUALLY close the gap to the aim once the
     hard `max_annual_turnover` budget is accounted for (at realistic settings
     the budget binds long before the nominal rate). This one quantity drives
-    BOTH the aim discount in `_backtest_window` and the selection speed floor
-    (`resolve_min_holding_lag`), so the two layers cannot disagree about how
-    fast alpha can be monetized.
+    the aim discount in `_backtest_window`.
     """
     gp = PORT.get('gp_trading', {})
     nominal = gp_trade_rate(PORT['cost_bps'], gp,
@@ -201,32 +117,6 @@ def effective_fill_rate() -> Tuple[float, float]:
         realized = per_bar_budget / max(PORT['gross_leverage'], 1e-9)
         kappa = max(min(kappa, realized), 1e-9)
     return nominal, kappa
-
-
-def resolve_min_holding_lag() -> int:
-    """Selection speed floor (bars). 'auto' derives it from execution speed.
-
-    The backtest discounts each bucket's alpha by h/(h + 1/kappa) (Garleanu-
-    Pedersen aim discount at the effective fill rate). A signal whose holding
-    lag retains less than `min_monetizable_alpha_fraction` of its alpha after
-    that discount enters the composite at near-zero scale, so selecting it
-    wastes a slot on a signal the executor then ignores. 'auto' solves
-    h/(h + 1/kappa) >= f  =>  h >= f/(1-f) * (1/kappa): the floor moves WITH
-    the turnover budget / trade urgency instead of being an independently
-    tuned knob that can contradict them. An integer config value keeps a
-    manual floor (0 = off); with gp_trading disabled no aim discount is
-    modeled, so 'auto' resolves to 0.
-    """
-    cfg = WF.get('min_holding_lag_bars', 0)
-    if cfg != 'auto':
-        return int(cfg or 0)
-    if not PORT.get('gp_trading', {}).get('enabled', False):
-        return 0
-    frac = float(WF.get('min_monetizable_alpha_fraction', 0.0))
-    if not 0.0 < frac < 1.0:
-        return 0
-    _, kappa = effective_fill_rate()
-    return int(np.ceil(frac / (1.0 - frac) / kappa))
 
 
 def edge_gross_multiplier(exp_edge: float, rt_cost: float,
@@ -266,51 +156,6 @@ def cost_holding_bars(lag_bars: float, turnover: Optional[float],
     return float(min(h / min(float(turnover), 2.0), cap))
 
 
-def filter_valid_from(stats: pd.DataFrame, valid_from: Dict[str, pd.Timestamp],
-                      train_end: pd.Timestamp) -> pd.DataFrame:
-    """Drop signals whose DEFINITION did not exist by this window's train end.
-
-    Discovered (disc_*) signals carry valid_from = their promotion date: the
-    search that produced their expression saw data up to that point, so
-    selecting them in earlier windows would be time travel - the walk-forward
-    would trade a formula chosen with future knowledge. Curated spaces carry
-    no valid_from and always pass. Applied BEFORE the FDR step so not-yet-
-    existing signals don't consume FDR budget either."""
-    if stats.empty or not valid_from:
-        return stats
-    vf = stats['signal_name'].map(valid_from)
-    return stats[vf.isna() | (vf <= pd.Timestamp(train_end))]
-
-
-def _lag_bars_from_label(horizon) -> Optional[int]:
-    """Holding lag in bars from a daily-stats horizon label ('36b' -> 36).
-    None for labels that don't encode a bar count."""
-    s = str(horizon)
-    if s.endswith('b') and s[:-1].isdigit():
-        return int(s[:-1])
-    return None
-
-
-def selection_cost_rate(lag_bars: Optional[int]) -> float:
-    """Per-side cost RATE charged against a signal's own turnover in selection
-    (window_stats sharpe_net / net_ret_mean).
-
-    Execution-matched: the screening backtest re-optimizes at every stamp, but
-    the book fills toward the aim at the effective rate kappa, so within one
-    holding period of h bars only ~h/(h + 1/kappa) of the aim turnover is
-    actually executed - the SAME Garleanu-Pedersen factor that discounts the
-    alpha side (see _backtest_window ic_scale). Charging the full standalone-
-    replication cost priced signals as if the book re-optimized stamp by
-    stamp, which at realistic cost_bps rejected 93-96% of FDR survivors for
-    turnover the executor never pays. Applies only while gp_trading models an
-    aim fill (mirrors ic_scale). Unknown lag -> full cost (conservative)."""
-    cost = PORT['cost_bps'] / 10000.0
-    if (lag_bars is None
-            or not PORT.get('gp_trading', {}).get('enabled', False)):
-        return cost
-    _, kappa = effective_fill_rate()
-    h = max(float(lag_bars), 1.0)
-    return cost * h / (h + 1.0 / max(kappa, 1e-9))
 
 
 def liquidity_multipliers(adv: pd.Series, cfg: dict) -> Tuple[pd.Series, pd.Series]:
@@ -375,7 +220,6 @@ class WindowResult:
     horizon_ic: Dict[str, float] = field(default_factory=dict)     # bucket -> |IC|
     bucket_h: Dict[str, float] = field(default_factory=dict)       # bucket -> half-life (bars)
     bucket_to: Dict[str, float] = field(default_factory=dict)      # bucket -> per-rebalance turnover
-    eff_breadth: Dict[str, float] = field(default_factory=dict)
     n_candidates: int = 0
     oos_returns: Optional[pd.DataFrame] = None
     oos_sharpe: float = np.nan
@@ -386,504 +230,8 @@ class WindowResult:
     avg_abs_size_exposure: float = np.nan
     cost_to_alpha: float = np.nan   # half-alpha: costs / expected gross alpha
     net_to_gross: float = np.nan    # realized: sum(net) / sum(gross)
-    train_oos_ic_rank_corr: float = np.nan
-    train_oos_ic_sign_accuracy: float = np.nan
-    selection_counts: Dict[str, int] = field(default_factory=dict)
-    signal_attribution: List[dict] = field(default_factory=list)  # per-signal OOS edge
     oos_weights: Optional[pd.DataFrame] = None   # per-bar held weight per name
     oos_risk: Optional[pd.DataFrame] = None       # per-bar predicted risk / cov diagnostics
-
-
-# =============================================================================
-# Selection from daily aggregates
-# =============================================================================
-
-class SignalSelector:
-    def __init__(self, daily_stats: pd.DataFrame,
-                 signal_categories: Optional[Dict[str, str]] = None,
-                 signal_valid_from: Optional[Dict[str, pd.Timestamp]] = None):
-        ds = daily_stats.copy()
-        ds['date'] = pd.to_datetime(ds['date'])
-        self.daily = ds
-        self.daily_by_horizon = {
-            h: g.reset_index(drop=True)
-            for h, g in ds.groupby('horizon', sort=False)
-        }
-        self.signal_categories = signal_categories or {}
-        # signal_name -> earliest date its DEFINITION existed (discovered
-        # signals: promotion date). Enforced per window in select_decay.
-        self.signal_valid_from = signal_valid_from or {}
-        self.last_candidate_stats = pd.DataFrame()
-        self.last_rets = pd.DataFrame()   # selected signals' training daily returns
-        self.last_selection_counts: Dict[str, int] = {}
-        # Speed floor derived from the execution layer (or the manual config
-        # value); resolved once - it is a pure function of config.
-        self.min_holding_lag = resolve_min_holding_lag()
-        nominal, kappa = effective_fill_rate()
-        logging.info(
-            f"Selection speed floor: holding lag >= {self.min_holding_lag} bars "
-            f"(min_holding_lag_bars={WF.get('min_holding_lag_bars', 0)!r}; "
-            f"trade rate nominal {nominal:.4f}/bar, effective fill rate "
-            f"{kappa:.5f}/bar -> 1/kappa = {1.0 / kappa:.0f} bars)")
-
-    def _daily_slice(self, horizon: str, start: pd.Timestamp,
-                     end: pd.Timestamp,
-                     signals: Optional[List[str]] = None) -> pd.DataFrame:
-        d = self.daily_by_horizon.get(horizon)
-        if d is None:
-            return pd.DataFrame(columns=self.daily.columns)
-        mask = (d['date'] >= start) & (d['date'] < end)
-        if signals is not None:
-            mask &= d['signal_name'].isin(signals)
-        return d.loc[mask]
-
-    @staticmethod
-    def purged_end(lag: int, end: pd.Timestamp) -> pd.Timestamp:
-        """Purged train end: drop the tail whose forward targets reach into
-        the test period (an IC stamped on the last training day uses returns
-        from the first test day - selection would peek across the boundary)."""
-        purge_days = int(np.ceil(lag / BARS_PER_DAY))
-        return end - pd.Timedelta(days=purge_days)
-
-    def window_stats(self, horizon: str, start: pd.Timestamp,
-                     end: pd.Timestamp) -> pd.DataFrame:
-        """Pooled per-signal stats on [start, end) for one horizon.
-
-        Direction is resolved here: 'sign' is the sign of the training IC.
-        IC diagnostics and gross Sharpe are reported for the signal traded in
-        that direction, so negative-IC signals can be selected as anti-signals.
-        """
-        d = self._daily_slice(horizon, start, end)
-        if d.empty:
-            return pd.DataFrame()
-
-        g = d.groupby('signal_name')
-        n = g['n_cs'].sum()
-        ic_mean = g['ic_sum'].sum() / n
-        ic_var = g['ic_sumsq'].sum() / n - ic_mean ** 2
-        ic_std = np.sqrt(ic_var.clip(lower=0))
-        # Newey-West HAC t-stat on the DAILY IC series (serially correlated
-        # across days), not the iid pooled t over all cross-sections.
-        dd = d.assign(ic_day=d['ic_sum'] / d['n_cs'].replace(0, np.nan))
-        tstat = grouped_nw_tstat(dd, IC_HAC_LAGS).reindex(ic_mean.index).fillna(0.0)
-        sign = np.where(ic_mean.values >= 0, 1.0, -1.0)
-
-        ret = g['ret_gross'].mean()
-        ret_std = g['ret_gross'].std()
-        ret_f = -g['ret_gross'].mean()
-        ret_f_std = g['ret_gross'].std()
-        n_days = g['ret_net'].count()
-        sharpe = (ret / ret_std.replace(0, np.nan)) * np.sqrt(365)
-        sharpe_f = (ret_f / ret_f_std.replace(0, np.nan)) * np.sqrt(365)
-
-        # Cost-aware (net) edge in the TRADED direction. The gross Sharpe above is
-        # what the signal would earn if trading were free; the economic floor is
-        # the Sharpe AFTER paying the per-side cost on the signal's own rebalance
-        # turnover. Many high-gross-IC short-horizon signals are net-NEGATIVE -
-        # their few-bp edge never clears a round trip - so gating on gross alone
-        # admits signals the book then loses money trading. The cost is
-        # amortized by the GP fill factor at this horizon's holding lag
-        # (selection_cost_rate): the gate prices the turnover the executor
-        # actually trades, not full stamp-by-stamp replication.
-        cost = selection_cost_rate(_lag_bars_from_label(horizon))
-        sign_map = dict(zip(ic_mean.index, sign))
-        net_row = (d['signal_name'].map(sign_map) * d['ret_gross']
-                   - d['turnover'] * cost)
-        gn = net_row.groupby(d['signal_name'])
-        net_ret = gn.mean().reindex(ic_mean.index)
-        net_std = gn.std().reindex(ic_mean.index)
-        sharpe_net = (net_ret / net_std.replace(0, np.nan)) * np.sqrt(365)
-
-        turnover = g['turnover'].sum() / g['n_rebalances'].sum().replace(0, np.nan)
-
-        # Stability: IC sign agreement across window thirds. A pooled IC made
-        # entirely in the first third is a decayed signal, not a live one.
-        span = max((end - start).total_seconds(), 1.0)
-        third = (((d['date'] - start).dt.total_seconds() / span) * 3
-                 ).clip(upper=2.999).astype(int)
-        g3 = d.groupby(['signal_name', third])
-        ic3 = (g3['ic_sum'].sum() / g3['n_cs'].sum()).unstack()
-        pooled_sign = pd.Series(sign, index=ic_mean.index)
-        stable = ic3.apply(lambda col: np.sign(col) == pooled_sign).sum(axis=1)
-        stable = stable.reindex(ic_mean.index).fillna(0)
-        recent = (np.sign(ic3.get(2, pd.Series(index=ic3.index, dtype=float))) ==
-                  pooled_sign).reindex(ic_mean.index).fillna(False)
-
-        # Liquid-half IC and Q5-Q1 tail spread (columns exist for stats
-        # produced by the current scorer; NaN-safe otherwise)
-        if 'liq_ic_sum' in d.columns:
-            ic_liq = g['liq_ic_sum'].sum() / g['n_liq'].sum().replace(0, np.nan)
-        else:
-            ic_liq = pd.Series(np.nan, index=ic_mean.index)
-        if 'qs_sum' in d.columns:
-            q_spread = g['qs_sum'].sum() / g['n_qs'].sum().replace(0, np.nan)
-        else:
-            q_spread = pd.Series(np.nan, index=ic_mean.index)
-
-        out = pd.DataFrame({
-            'signal_name': ic_mean.index,
-            'ic_mean': ic_mean.values,
-            'sign': sign,
-            'ic_std': ic_std.values,
-            'ic_tstat': tstat.values,
-            'icir': (ic_mean / ic_std.replace(0, np.nan)).values,
-            'sharpe': np.where(sign > 0, sharpe.values, sharpe_f.values),
-            'sharpe_net': sharpe_net.values,
-            'net_ret_mean': net_ret.values,
-            'avg_turnover': turnover.values,
-            'stable_thirds': stable.values,
-            'recent_third_consistent': recent.values,
-            'ic_liquid': ic_liq.reindex(ic_mean.index).values,
-            'q_spread': q_spread.reindex(ic_mean.index).values,
-            'n_obs': n.values,
-            'n_days': n_days.values,
-        })
-        return out.dropna(subset=['ic_mean'])
-
-    def daily_returns_matrix(self, horizon: str, signals: List[str],
-                             start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        d = self._daily_slice(horizon, start, end, signals)
-        if d.empty:
-            return pd.DataFrame()
-        return d.pivot_table(index='date', columns='signal_name',
-                             values='ret_net', aggfunc='first')
-
-    def signed_daily_returns(self, horizon: str, signal: str, sign: float,
-                             start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
-        """Daily gross return with the selected signal direction applied."""
-        d = self._daily_slice(horizon, start, end, [signal])
-        if d.empty:
-            return pd.Series(dtype=float)
-        d = d.set_index('date')
-        return sign * d['ret_gross']
-
-    def horizon_stats(self, start: pd.Timestamp,
-                      end: pd.Timestamp) -> pd.DataFrame:
-        """
-        Select each signal's strongest directly observed forward-return lag.
-
-        Cumulative-forward-return IC across horizons is not an exponential
-        decay curve, so each signal is pinned to the lag with the largest
-        absolute HAC t-stat, and `p_horizon` Bonferroni-adjusts that lag's
-        p-value for the lag-grid search (consumed by the FDR pre-filter).
-        """
-        per_lag = {}
-        for lag in LAG_GRID:
-            st = self.window_stats(lag_label(lag), start,
-                                   self.purged_end(lag, end))
-            if not st.empty:
-                per_lag[lag] = st.set_index('signal_name')
-        if not per_lag:
-            return pd.DataFrame()
-
-        all_sigs = sorted(set().union(*[set(s.index) for s in per_lag.values()]))
-        lags = np.array(sorted(per_lag.keys()), dtype=float)
-
-        tstat = pd.DataFrame({lag: per_lag[lag]['ic_tstat'] for lag in lags},
-                             index=all_sigs)
-
-        rows = []
-        min_valid = WF['horizon_selection'].get('min_valid_lags', 1)
-        for sig in all_sigs:
-            t_s = tstat.loc[sig]
-            valid = t_s.replace([np.inf, -np.inf], np.nan).dropna()
-            if len(valid) < min_valid:
-                continue
-            best_lag = float(valid.abs().idxmax())
-            p_min = float(2 * norm.sf(abs(valid.loc[best_lag])))
-            p_horizon = min(1.0, p_min * len(valid))
-            best = per_lag[best_lag].loc[sig]
-            rows.append({
-                'signal_name': sig, 'ic0': best['ic_mean'],
-                'holding_lag': best_lag, 'sign': best['sign'],
-                'p_horizon': p_horizon, 'best_lag': best_lag,
-                'ic_mean': best['ic_mean'], 'icir': best['icir'],
-                'ic_tstat': best['ic_tstat'], 'sharpe': best['sharpe'],
-                'sharpe_net': best['sharpe_net'],
-                'net_ret_mean': best['net_ret_mean'],
-                'avg_turnover': best['avg_turnover'],
-                'stable_thirds': best['stable_thirds'],
-                'recent_third_consistent': best['recent_third_consistent'],
-                'ic_liquid': best['ic_liquid'], 'q_spread': best['q_spread'],
-                'n_days': best['n_days'],
-                'family': self.signal_categories.get(sig, sig),
-            })
-        return pd.DataFrame(rows)
-
-    def select_decay(self, start: pd.Timestamp, end: pd.Timestamp
-                     ) -> Tuple[Dict, pd.DataFrame, Dict]:
-        """FDR pre-filter -> robustness gates -> composite rank -> family cap ->
-        greedy de-correlation -> holding-lag buckets.
-
-        Returns (buckets, selected stats, per-bucket effective breadth) where
-        buckets = {label: [signals]} formed from observed holding-lag terciles.
-        """
-        stats = self.horizon_stats(start, end)
-        stats = filter_valid_from(stats, self.signal_valid_from, end)
-        self.last_candidate_stats = stats.copy()
-        self.last_selection_counts = {'candidates': len(stats)}
-        if stats.empty:
-            return {}, stats, {}
-
-        n_cand = len(stats)
-        # FDR pre-filter: with hundreds of candidates a chunk clear any fixed
-        # significance bar by luck. The procedure keeps an adaptive cutoff so the
-        # expected false-discovery share among survivors stays <= fdr_alpha. A
-        # loose alpha only sweeps out the clearly-spurious tail; the gates do the
-        # real economic filtering after.
-        #   * 'by' (Benjamini-Yekutieli) controls FDR under arbitrary dependence
-        #     (alpha / H_m). The library carries dense families of correlated
-        #     variants (lookback/term-structure/halflife twins of the same
-        #     economic idea), where plain BH is anti-conservative - so BY is the
-        #     default.
-        #   * 'bh' (Benjamini-Hochberg) is the looser independent-tests variant.
-        fdr_fn = (benjamini_yekutieli
-                  if WF.get('fdr_method', 'by') == 'by' else benjamini_hochberg)
-        discovered = fdr_fn(stats['p_horizon'].values, alpha=WF['fdr_alpha'])
-        stats = stats[discovered]
-        self.last_selection_counts['after_fdr'] = len(stats)
-        if stats.empty:
-            stats.attrs['n_candidates'] = n_cand
-            return {}, stats, {}
-
-        # One economics gate + robustness gates. IC magnitude, ICIR, gross
-        # Sharpe and per-signal turnover caps were retired: each was a proxy
-        # for "does this signal earn after costs", which sharpe_net (net of
-        # amortized costs, traded direction) measures directly. Statistical
-        # significance is the FDR step above; robustness is below.
-        gates = (
-            (stats['sharpe_net'] >= WF['min_net_sharpe_threshold']) &
-            (stats['stable_thirds'] >= WF['min_stable_thirds'])
-        )
-        if self.min_holding_lag > 0:
-            # The speed floor compares against the signal's turnover-implied
-            # PERSISTENCE (scoring lag / per-rebalance turnover), not the raw
-            # lag: a funding-carry signal scored at 6 bars with turnover 0.04
-            # reshuffles over ~150 bars and IS fillable by a slow book, while
-            # a churny 6-bar signal (turnover ~1, persistence 6) is not.
-            # Mirrors the aim discount / cost amortization in the backtest
-            # (cost_holding_bars), so selection and execution keep pricing
-            # signal speed identically.
-            eff_hold = stats.apply(
-                lambda r: cost_holding_bars(r['holding_lag'],
-                                            r['avg_turnover']),
-                axis=1)
-            gates &= (eff_hold >= self.min_holding_lag)
-        if WF.get('require_recent_third', True):
-            gates &= stats['recent_third_consistent']
-        liq_ratio = WF.get('min_liquid_ic_ratio', 0.0)
-        if liq_ratio > 0:
-            ok_liq = (stats['ic_liquid'].abs() >=
-                      liq_ratio * stats['ic_mean'].abs())
-            # Pass-through when liquid IC is unavailable (NaN): a missing
-            # liquid-half stat is a data gap, not a failed test. Auto-rejecting
-            # it zeroed out early windows (W00-W03) where ic_liquid was empty.
-            gates &= stats['ic_liquid'].isna() | ok_liq
-        stats = stats[gates]
-        self.last_selection_counts['after_gates'] = len(stats)
-        if stats.empty:
-            stats.attrs['n_candidates'] = n_cand
-            return {}, stats, {}
-
-        ranked = self._rank_candidates(stats)
-
-        # De-correlation on each signal's daily returns at its own best lag.
-        # Build the [date x signal] matrix in ONE pivot per distinct lag (signals
-        # sharing a lag share dates) instead of one slice+pivot per signal, then
-        # precompute the |correlation| matrix once for a single greedy prune
-        # (FCBF's speed idea: rank once, sweep once).
-        lag_of = dict(zip(stats['signal_name'], stats['best_lag']))
-        sigs_by_lag: Dict[int, List[str]] = {}
-        for sig in ranked:
-            sigs_by_lag.setdefault(int(lag_of[sig]), []).append(sig)
-        rets_cols = {}
-        for lag, sigs in sigs_by_lag.items():
-            mat = self.daily_returns_matrix(lag_label(lag), sigs, start,
-                                            self.purged_end(lag, end))
-            for sig in sigs:
-                if sig in mat.columns:
-                    rets_cols[sig] = mat[sig]
-        rets = pd.DataFrame(rets_cols)
-        self.last_rets = rets   # kept for the covariance-aware signal combination
-        corr_abs = rets.corr().abs() if rets.shape[1] > 1 else pd.DataFrame()
-
-        selected = []
-        family_counts: Dict[str, int] = {}
-        family_cap = WF['horizon_selection'].get('max_variants_per_family', 1)
-        for sig in ranked:
-            family = stats.loc[stats['signal_name'] == sig, 'family'].iloc[0]
-            if family_counts.get(family, 0) >= family_cap:
-                continue
-            if not selected:
-                selected.append(sig)
-            else:
-                cols = corr_abs.columns
-                if (not corr_abs.empty and sig in cols
-                        and all(s in cols for s in selected)):
-                    max_corr = corr_abs.loc[selected, sig].max()
-                    if max_corr > WF['max_correlation_threshold']:
-                        continue
-                selected.append(sig)
-            family_counts[family] = family_counts.get(family, 0) + 1
-            if len(selected) >= WF['max_signals_per_window']:
-                break
-
-        sel = stats[stats['signal_name'].isin(selected)].copy()
-        sel.attrs['n_candidates'] = n_cand
-        self.last_selection_counts['selected'] = len(sel)
-
-        # Execution buckets = the DISTINCT SELECTED LAGS. Each bucket's
-        # composite refreshes at its own lag-matched cadence downstream.
-        # (Replaces the old fast/mid/slow terciles, which were RELATIVE: they
-        # split whatever happened to be selected into three "speeds" even when
-        # every selection shared one lag - fabricated distinctions with real
-        # per-bucket bookkeeping. With a 4-lag grid the natural grouping is
-        # the lag itself.)
-        sel['bucket'] = sel['holding_lag'].astype(int).astype(str) + 'b'
-        labels = sorted(sel['bucket'].unique(), key=lambda s: int(s.rstrip('b')))
-        buckets = {lab: sel.loc[sel['bucket'] == lab, 'signal_name'].tolist()
-                   for lab in labels}
-        eff_n = {lab: self._effective_breadth(rets, sigs)
-                 for lab, sigs in buckets.items() if sigs}
-        return buckets, sel, eff_n
-
-    def persistence_diagnostic(self, train_stats: pd.DataFrame,
-                               start: pd.Timestamp,
-                               end: pd.Timestamp) -> Tuple[float, float]:
-        """Relate training IC to next-window IC at the same selected lag."""
-        if train_stats.empty:
-            return np.nan, np.nan
-        rows = []
-        for lag, tr in train_stats.groupby('best_lag'):
-            lag = int(lag)
-            oos = self.window_stats(lag_label(lag), start,
-                                    self.purged_end(lag, end))
-            if oos.empty:
-                continue
-            m = tr[['signal_name', 'ic_mean']].merge(
-                oos[['signal_name', 'ic_mean']], on='signal_name',
-                suffixes=('_train', '_oos'))
-            rows.append(m)
-        if not rows:
-            return np.nan, np.nan
-        d = pd.concat(rows, ignore_index=True).dropna()
-        if len(d) < 3:
-            return np.nan, np.nan
-        rank_corr = d['ic_mean_train'].corr(d['ic_mean_oos'], method='spearman')
-        sign_acc = (np.sign(d['ic_mean_train']) ==
-                    np.sign(d['ic_mean_oos'])).mean()
-        return float(rank_corr), float(sign_acc)
-
-    @staticmethod
-    def _effective_breadth(rets: pd.DataFrame, selected: List[str]) -> float:
-        """(sum lambda)^2 / sum lambda^2 of the selected signals' daily-return
-        correlation - what de-correlation actually bought, vs len(selected)."""
-        cols = [s for s in selected if s in rets.columns]
-        if len(cols) < 2:
-            return float(len(selected))
-        # to_numpy(copy=True): under pandas copy-on-write, .values can be a
-        # read-only view and fill_diagonal would raise.
-        c = rets[cols].corr().fillna(0.0).to_numpy(copy=True)
-        np.fill_diagonal(c, 1.0)
-        ev = np.clip(np.linalg.eigvalsh(c), 0.0, None)
-        denom = float((ev ** 2).sum())
-        return float(ev.sum() ** 2 / denom) if denom > 0 else float(len(cols))
-
-    @staticmethod
-    def _rank_candidates(stats: pd.DataFrame) -> List[str]:
-        cfg = WF.get('candidate_ranking', {})
-        if not cfg.get('enabled', False):
-            key = 'sharpe_net' if 'sharpe_net' in stats.columns else 'sharpe'
-            return stats.sort_values(key, ascending=False)['signal_name'].tolist()
-
-        weights = cfg.get('score_weights', {})
-        scores = pd.Series(0.0, index=stats['signal_name'].values)
-        # Longer directly selected holding lags are more implementation-friendly.
-        col_map = {'sharpe': 'sharpe', 'sharpe_net': 'sharpe_net',
-                   'icir': 'icir', 'ic_tstat': 'ic_tstat',
-                   'inverse_turnover': 'avg_turnover',
-                   'inverse_decay': 'holding_lag'}
-        for metric, w in weights.items():
-            col = col_map.get(metric)
-            if col is None or col not in stats.columns:
-                continue
-            vals = stats[col].values.astype(float)
-            if metric in ('icir', 'ic_tstat'):
-                vals = np.abs(vals)  # direction is resolved via 'sign'
-            if metric == 'inverse_turnover':
-                vals = -vals         # lower turnover is better
-            # The legacy inverse_decay key now means longer observed holding lag.
-            std = np.nanstd(vals)
-            if std > 1e-12:
-                scores += w * (vals - np.nanmean(vals)) / std
-        return scores.sort_values(ascending=False).index.tolist()
-
-    @staticmethod
-    def _combination_strength(stats: pd.DataFrame, signals) -> Dict[str, float]:
-        """Per-signal strength vector for the composite combination: the
-        signal's training-window NET Sharpe (after amortized costs, traded
-        direction), clipped at 0 - the direct measurement of the after-cost
-        value the composite exists to maximize. Missing/NaN -> 0 strength."""
-        if 'sharpe_net' in stats.columns:
-            v = dict(zip(stats['signal_name'], stats['sharpe_net']))
-        else:
-            v = dict(zip(stats['signal_name'], stats['ic_mean'].abs()))
-        out = {}
-        for s in signals:
-            x = v.get(s, 0.0)
-            out[s] = max(float(x), 0.0) if x is not None and np.isfinite(x) else 0.0
-        return out
-
-    @staticmethod
-    def _ic_weights(stats: pd.DataFrame, selected: List[str]) -> Dict[str, float]:
-        """Strength-proportional weights (knob-free fallback when the C^-1
-        combination cannot run); equal weights if every strength is ~0.
-        Uses the same configured basis as combination_weights."""
-        if not selected:
-            return {}
-        raw = SignalSelector._combination_strength(stats, selected)
-        total = sum(raw.values())
-        if total <= 1e-12:
-            return {s: 1.0 / len(selected) for s in selected}
-        return {s: v / total for s, v in raw.items()}
-
-    @staticmethod
-    def combination_weights(stats: pd.DataFrame, selected: List[str],
-                            rets: pd.DataFrame) -> Dict[str, float]:
-        """Covariance-aware signal combination: w proportional to
-        C^{-1} . strength, where C is the correlation of the signals'
-        TRADED-DIRECTION daily returns and strength is the training net
-        Sharpe (_combination_strength). C^{-1} down-weights redundant
-        signals; C is shrunk toward the identity for stability; negative
-        (anti-)weights are clipped to 0. Returns POSITIVE weights summing to
-        1 (the caller applies each signal's sign). Fallback (disabled, or <2
-        signals with return history): plain strength-proportional weights.
-        """
-        cfg = WF.get('signal_combination', {})
-        cols = [s for s in selected if rets is not None and s in rets.columns]
-        if not cfg.get('enabled', False) or len(cols) < 2:
-            return SignalSelector._ic_weights(stats, selected)
-
-        sign = dict(zip(stats['signal_name'], stats['sign']))
-        strength = SignalSelector._combination_strength(stats, cols)
-        signed = rets[cols].mul([sign.get(c, 1.0) for c in cols], axis=1)
-        # copy=True: read-only under pandas copy-on-write (see _effective_breadth)
-        C = signed.corr().fillna(0.0).to_numpy(copy=True)
-        np.fill_diagonal(C, 1.0)
-        shrink = float(cfg.get('corr_shrink', 0.5))
-        C = (1.0 - shrink) * C + shrink * np.eye(len(cols))
-        s_vec = np.array([strength[c] for c in cols])
-        try:
-            w = np.linalg.solve(C, s_vec)
-        except np.linalg.LinAlgError:
-            w = s_vec
-        w = np.clip(w, 0.0, None)
-        if w.sum() <= 1e-12:
-            return SignalSelector._ic_weights(stats, selected)
-        w = w / w.sum()
-        out = {s: 0.0 for s in selected}
-        out.update({c: float(wi) for c, wi in zip(cols, w)})
-        return out
 
 
 # =============================================================================
@@ -1040,43 +388,19 @@ class DataContext:
 
 class WalkForwardPortfolio:
     def __init__(self):
-        # Discovery is the only signal source: the registry holds the
-        # promoted disc_* candidates, which are SCORED here in memory
-        # (research/lib/signal_eval.score_registry) - there is no separate
-        # scoring pipeline stage or signal_daily_stats table.
+        # Per-month mirror of discovery: no scoring pipeline. Each OOS month
+        # trades ONLY the signals its roll promoted, sized from the metadata
+        # discovery already measured (direction, lag, train IC, half-life,
+        # turnover).
         self.registry = build_registry()
         if not self.registry:
             raise RuntimeError(
                 "signal registry is empty - run "
                 "research/signals/discovery.py first (promoted "
                 "candidates are the only signal source)")
-        logging.info(f"Scoring {len(self.registry)} promoted signals across "
-                     f"the {len(LAG_GRID)}-lag grid...")
-        daily_stats = score_registry(self.registry)
-        if daily_stats.empty:
-            raise RuntimeError("scoring produced no daily stats - check that "
-                               "features/residual_returns cover the "
-                               "walk-forward window")
-        categories = {name: info.get('family') or info.get('category', name)
-                      for name, info in self.registry.items()}
-        valid_from = {name: pd.Timestamp(info['valid_from'])
-                      for name, info in self.registry.items()
-                      if info.get('valid_from') is not None}
-        # Fitted alpha half-life (bars) from each signal's discovery train
-        # profile: caps the turnover-implied persistence below, so alpha is
-        # never aim-discounted as if it outlived its own term structure.
-        self.signal_half_life = {
-            name: float(info['half_life_bars'])
-            for name, info in self.registry.items()
-            if info.get('half_life_bars')}
-        if valid_from:
-            logging.info(f"{len(valid_from)} discovered (disc_*) signals in "
-                         "the registry; each selectable only from its "
-                         "promotion date")
-        self.selector = SignalSelector(daily_stats, categories, valid_from)
-        # Per-month mirror of discovery: each OOS month trades ONLY the signals
-        # promoted in that month's roll (keyed by the roll's oos_start).
-        self.selector.month_signals = self._build_month_signals()
+        self.month_meta = self._build_month_meta()
+        if not self.month_meta:
+            raise RuntimeError("no promotions found - run discovery first")
         self.ctx: Optional[DataContext] = None
         self._ctx_start: Optional[pd.Timestamp] = None
         self._ctx_end: Optional[pd.Timestamp] = None
@@ -1084,6 +408,43 @@ class WalkForwardPortfolio:
         self.windows: List[WindowResult] = []
         # Held book carried across contiguous windows (see _backtest_window).
         self._carry: pd.Series = pd.Series(dtype=float)
+
+    def _build_month_meta(self) -> Dict[pd.Timestamp, List[dict]]:
+        """{oos_start -> [{name, lag, ic, half_life, turnover}]} from the
+        promotions table (one entry per signal per month it was promoted),
+        joined with the ledger for that roll's train IC and turnover."""
+        from research.signals.data import make_rolls
+        tables = get('discovery.tables')
+        promos = load_data(tables['promotions'])
+        if promos is None or promos.empty:
+            return {}
+        led = load_data(tables['ledger'])
+        led_key = {}
+        if led is not None and not led.empty:
+            for r in led.itertuples():
+                led_key[(int(r.roll_id), r.cand_hash)] = (
+                    float(getattr(r, 'train_ic_mean', np.nan) or np.nan),
+                    float(getattr(r, 'turnover', np.nan) or np.nan))
+        oos_by_roll = {r.roll_id: pd.Timestamp(r.oos_start)
+                       for r in make_rolls(get('discovery'))}
+        out: Dict[pd.Timestamp, List[dict]] = {}
+        for _, r in promos.iterrows():
+            name = f"disc_{r['family']}_{str(r['cand_hash'])[:10]}"
+            oos = oos_by_roll.get(int(r['roll_id']))
+            if oos is None or name not in self.registry:
+                continue
+            ic, to = led_key.get((int(r['roll_id']), r['cand_hash']),
+                                 (np.nan, np.nan))
+            hl = float(r.get('half_life_bars') or 0) or None
+            out.setdefault(oos, []).append({
+                'name': name,
+                'lag': int(r.get('target_lag') or 0) or 6,
+                'ic': ic, 'half_life': hl, 'turnover': to,
+            })
+        n = sum(len(v) for v in out.values())
+        logging.info(f"per-month book: {n} promotions across {len(out)} "
+                     f"OOS months")
+        return out
 
     def _set_context_bounds(self, schedule: List[Tuple[pd.Timestamp,
                                                        pd.Timestamp,
@@ -1173,86 +534,53 @@ class WalkForwardPortfolio:
                    prev: Optional[WindowResult]) -> Optional[WindowResult]:
         res = WindowResult(idx, train_start, train_end, test_end)
 
-        buckets, sel, eff_breadth = self.selector.select_decay(train_start, train_end)
-        n_candidates = int(sel.attrs.get('n_candidates', len(sel))) if not sel.empty else 0
-        if not n_candidates:
-            n_candidates = self.selector.last_selection_counts.get('candidates', 0)
-
+        # This OOS month trades exactly its roll's promoted signals, sized
+        # from discovery metadata. Buckets = distinct promoted lags; weights
+        # within a bucket proportional to train IC (panels are already
+        # direction-applied by compute_signal_panel).
+        meta = self.month_meta.get(pd.Timestamp(train_end), [])
         selected, weights, bucket_ic, bucket_h = {}, {}, {}, {}
         bucket_to, bucket_hl = {}, {}
-        for lab, sigs in buckets.items():
-            if not sigs:
-                continue
-            stats_b = sel[sel['signal_name'].isin(sigs)]
-            selected[lab] = sigs
-            # Fold the training-IC sign into the weight: the composite
-            # trades each signal in its profitable direction. Covariance-aware
-            # combination (Grinold) when enabled, else flat IC-weighting.
-            w_pos = SignalSelector.combination_weights(
-                stats_b, sigs, self.selector.last_rets)
-            sign_map = dict(zip(stats_b['signal_name'], stats_b['sign']))
-            weights[lab] = {s: w_pos[s] * sign_map.get(s, 1.0) for s in sigs}
-            ic_map = dict(zip(stats_b['signal_name'], stats_b['ic_mean']))
-            wsum = sum(abs(w) for w in weights[lab].values())
-            # signed ic x signed weight = |ic| x positive weight
-            bucket_ic[lab] = float(sum(ic_map.get(s, 0) * w
-                                       for s, w in weights[lab].items()) / max(wsum, 1e-12))
-            bucket_h[lab] = float(stats_b['holding_lag'].median())
-            # |weight|-averaged per-rebalance turnover of the bucket's
-            # signals: drives the cost-amortization holding period
-            # (cost_holding_bars). Missing/NaN turnover counts as 1 (churny).
-            to_map = dict(zip(stats_b['signal_name'], stats_b['avg_turnover']))
-            bucket_to[lab] = float(sum(
-                abs(w) * (to_map.get(s) if np.isfinite(to_map.get(s, np.nan))
-                          else 1.0)
-                for s, w in weights[lab].items()) / max(wsum, 1e-12))
-            # |weight|-averaged fitted alpha half-life of the bucket's
-            # signals (bars): None when no signal carries one.
-            hls = [(abs(w), self.signal_half_life[s])
-                   for s, w in weights[lab].items()
-                   if s in self.signal_half_life]
-            bucket_hl[lab] = (float(sum(w * h for w, h in hls)
-                                    / max(sum(w for w, _ in hls), 1e-12))
+        by_lag: Dict[int, List[dict]] = {}
+        for m in meta:
+            by_lag.setdefault(m['lag'], []).append(m)
+        for lag in sorted(by_lag):
+            lab = f'{lag}b'
+            ms = by_lag[lag]
+            ics = np.array([m['ic'] if np.isfinite(m['ic']) else 0.0
+                            for m in ms])
+            ics = np.abs(ics)
+            w = ics / ics.sum() if ics.sum() > 1e-12 else np.full(len(ms),
+                                                                  1 / len(ms))
+            selected[lab] = [m['name'] for m in ms]
+            weights[lab] = {m['name']: float(wi) for m, wi in zip(ms, w)}
+            bucket_ic[lab] = float(ics @ w)
+            bucket_h[lab] = float(lag)
+            tos = np.array([m['turnover'] if np.isfinite(m['turnover'])
+                            else 1.0 for m in ms])
+            bucket_to[lab] = float(tos @ w)
+            hls = [(wi, m['half_life']) for m, wi in zip(ms, w)
+                   if m['half_life']]
+            bucket_hl[lab] = (float(sum(wi * h for wi, h in hls)
+                                    / max(sum(wi for wi, _ in hls), 1e-12))
                               if hls else None)
-
-        if not selected and WF.get('fallback_to_previous') and prev and prev.selected:
-            selected, bucket_ic, bucket_h = (prev.selected, prev.horizon_ic,
-                                             prev.bucket_h)
-            bucket_to = prev.bucket_to or {}
-            weights = prev.weights or {b: {s: 1.0 / len(sigs) for s in sigs}
-                                       for b, sigs in selected.items()}
 
         res.selected = selected
         res.weights = weights
         res.horizon_ic = bucket_ic
         res.bucket_h = bucket_h
         res.bucket_to = bucket_to
-        res.eff_breadth = eff_breadth
-        res.n_candidates = n_candidates
-        res.selection_counts = self.selector.last_selection_counts.copy()
-
-        # Per-stage selection funnel for this window (stages skipped by an empty
-        # early-return show as '-').
-        c = res.selection_counts
-        def _f(k):
-            return c['after_' + k] if ('after_' + k) in c else (
-                c[k] if k in c else '-')
-        logging.info(
-            f"W{idx:02d} {train_end.date()} selection funnel: "
-            f"candidates {c.get('candidates', n_candidates)} "
-            f"-> fdr {_f('fdr')} -> gates {_f('gates')} -> selected {_f('selected')}")
-        (res.train_oos_ic_rank_corr,
-         res.train_oos_ic_sign_accuracy) = self.selector.persistence_diagnostic(
-            self.selector.last_candidate_stats, train_end, test_end)
-        # Per-signal OOS attribution (Option A): trace a window's PnL to the
-        # individual signals whose standalone edge held up or decayed/flipped OOS.
-        res.signal_attribution = self._signal_oos_attribution(sel, train_end, test_end, idx)
+        res.n_candidates = len(meta)
+        logging.info(f"W{idx:02d} OOS {train_end.date()}..{test_end.date()}: "
+                     f"{len(meta)} promoted signals in "
+                     f"{len(selected)} lag buckets")
         if not selected:
+            logging.info(f"W{idx:02d}: no promotions this month - no new book "
+                         f"(carried positions re-target next traded month)")
             return res
 
         feat_start = train_end - pd.Timedelta(days=WARMUP_DAYS)
-        lag_of = ({} if sel is None or sel.empty else
-                  dict(zip(sel['signal_name'], sel['best_lag'].astype(int))))
+        lag_of = {m['name']: m['lag'] for m in meta}
         composites = self.composite_scores(selected, weights, feat_start,
                                            train_end, test_end, lag_of=lag_of)
         if not composites:
@@ -1296,53 +624,6 @@ class WalkForwardPortfolio:
                          f"(~0.5 ideal), net/gross={res.net_to_gross:.2f}")
 
         return res
-
-    def _signal_oos_attribution(self, sel: pd.DataFrame, test_start: pd.Timestamp,
-                                test_end: pd.Timestamp, idx: int) -> List[dict]:
-        """Per selected signal: did its standalone edge hold up out-of-sample?
-
-        Compares the training IC that earned its selection against the realized
-        OOS IC at the SAME lag/direction, plus the signal's own dollar-neutral
-        OOS return - all in the traded direction (sign applied), so positive =
-        still working, negative = decayed or flipped. This is what lets a bad
-        window be traced to specific signals rather than 'the market'.
-        IC/return are the signal's STANDALONE edge, not its MVO portfolio share.
-        """
-        if sel is None or sel.empty:
-            return []
-        oos_by_lag = {}
-        for lag in {int(l) for l in sel['best_lag'].unique()}:
-            st = self.selector.window_stats(lag_label(lag), test_start, test_end)
-            oos_by_lag[lag] = st.set_index('signal_name') if not st.empty else None
-        rows = []
-        for _, rs in sel.iterrows():
-            s = rs['signal_name']
-            lag = int(rs['best_lag'])
-            sign = float(rs['sign'])
-            oos = oos_by_lag.get(lag)
-            oos_ic_raw = (float(oos.loc[s, 'ic_mean'])
-                          if oos is not None and s in oos.index else np.nan)
-            stream = self.selector.signed_daily_returns(lag_label(lag), s, sign,
-                                                        test_start, test_end)
-            if len(stream):
-                oos_ret = float((1 + stream).prod() - 1)
-                oos_sharpe = (float(stream.mean() / stream.std() * np.sqrt(365))
-                              if stream.std() > 0 else np.nan)
-            else:
-                oos_ret = oos_sharpe = np.nan
-            rows.append({
-                'window_idx': idx,
-                'bucket': rs.get('bucket', ''),
-                'signal_name': s,
-                'family': rs.get('family', ''),
-                'sign': sign,
-                'holding_lag': lag,
-                'train_ic': float(sign * rs['ic_mean']),         # traded-direction
-                'oos_ic': float(sign * oos_ic_raw),              # traded-direction
-                'oos_ret': oos_ret,                              # standalone, signed
-                'oos_sharpe': oos_sharpe,
-            })
-        return rows
 
     # ---------------- MVO backtest ----------------
 
@@ -1394,10 +675,8 @@ class WalkForwardPortfolio:
         # costs. ic_shrink pulls the noisy realized IC toward 0 (Grinold & Kahn
         #) so IC swings don't whipsaw the book.
         gp_on = bool(gp.get('enabled', False))
-        # Effective fill rate kappa: the GP trade rate capped at the rate the
-        # turnover budget actually allows - the same quantity that derives the
-        # selection speed floor (see effective_fill_rate / resolve_min_holding_lag),
-        # so selection and execution price alpha decay identically.
+        # Effective fill rate kappa: the GP trade rate capped at what the
+        # turnover budget allows.
         _, kappa = effective_fill_rate()
         ic_shrink = float(PORT.get('ic_shrink', 0.0))
         ic_keep = max(0.0, 1.0 - ic_shrink)
@@ -1991,31 +1270,14 @@ class WalkForwardPortfolio:
 
     def run(self) -> pd.DataFrame:
         from tqdm import tqdm
+        from research.signals.data import make_rolls
 
-        full_start = pd.to_datetime(WF['start_date'])
-        full_end = pd.to_datetime(WF['end_date'])
-        train_months = WF['train_months']
-        test_days = WF['test_days']
-        expanding = WF.get('train_window', 'expanding') == 'expanding'
-
-        # Schedule: test windows step forward by test_days. 'expanding' anchors
-        # every training window at full_start (monthly production retrain on
-        # ALL data known so far - by the last window the selector sees the
-        # whole history, ~10x the observations of a rolling 6mo slice);
-        # 'rolling' keeps the legacy fixed train_months lookback.
-        schedule = []
-        t0 = full_start
-        while True:
-            t1 = t0 + pd.DateOffset(months=train_months)
-            t2 = t1 + pd.DateOffset(days=test_days)
-            if t2 > full_end:
-                break
-            schedule.append((full_start if expanding else t0, t1, t2))
-            t0 = t0 + pd.DateOffset(days=test_days)
-
-        logging.info(f"Walk-forward: {len(schedule)} windows "
-                     f"({'expanding from ' + str(full_start.date()) if expanding else f'{train_months}mo rolling'}"
-                     f" / {test_days}d test)")
+        # One window per discovery roll: train on that roll's train window,
+        # trade its OOS month with the signals it promoted (out of sample).
+        schedule = [(pd.Timestamp(r.train_start), pd.Timestamp(r.oos_start),
+                     pd.Timestamp(r.oos_end)) for r in make_rolls(get('discovery'))]
+        logging.info(f"Walk-forward: {len(schedule)} monthly windows "
+                     f"(mirrors discovery rolls)")
         self._set_context_bounds(schedule)
         self.ctx = None
 
@@ -2104,18 +1366,15 @@ class WalkForwardPortfolio:
         # selected lags ('3b:5' = 5 signals held at the 3-bar lag); top
         # families are abbreviated to the three largest (full breakdown lives
         # in the notebook's attribution view).
-        row = ("  {win:<4}{period:<24}{nsig:>5}  {bkt:<20}{eff:>14}"
-               "{sr:>8}{rho:>8}{sign:>7}{mkt:>9}  {fam}")
-        print("\nPer-window detail (buckets = selected lags):")
+        row = ("  {win:<4}{period:<24}{nsig:>5}  {bkt:<20}"
+               "{sr:>8}{mkt:>9}  {fam}")
+        print("\nPer-window detail (buckets = promoted lags):")
         print(row.format(win='Win', period='OOS test period', nsig='#sig',
-                         bkt='lag:sigs', eff='effN', sr='OOS_SR',
-                         rho='IC_rho', sign='sign', mkt='|mkt|',
+                         bkt='lag:sigs', sr='OOS_SR', mkt='|mkt|',
                          fam='top families'))
         for w in self.windows:
             labs = sorted(w.selected, key=lambda s: int(str(s).rstrip('b') or 0))
             bkt = ' '.join(f'{b}:{len(w.selected[b])}' for b in labs)
-            eff = '/'.join(f'{w.eff_breadth[b]:.1f}' if b in w.eff_breadth
-                           else '-' for b in labs)
             fam = list(self._selected_family_counts(w).items())
             fam_str = ' '.join(f'{k}:{v}' for k, v in fam[:3])
             if len(fam) > 3:
@@ -2126,10 +1385,7 @@ class WalkForwardPortfolio:
                 period=f'{w.train_end.date()}-{w.test_end.date()}',
                 nsig=sum(len(s) for s in w.selected.values()),
                 bkt=bkt or '-',
-                eff=eff or '-',
                 sr=f'{w.oos_sharpe:.2f}',
-                rho=f'{w.train_oos_ic_rank_corr:.2f}',
-                sign=f'{w.train_oos_ic_sign_accuracy:.0%}',
                 mkt=f'{mkt:.4f}',
                 fam=fam_str))
 
@@ -2148,18 +1404,12 @@ class WalkForwardPortfolio:
             'window_idx': w.window_idx,
             'train_start': w.train_start, 'train_end': w.train_end,
             'test_end': w.test_end,
-            'n_candidates': w.n_candidates,
-            'n_after_fdr': w.selection_counts.get('after_fdr', 0),
-            'n_after_gates': w.selection_counts.get('after_gates', 0),
-            'n_selected': w.selection_counts.get('selected', 0),
+            'n_signals': w.n_candidates,
             'selected': ';'.join(f"{b}:{','.join(s[:10])}" for b, s in w.selected.items()),
             'selected_families': ';'.join(f"{k}:{v}" for k, v in family_counts.items()),
             'horizon_ic': ';'.join(f"{b}:{ic:.4f}" for b, ic in w.horizon_ic.items()),
             'bucket_holding_lag': ';'.join(f"{b}:{v:.0f}" for b, v in w.bucket_h.items()),
-            'eff_breadth': ';'.join(f"{b}:{v:.1f}" for b, v in w.eff_breadth.items()),
             'oos_sharpe': w.oos_sharpe,
-            'train_oos_ic_rank_corr': w.train_oos_ic_rank_corr,
-            'train_oos_ic_sign_accuracy': w.train_oos_ic_sign_accuracy,
             'avg_gross': w.avg_gross,
             'avg_turnover': w.avg_turnover,
             'avg_abs_mkt_exposure': w.avg_abs_mkt_exposure,
@@ -2183,15 +1433,6 @@ class WalkForwardPortfolio:
                   mode='append',
                   datetime_columns=['train_start', 'train_end', 'test_end',
                                     'run_timestamp'])
-
-        # Per-signal OOS attribution (written for every window with a selection).
-        if res.signal_attribution:
-            attr = pd.DataFrame(res.signal_attribution)
-            attr['test_start'] = res.train_end
-            attr['test_end'] = res.test_end
-            attr['run_timestamp'] = self._run_ts
-            save_data(SIGNAL_ATTRIBUTION_TABLE, attr, mode='append',
-                      datetime_columns=['test_start', 'test_end', 'run_timestamp'])
 
         if res.oos_returns is None or res.oos_returns.empty:
             return

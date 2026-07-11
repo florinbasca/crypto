@@ -150,23 +150,6 @@ m = panel_pos.merge(panel_neg, on=['timestamp', 'symbol'], suffixes=('_p', '_n')
 check("registry direction flips the traded sign",
       np.allclose(m['signal_p'], -m['signal_n'], atol=1e-9))
 
-# --- walk-forward valid_from gate ------------------------------------------------
-from research.portfolio.walk_forward import filter_valid_from
-
-stats = pd.DataFrame({
-    'signal_name': ['space_curated', name, gname],
-    'ic0': [0.02, 0.03, 0.01],
-})
-vf_map = {name: pd.Timestamp('2024-03-01'), gname: pd.Timestamp('2024-06-01')}
-kept = filter_valid_from(stats, vf_map, pd.Timestamp('2024-04-15'))
-check("valid_from gate: curated always passes, later promotions dropped",
-      set(kept['signal_name']) == {'space_curated', name})
-kept_all = filter_valid_from(stats, vf_map, pd.Timestamp('2024-07-01'))
-check("valid_from gate: everything passes once the window reaches it",
-      len(kept_all) == 3)
-check("valid_from gate: empty map is a no-op",
-      filter_valid_from(stats, {}, pd.Timestamp('2024-01-01')).equals(stats))
-
 # --- registry merge is graceful without promotions tables -----------------------
 from research.lib.signal_eval import build_registry
 
