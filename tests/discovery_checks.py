@@ -343,6 +343,52 @@ check("directional: sign-reversed hold-out signal is NOT promoted",
       f"(|t| {abs(best['metrics_select']['ic_tstat']):.1f} but reversed -> "
       f"{len(reversed_promoted)} promoted)")
 
+# Turnover diagnostic: a property of the signal alone (0 = never retrades,
+# 1 = fully replaced each bar). Ledger-only; never touches reward, promotion,
+# or the walk-forward.
+_ts = pd.date_range('2024-01-01', periods=4, freq='10min')
+_static = pd.DataFrame([{'timestamp': t, 'symbol': s, 'signal': v}
+                        for t in _ts
+                        for s, v in [('A', 1.0), ('B', -1.0)]])
+check("turnover: constant signal -> ~0",
+      abs(search_mod.signal_turnover(_static)) < 1e-9,
+      f"({search_mod.signal_turnover(_static):.4f})")
+_flip = pd.DataFrame([{'timestamp': t, 'symbol': s, 'signal': v * (1 if i % 2 == 0 else -1)}
+                      for i, t in enumerate(_ts)
+                      for s, v in [('A', 1.0), ('B', -1.0)]])
+check("turnover: sign-flipping every bar -> ~1 (full replacement)",
+      abs(search_mod.signal_turnover(_flip) - 1.0) < 1e-9,
+      f"({search_mod.signal_turnover(_flip):.4f})")
+_led_df = ledger_a.to_frame()
+check("turnover: recorded in the ledger for every candidate (finite)",
+      'turnover' in _led_df.columns
+      and _led_df['turnover'].notna().all()
+      and (_led_df['turnover'] >= 0).all(),
+      f"(range {_led_df['turnover'].min():.3f}-{_led_df['turnover'].max():.3f})")
+check("turnover: survivors carry it in-memory too",
+      all('turnover' in s and np.isfinite(s['turnover']) for s in survivors_a))
+
+# Turnover CEILING gate (promotion.max_turnover): OFF by default; when set,
+# rejects high-churn survivors; fails OPEN on missing turnover.
+_base = bt_mod.promote(survivors_a, ROLL, ledger_a, CFG)
+assert _base, "e2e produced no promotions to gate"
+# Cap just below the churniest PROMOTED signal: it must now be excluded, and
+# every survivor still promoted must respect the cap.
+_cap = max(p['turnover'] for p in _base) - 1e-6
+_tv_cfg = copy.deepcopy(CFG)
+_tv_cfg['promotion']['max_turnover'] = _cap
+_gated = bt_mod.promote(survivors_a, ROLL, ledger_a, _tv_cfg)
+check("turnover gate: None promotes; a ceiling bites and is respected",
+      any(p['turnover'] > _cap for p in _base)          # the cap actually bit
+      and all(p['turnover'] <= _cap for p in _gated),   # gate respected
+      f"(base {len(_base)} -> gated {len(_gated)} at cap {_cap:.3f})")
+# Fail-open: a survivor with no/NaN turnover is not blocked by the gate.
+_no_tv = [{**s, 'turnover': float('nan')} for s in survivors_a]
+_openq = bt_mod.promote(_no_tv, ROLL, ledger_a, _tv_cfg)
+check("turnover gate: fails open when turnover is unknown (NaN)",
+      len(_openq) == len(_base),
+      f"({len(_openq)} promoted with NaN turnover vs {len(_base)} baseline)")
+
 # survivor carry-over: the next roll is seeded with this roll's survivors,
 # they re-earn survival on the new windows, and the N-consecutive-rolls
 # persistence gate becomes satisfiable (without seeding it never can be).

@@ -178,6 +178,31 @@ def pooled_signal(signals: List[pd.DataFrame]) -> pd.DataFrame:
     return wide.mean(axis=1).rename('signal').reset_index()
 
 
+def signal_turnover(sig: pd.DataFrame) -> float:
+    """Mean per-bar one-sided turnover of a compiled signal, as a fraction of
+    gross book: 0 = positions never change, 1 = the book is fully replaced
+    each bar.
+
+    Each timestamp's cross-section is normalised to gross 1 (the dollar-neutral
+    book weights the signal implies), then turnover_t = 0.5 * sum_i |w_{i,t} -
+    w_{i,t-1}| - the fraction of the book traded between consecutive bars,
+    counting names entering/leaving the cross-section as full trades.
+
+    This is a property of the SIGNAL ALONE - no portfolio, no assumed cost -
+    and is the standalone 'is this even tradeable' diagnostic from SLS's
+    'Modern Spirit of Statistical Arbitrage' (a 6.9% signal trades on its own;
+    a 36.8% one does not). DIAGNOSTIC ONLY: never a reward or promotion term -
+    real cost is a portfolio property, judged in the walk-forward."""
+    if sig is None or sig.empty:
+        return float('nan')
+    w = sig.pivot_table(index='timestamp', columns='symbol',
+                        values='signal', aggfunc='first').sort_index()
+    gross = w.abs().sum(axis=1)
+    w = w.div(gross.where(gross > 0), axis=0).fillna(0.0)   # gross-1 per bar
+    dw = (w.diff().abs().sum(axis=1) * 0.5).iloc[1:]         # skip first bar
+    return float(dw.mean()) if len(dw) else float('nan')
+
+
 def alpha_term_structure(m_by_lag: Dict[int, dict]) -> Dict[int, float]:
     """Cumulative expected alpha per bet at each horizon: A(L) = ic_mean(L) *
     target_dispersion(L). This is the empirical alpha_k curve of SLS
@@ -374,10 +399,14 @@ class DiscoveryLedger:
                reward: float, terms: dict,
                target_lag: Optional[int] = None,
                profile_json: Optional[str] = None,
-               half_life_bars: Optional[float] = None) -> None:
+               half_life_bars: Optional[float] = None,
+               turnover: Optional[float] = None) -> None:
         """target_lag = the BEST PER-BET train lag (display/sorting only -
         the signal is not pinned to it); profile_json = the full per-lag
-        train+select metrics; half_life_bars = fitted alpha half-life."""
+        train+select metrics; half_life_bars = fitted alpha half-life;
+        turnover = mean per-bar book turnover of the train signal (DIAGNOSTIC
+        ONLY - ledger column, never read by the walk-forward). Rows written by
+        older code simply carry NaN here, so a resumed run mixes cleanly."""
         row = {
             'roll_id': int(roll_id),
             'generation': int(generation),
@@ -389,6 +418,8 @@ class DiscoveryLedger:
             'target_lag': int(target_lag) if target_lag is not None else -1,
             'half_life_bars': (float(half_life_bars)
                                if half_life_bars is not None else np.nan),
+            'turnover': (float(turnover) if turnover is not None
+                         and np.isfinite(turnover) else np.nan),
             'profile_json': profile_json or '',
             'reward': float(reward),
             'survivor': False,
@@ -619,6 +650,10 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         m_select = m_select_by_lag[best_lag]
         sig_select = sig[sig['timestamp'] >= roll.select_start]
         sig_train = sig[sig['timestamp'] < roll.select_start]
+        # Standalone tradeability diagnostic (train signal): what fraction of
+        # the book this signal churns per bar. Ledger-only, never a reward or
+        # promotion term - real cost belongs to the walk-forward.
+        turnover = signal_turnover(sig_train)
 
         instability = train_thirds_instability(sig, train,
                                                target_col(best_lag),
@@ -655,7 +690,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         ledger.record(roll.roll_id, gen, cand, direction,
                       m_train, m_select, rwd, terms, target_lag=best_lag,
                       profile_json=json.dumps(profile),
-                      half_life_bars=half_life)
+                      half_life_bars=half_life, turnover=turnover)
         if cand.family in bandit:
             bandit[cand.family]['n'] += 1
             bandit[cand.family]['sum'] += rwd
@@ -667,6 +702,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             'profile_select': m_select_by_lag,
             'reward': rwd, 'metrics_train': m_train,
             'metrics_select': m_select,
+            'turnover': turnover,
             'signal_train': sig_train.reset_index(drop=True),
             'signal_select': sig_select.reset_index(drop=True),
         })
@@ -773,8 +809,12 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     lag_mix: Dict[int, int] = {}
     for s in population:
         lag_mix[s['target_lag']] = lag_mix.get(s['target_lag'], 0) + 1
+    turns = [s['turnover'] for s in population
+             if s.get('turnover') is not None and np.isfinite(s['turnover'])]
+    turn_str = (f", turnover/bar {np.median(turns):.1%} median "
+                f"[{min(turns):.1%}-{max(turns):.1%}]" if turns else "")
     logging.info(f"roll {roll.roll_id}: survivor lag mix "
-                 f"{dict(sorted(lag_mix.items()))} (bars)")
+                 f"{dict(sorted(lag_mix.items()))} (bars){turn_str}")
     ledger.mark_survivors(roll.roll_id,
                           [s['candidate'].hash for s in population])
     return population

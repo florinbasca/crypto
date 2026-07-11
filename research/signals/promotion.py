@@ -23,6 +23,10 @@ and the candidate as a whole must pass:
   5. capture floor: persistence weight 1/(1 + phi/kappa) at least
      min_capture - the book structurally cannot hold alpha faster than its
      own trade rate long enough to matter (duration, never a cost model)
+  5b. turnover ceiling (max_turnover, OFF by default): direct-measurement
+     sibling of the capture floor - rejects a signal whose per-bar book churn
+     exceeds the cap (the untradeable-standalone case where alpha persists but
+     positions are noisy, which the half-life-derived capture floor misses)
   6. N-consecutive-rolls persistence (by candidate hash, via the ledger)
   7. orthogonality vs the already-promoted book (incremental edge, greedy)
   8. book-size cap; slots filled in CAPTURE-WEIGHTED day-equivalent select
@@ -118,6 +122,20 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
     min_capture = float(promo.get('min_capture', 0.0))
     max_book_corr = float(promo['max_book_corr'])
     slots = int(promo['max_book_size'])
+    # Turnover ceiling (None / non-finite = OFF). Rejects untradeable-standalone
+    # churners; sibling of the capture floor. Fails OPEN when a survivor carries
+    # no turnover (older in-memory dicts) - never block on missing diagnostics.
+    _mt = promo.get('max_turnover')
+    max_turnover = (float(_mt) if _mt is not None and np.isfinite(_mt)
+                    else None)
+
+    def turnover_ok(s) -> bool:
+        if max_turnover is None:
+            return True
+        tv = s.get('turnover')
+        if tv is None or not np.isfinite(tv):
+            return True
+        return float(tv) <= max_turnover
 
     def passing_lags(i, s) -> List[int]:
         out = []
@@ -171,6 +189,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
             'profile': bool(ok_lags),
             'sign_agreement': sign_agreement(s) >= min_agree,
             'capture': capture(s) >= min_capture,
+            'turnover': turnover_ok(s),
             'persistence': ledger.consecutive_survivals(
                 s['candidate'].hash, roll.roll_id)
                 >= int(promo['min_rolls_survived']),

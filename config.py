@@ -595,6 +595,17 @@ config = {
             # structurally cannot hold anything faster long enough to
             # matter. 0 disables. Duration-based, never a cost model.
             'min_capture': 0.5,
+            # Turnover CEILING: the direct-measurement sibling of the capture
+            # floor. Rejects a signal whose per-bar book churn (0.5*sum|dw| on
+            # the gross-1 signal, ledger 'turnover' column) exceeds this, i.e.
+            # the untradeable-standalone case where alpha persists but positions
+            # are noisy - which the (half-life-derived) capture floor misses.
+            # Raw signal turnover OVERSTATES what the smoothed book trades, so
+            # this is meant to catch EXTREMES, not fine-tune. Calibrate from the
+            # ledger's turnover distribution among promoted signals. None (or a
+            # non-finite value) DISABLES it - the default, so it never changes an
+            # in-flight run or resume unless you opt in.
+            'max_turnover': None,
         },
         # ML probe: gradient boosting on ALL resolved primitives, fit on TRAIN,
         # scored on SELECT. Its IC is the predictability CEILING (upper bound)

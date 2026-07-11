@@ -90,6 +90,12 @@ def main():
         best_select_t=('select_ic_tstat', lambda s: s.abs().max()),
         best_reward=('reward', 'max'),
     ).join(seeded).fillna({'seeded': 0}).astype({'seeded': int})
+    # Median survivor book turnover per bar (diagnostic column; absent on runs
+    # from before it was added, NaN on their rows in a resumed run).
+    if 'turnover' in led.columns:
+        summary = summary.join(
+            led[led['survivor']].groupby('roll_id')['turnover']
+            .median().rename('surv_turnover'))
     print(summary.to_string())
 
     # 2. top candidates ------------------------------------------------------
@@ -109,6 +115,9 @@ def main():
         hl = r.get('half_life_bars')
         hl_str = (f" | half-life {hl:,.0f}b"
                   if hl is not None and np.isfinite(hl) else "")
+        tv = r.get('turnover')
+        tv_str = (f" | turnover {tv:.1%}/bar"
+                  if tv is not None and np.isfinite(tv) else "")
         print(f"\n{r['name']}  [{r['family']}]  roll {r['roll_id']}  "
               f"dir {r['direction']:+d}  best lag {r.get('target_lag', '?')}b"
               f"  {flags}")
@@ -117,7 +126,7 @@ def main():
               f"train t={r['train_ic_tstat']:.2f} | "
               f"ICIR {r.get('select_icir', float('nan')):.3f} | "
               f"liquid ratio {r.get('select_liquid_ic_ratio', float('nan')):.2f}"
-              f"{hl_str}")
+              f"{hl_str}{tv_str}")
         print(f"      {_fmt_expr(r['candidate_json'], args.expressions)}")
 
     # 3. promoted book -------------------------------------------------------

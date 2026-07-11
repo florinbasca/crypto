@@ -84,6 +84,13 @@ signal) *with* the candidate included minus *without* it. A near-duplicate adds
 never a reward term — a signal's real cost depends on the whole book, so it is
 judged only in the walk-forward.
 
+**Turnover** (mean per-bar book churn, `0.5·Σ|Δw|` on the gross-1 signal) is
+recorded per candidate in the ledger as a standalone tradeability diagnostic:
+0 = positions never change, 1 = the book is replaced every bar. It's the
+measured twin of the capture weight (fast signal ⇒ short half-life ⇒ high
+turnover). Diagnostic only — never a reward or promotion term, never read by
+the walk-forward.
+
 ## Diversity
 
 An evolutionary search collapses toward one idea: once a family scores well the
@@ -115,6 +122,10 @@ of its profile clears all of:
   reverses out-of-sample is rejected, never admitted on magnitude alone.
 - Sign agreement: the train profile mostly shares the traded sign.
 - Capture floor: half-life long enough for the book to hold it.
+- Turnover ceiling (`max_turnover`, off by default): rejects a signal whose
+  per-bar book churn exceeds the cap — the direct-measurement sibling of the
+  capture floor, catching the untradeable-standalone case where alpha persists
+  but positions are noisy. Fails open when turnover is unknown.
 - Orthogonality to signals already promoted this roll.
 
 Passers are written to the promotions table with profile, half-life, and

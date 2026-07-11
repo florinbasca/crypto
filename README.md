@@ -148,5 +148,3 @@ redistribute this code, but any derivative you distribute **or run as a network
 service** must also be released under the AGPL with its complete source. This
 keeps the project and anything built on it open.
 
-A separate **commercial license** (without the AGPL's copyleft obligations) is
-available on request — open an issue or contact the author.
