@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import logging
+import time
 import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -60,7 +61,10 @@ from research.lib.signal_eval import (build_registry, compute_signal_panel,
                                       LAG_GRID, SCREENING_GRID, lag_label)
 
 warnings.filterwarnings('ignore')
+# INFO to stdout; force=True so it wins even if a module configured first.
 logging.basicConfig(level=logging.INFO,
+                    stream=sys.stdout,
+                    force=True,
                     format=global_config['logging']['format'],
                     datefmt=global_config['logging']['datefmt'])
 
@@ -911,6 +915,8 @@ class DataContext:
             if end is not None:
                 lf = lf.filter(pl.col(time_col) <
                                (end + pad_end if pad_end is not None else end))
+            t0 = time.perf_counter()
+            logging.info(f"  loading {table_name}.{value_col} wide...")
             df = lf.select([time_col, 'symbol', value_col]).collect()
             if df.is_empty():
                 return pd.DataFrame()
@@ -918,6 +924,8 @@ class DataContext:
                             aggregate_function='first').sort(time_col)
             out = wide.to_pandas().set_index(time_col)
             out.columns.name = 'symbol'
+            logging.info(f"  {table_name}.{value_col}: {out.shape[0]:,} bars x "
+                         f"{out.shape[1]} symbols ({time.perf_counter()-t0:.0f}s)")
             return out
 
         if start is not None or end is not None:
@@ -1066,6 +1074,9 @@ class WalkForwardPortfolio:
                          "the registry; each selectable only from its "
                          "promotion date")
         self.selector = SignalSelector(daily_stats, categories, valid_from)
+        # Per-month mirror of discovery: each OOS month trades ONLY the signals
+        # promoted in that month's roll (keyed by the roll's oos_start).
+        self.selector.month_signals = self._build_month_signals()
         self.ctx: Optional[DataContext] = None
         self._ctx_start: Optional[pd.Timestamp] = None
         self._ctx_end: Optional[pd.Timestamp] = None
@@ -2223,6 +2234,7 @@ class WalkForwardPortfolio:
 
 
 def main():
+    logging.info("Walk-forward starting (registry -> scoring -> panels)...")
     wf = WalkForwardPortfolio()
     # run() checkpoints each window to the DB (wf_portfolio_*) as it traverses.
     returns = wf.run()

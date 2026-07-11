@@ -26,9 +26,7 @@ from dbutil import load_data, get_table_columns
 from config import config as global_config, get, horizon_bars
 
 warnings.filterwarnings('ignore')
-logging.basicConfig(level=logging.WARNING,
-                    format=global_config['logging']['format'],
-                    datefmt=global_config['logging']['datefmt'])
+# Library module: no basicConfig (it clobbers the entry point's logging config).
 
 SCREENING_GRID = get('signals.screening_grid', '1h')
 SMOOTHING_HALFLIFE = get('signals.smoothing_halflife', 3)
@@ -1112,24 +1110,31 @@ def score_registry(registry: Optional[Dict] = None) -> pd.DataFrame:
         _REGISTRY = registry          # evaluate_signal reads the module state
     registry = _REGISTRY
 
-    groups: Dict[tuple, list] = {}
-    for name in sorted(registry):
-        key = tuple(signal_feature_columns(registry[name]['signal_def']))
-        groups.setdefault(key, []).append(name)
+    # Load the UNION of every signal's feature columns ONCE, then score all
+    # signals against it. evaluate_signal reads only the columns it needs, so a
+    # superset panel is fine. (This used to loop per distinct column set and
+    # reload the full 16M-row feature panel each time - N unique sets = N loads,
+    # the startup bottleneck.)
+    union_cols = sorted({c for name in registry
+                         for c in signal_feature_columns(
+                             registry[name]['signal_def'])})
+    logging.info(f"scoring {len(registry)} signals; loading {len(union_cols)} "
+                 f"feature columns once...")
+    features = _load_features(union_cols)
+    logging.info(f"features loaded ({len(features):,} rows); scoring...")
 
     frames = []
-    for columns, names in sorted(groups.items()):
-        features = _load_features(list(columns))
-        for name in names:
-            try:
-                daily, summaries = evaluate_signal(name, features)
-            except Exception as e:
-                logging.warning(f"scoring failed for {name}: {e}")
-                continue
-            if not daily.empty:
-                frames.append(daily)
-            for row in summaries:
-                if row.get('error'):
-                    logging.warning(f"{name} [{row.get('horizon')}]: "
-                                    f"{row['error']}")
+    for i, name in enumerate(sorted(registry), 1):
+        try:
+            daily, summaries = evaluate_signal(name, features)
+        except Exception as e:
+            logging.warning(f"scoring failed for {name}: {e}")
+            continue
+        if not daily.empty:
+            frames.append(daily)
+        for row in summaries:
+            if row.get('error'):
+                logging.warning(f"{name} [{row.get('horizon')}]: {row['error']}")
+        if i % 10 == 0 or i == len(registry):
+            logging.info(f"  scored {i}/{len(registry)} signals")
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

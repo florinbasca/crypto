@@ -26,7 +26,7 @@ import pandas as pd
 from dbutil import load_data
 from config import get_frequency_config, config as global_config
 
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+# Library module: no basicConfig (it clobbers the entry point's logging config).
 
 FUT_CFG = global_config['features'].get('futures', {})
 
