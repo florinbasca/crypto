@@ -212,3 +212,6 @@ test_*.py
 # API keys and secrets (bare name matches both the .keys file and a .keys/ dir)
 .keys
 .keys/
+
+# vendored emissions-adapters: track source, not its npm install
+vendor/emissions-adapters/node_modules/

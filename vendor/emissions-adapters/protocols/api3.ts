@@ -1,0 +1,63 @@
+import { manualCliff, manualLinear } from "../adapters/manual";
+import { Protocol } from "../types/adapters";
+import { periodToSeconds } from "../utils/time";
+import { stakingRewards, latest } from "../adapters/api3";
+const start = 1606741200;
+const qty = 100000000;
+
+const api3: Protocol = {
+  "Founding Team": [
+    manualCliff(start + periodToSeconds.month * 6, qty * 0.05),
+    manualLinear(
+      start + periodToSeconds.month * 6,
+      start + periodToSeconds.year * 3,
+      qty * 0.25,
+    ),
+  ],
+  "Partners & Contributors": [
+    manualCliff(start + periodToSeconds.month * 6, qty * (0.1 / 6)),
+    manualLinear(
+      start + periodToSeconds.month * 6,
+      start + periodToSeconds.year * 3,
+      qty * (0.5 / 6),
+    ),
+  ],
+  "Pre-seed Investors": manualLinear(
+    start,
+    start + periodToSeconds.year * 2,
+    qty * 0.05,
+  ),
+  "Seed Investors": manualLinear(
+    start,
+    start + periodToSeconds.year * 2,
+    qty * 0.1,
+  ),
+  "Ecosystem Fund": manualCliff(start, qty * 0.25),
+  "Public distribution": manualCliff(start, qty * 0.2),
+  "Staking rewards": () => stakingRewards(),
+  meta: {
+    token: "coingecko:api3",
+    sources: [
+      "https://medium.com/api3/api3-public-token-distribution-event-1acb3b6d940",
+    ],
+    notes: ["Inflationary staking rewards has no set allocation. In this analysis we can only look at past unlocks"],
+    protocolIds: ["1339"],
+    total: qty,
+    incompleteSections: [
+      {
+        key: "Staking rewards",
+        allocation: undefined,
+        lastRecord: () => latest(),
+      },
+    ],
+  },
+  categories: {
+    noncirculating: ["Ecosystem Fund"],
+    publicSale: ["Public distribution"],
+    staking: ["Staking rewards"],
+    privateSale: ["Pre-seed Investors","Seed Investors"],
+    insiders: ["Founding Team","Partners & Contributors"],
+  },
+};
+
+export default api3;
