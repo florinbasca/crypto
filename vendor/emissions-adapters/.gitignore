@@ -1,6 +1,0 @@
-/node_modules
-**/**/*.js
-/utils/testCharts
-result.txt
-/utils/result.png
-.env

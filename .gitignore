@@ -213,5 +213,5 @@ test_*.py
 .keys
 .keys/
 
-# vendored emissions-adapters: track source, not its npm install
-vendor/emissions-adapters/node_modules/
+# emissions-adapters clone (unlock schedules; see etl/unlocks.py docstring)
+vendor/

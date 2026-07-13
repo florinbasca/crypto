@@ -1,1 +1,0 @@
-import adapter from "./sablier";

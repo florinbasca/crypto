@@ -1,6 +1,7 @@
 """
 ETL for token unlock/emission schedules (self-run DefiLlama
-emissions-adapters; see vendor/emissions-adapters + export_schedules.ts).
+emissions-adapters). The adapter repo is a gitignored clone under
+vendor/ (NOT tracked); only the exporter etl/export_schedules.ts is ours.
 
 Input : data_unlock_schedules.json (produced by the exporter:
         {protocol: {sections: [{label, continuous, series: [[unix_s,
@@ -15,9 +16,16 @@ PIT caveat (documented in the plan): schedules are the CURRENT known
 version; revisions are not versioned here. schedule_hash is stored per run
 so future snapshots can detect changes.
 
-Run the exporter first:
-  cd vendor/emissions-adapters && npx ts-node --transpile-only \
-      export_schedules.ts <protocols_csv> ../../data_unlock_schedules.json
+Run the exporter first (one-time setup, then rerun ~monthly for fresh
+forward cliffs; upstream DefiLlama/emissions-adapters went private, hence
+the fork):
+  git clone https://github.com/Omni-Chain-Protocols/emissions-adapters \
+      vendor/emissions-adapters
+  cd vendor/emissions-adapters
+  npm install --ignore-scripts && npm install -D typescript@5.3
+  cp ../../etl/export_schedules.ts .   # imports resolve inside the repo
+  npx ts-node --transpile-only export_schedules.ts <protocols_csv> \
+      ../../data_unlock_schedules.json
 """
 
 import sys

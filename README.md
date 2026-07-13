@@ -130,7 +130,8 @@ How far the backtested numbers should be trusted out of sample:
   - *Stablecoin supply* (`etl/stablecoins.py` → `mx_stable_`, gate-only):
     DefiLlama total + per-chain (ETH/SOL/Tron) supply growth, 1-day lagged.
   - *Token unlocks* (`etl/unlocks.py` → `un_`): vesting calendar from the
-    self-run DefiLlama emissions-adapters (vendored fork under `vendor/`);
+    self-run DefiLlama emissions-adapters (gitignored clone under
+    `vendor/`; setup recipe in the `etl/unlocks.py` docstring);
     forward dates are legitimately knowable (calendar convention, like ev_).
     Caveat: schedules are the current-known version — revisions are not
     versioned; a `schedule_hash` is printed per run to detect changes.
