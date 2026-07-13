@@ -5,6 +5,12 @@ place P&L is judged; discovery is purely statistical, refers to residuals and ca
 
 The formula space is infinite and naive search overfits. Three controls: a bounded expression, an LLM proposing candidates, and promotion only of signals that stay significant on a held-out month. Scoring and selection are deterministic.
 
+"Agentic" describes the loop, not the model. Each LLM call is one stateless
+prompt → JSON completion: no tools, no memory, no data access, no control over
+what happens next. The feedback (scored parents, failures, over-mined blocks in
+the next prompt), the budget allocation, and every decision are deterministic
+code — the LLM is the idea generator inside an evolutionary search, nothing more.
+
 ## Grammar or the language of the signal
 
 Formulas are written in a small fixed **DSL** (domain-specific language: a fixed set of operators over whitelisted feature columns). A candidate is an expression plus gate conditions:
@@ -85,10 +91,13 @@ alpha term is corrected for both:
 - Even when the skill is real, a fast edge decays before the book can trade into
   it, so only part of it is capturable. **Capture weight**, `1 / (1 + φ/κ)`,
   scales the alpha down to the tradable fraction. φ = ln2 / *effective
-  persistence* = min(alpha half-life, position life lag/turnover) — the alpha
-  and the positions must BOTH live long enough. κ = the GP fill rate the
-  walk-forward actually trades at (~0.048/bar; per-name fills are further
-  capped at 10% of trailing volume). Duration, not fees.
+  persistence* = min(alpha half-life, position life `1/turnover`) — the alpha
+  and the positions must BOTH live long enough (turnover is per bar, so
+  `1/turnover` is the bars until the signal has fully reshuffled itself).
+  κ = the GP fill rate the walk-forward actually trades at (~0.048/bar;
+  per-name fills are further capped at 10% of trailing volume). At the
+  current κ the 0.5 capture floor binds at churn ≈ 0.07/bar. Duration,
+  not fees.
 
 **Incremental** rewards adding something new instead of repeating what you
 already have: the pooled per-bet return of survivors *with* the candidate
@@ -99,10 +108,9 @@ in the walk-forward.
 **Turnover** (mean per-bar book churn, `0.5·Σ|Δw|` on the gross-1 signal;
 0 = positions never change, 1 = replaced every bar) is recorded per candidate
 and enters selection twice: through the capture weight (position life
-`lag/turnover` caps effective persistence) and as a hard promotion ceiling
-`max_turnover = 0.01`/bar — tracking a 0.01/bar churner costs ~14bps/day at
-5bps/side, past any alpha measured here, so churnier signals are rejected
-outright. Never a cost term — cost stays in the walk-forward.
+`1/turnover` caps effective persistence — the graded gate, binding at
+~0.07/bar) and as a hard fails-open backstop `max_turnover = 0.10`/bar for
+extremes. Never a cost term — cost stays in the walk-forward.
 
 ## Diversity
 
@@ -136,9 +144,9 @@ horizon of its profile clears all of:
   whose sign reverses out-of-sample is rejected, never admitted on magnitude.
 - Sign agreement: the train profile mostly shares the traded sign.
 - Capture floor: effective persistence long enough for the book to hold.
-- Turnover ceiling (`max_turnover = 0.01`/bar): signals churnier than this
-  cannot pay for their own tracking at 5bps — rejected outright. Fails open
-  when turnover is unknown.
+- Turnover ceiling (`max_turnover = 0.10`/bar): extremes backstop above the
+  capture floor (which already binds at ~0.07/bar). Fails open when turnover
+  is unknown.
 - Orthogonality to signals already promoted this roll.
 
 Passers are written to the promotions table with profile, half-life, turnover,

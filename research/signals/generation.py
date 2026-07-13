@@ -420,7 +420,7 @@ def compile_candidate(cand: Candidate, panel: pd.DataFrame,
 
     panel must be sorted by (symbol, timestamp) - rolling operators depend on
     it. Validation runs first when allowed_columns is given (the search always
-    passes it; tests may skip). Pipeline (hard requirement from agent.md):
+    passes it; tests may skip). Pipeline (hard requirement from signal.md):
     evaluate the expression, apply gate conditions (gated-off rows are neutral
     0, keeping the cross-section intact), then per-timestamp cross-sectional
     demean + z-score + clip (+-3) - the same normalization

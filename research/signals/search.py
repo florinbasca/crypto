@@ -254,16 +254,17 @@ def trade_rate_per_bar(cfg: Optional[dict] = None) -> float:
 def effective_persistence_bars(half_life_bars: float, lag_bars: int,
                                turnover: Optional[float]) -> float:
     """Persistence the capture weight prices: min(alpha half-life,
-    turnover-implied position life lag/turnover). The half-life says how long
-    the ALPHA lives; lag/turnover says how long the POSITIONS live (a churny
-    signal reshuffles every rebalance regardless of its fitted half-life).
-    The discount must honor the shorter. Turnover clipped to [1e-2, 2];
-    missing/NaN turnover falls back to the half-life alone. Mirrors the
-    walk-forward's hold_bars (cost_holding_bars capped by half-life)."""
+    turnover-implied position life). Turnover is PER BAR (fraction of the
+    gross-1 signal replaced each bar), so position life = 1/turnover bars -
+    how long until the signal has fully reshuffled itself. The half-life says
+    how long the ALPHA lives; 1/turnover says how long the POSITIONS live;
+    the discount honors the shorter. Turnover clipped to [1e-4, 2];
+    missing/NaN turnover falls back to the half-life alone. (lag_bars kept
+    for call-site stability; unused.)"""
     hl = max(float(half_life_bars), 1e-9)
     if turnover is None or not np.isfinite(turnover) or turnover <= 0:
         return hl
-    return min(hl, float(lag_bars) / min(max(float(turnover), 1e-2), 2.0))
+    return min(hl, 1.0 / min(max(float(turnover), 1e-4), 2.0))
 
 
 def persistence_weight(half_life_bars: float, rate_bar: float) -> float:

@@ -419,7 +419,7 @@ config = {
 
     # Agentic signal discovery (research/signals/): bounded-DSL search
     # over residual-predictive cross-sectional signals with a train/select/OOS
-    # walk-forward. Design in research/signals/agent.md. Everything here
+    # walk-forward. Design in research/signals/signal.md. Everything here
     # is read via config.get('discovery.<...>') - never hardcoded.
     'discovery': {
         'start_date': '2023-08-01',      # First roll's train start
@@ -588,20 +588,21 @@ config = {
             'max_book_size': 15,      # per roll (the book re-forms every roll)
             # Capture floor: minimum persistence weight 1/(1 + phi/kappa) a
             # candidate needs to promote. phi uses EFFECTIVE persistence
-            # min(alpha half-life, position life lag/turnover); kappa is the
-            # GP fill rate the walk-forward trades at (~0.048/bar). 0.5 =
-            # effective persistence of at least ~15 bars (~2.4h). 0 disables.
+            # min(alpha half-life, position life 1/turnover_per_bar); kappa is
+            # the GP fill rate the walk-forward trades at (~0.048/bar). 0.5 =
+            # effective persistence >= ~15 bars, i.e. per-bar turnover <=
+            # ~0.07 - this floor is the graded churn gate. 0 disables.
             # Duration-based, never a cost model.
             'min_capture': 0.5,
-            # Turnover CEILING: rejects a signal whose per-bar book churn
-            # (0.5*sum|dw| on the gross-1 signal, ledger 'turnover' column)
-            # exceeds the cap. Arithmetic behind 0.01: tracking a signal that
-            # churns X/bar costs 2 x cost_bps x X x 144 per day; at X = 0.01
-            # that is ~14bps/day - already past any daily alpha measured here,
-            # so this is a loose extremes-killer (the 0.1-0.6 churners), with
-            # the graded discount below the cap left to the capture weight.
-            # None disables.
-            'max_turnover': 0.01,
+            # Turnover CEILING (backstop above the capture floor, which
+            # already binds at ~0.07/bar): rejects a signal whose per-bar
+            # churn (0.5*sum|dw| on the gross-1 signal) exceeds the cap.
+            # Calibration: measured survivor churn is median ~0.14/bar with
+            # only ~8% below 0.01 - the first pick (0.01) rejected every
+            # statistically-passing survivor and left only sparse macro-gated
+            # signals too thin to measure. 0.10 is a fails-open extremes
+            # backstop; the capture floor does the graded work. None disables.
+            'max_turnover': 0.10,
         },
         # LLM proposer (untrusted: sees compressed diagnostics only, emits DSL
         # JSON; everything it returns is re-validated and re-scored by code).

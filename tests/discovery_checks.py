@@ -348,17 +348,20 @@ check("directional: sign-reversed hold-out signal is NOT promoted",
       f"{len(reversed_promoted)} promoted)")
 
 # Effective persistence: capture prices min(alpha half-life, position life
-# lag/turnover) against the BUDGET-CAPPED fill rate (kappa alignment with the
-# walk-forward's turnover budget).
+# 1/turnover). Turnover is PER BAR, so 1/turnover = bars until the signal has
+# fully reshuffled itself (regression: lag/turnover mixed units and credited
+# a 0.1/bar churner with 1,440 bars of persistence instead of 10).
 _ep = search_mod.effective_persistence_bars
-check("persistence: churny signal (turnover 1) -> position life = lag",
-      _ep(2016.0, 144, 1.0) == 144.0)
-check("persistence: slow signal -> half-life binds",
-      _ep(96.0, 144, 0.04) == 96.0)
+check("persistence: full-churn signal (turnover 1) -> 1 bar",
+      _ep(2016.0, 144, 1.0) == 1.0)
+check("persistence: slow churn (0.04/bar) -> 25 bars, beats half-life 96",
+      _ep(96.0, 144, 0.04) == 25.0)
+check("persistence: half-life binds when churn is slower still",
+      _ep(96.0, 144, 0.005) == 96.0)
 check("persistence: missing turnover -> half-life alone",
       _ep(288.0, 72, float('nan')) == 288.0 and _ep(288.0, 72, None) == 288.0)
-check("persistence: hyperactive turnover clipped at 2",
-      _ep(2016.0, 144, 5.0) == 72.0)
+check("persistence: hyperactive turnover clipped at 2 -> 0.5 bars",
+      _ep(2016.0, 144, 5.0) == 0.5)
 # Turnover diagnostic: a property of the signal alone (0 = never retrades,
 # 1 = fully replaced each bar). Ledger-only; never touches reward, promotion,
 # or the walk-forward.

@@ -1,5 +1,5 @@
 """
-Agentic signal discovery - the deterministic harness (see agent.md).
+Agentic signal discovery - the deterministic harness (see signal.md).
 
 Discovery is PURELY STATISTICAL: it measures each candidate's per-bet return
 (alpha, in return units; rank IC kept as a diagnostic), fits alpha
@@ -232,11 +232,15 @@ def main():
                   f"turnover {p.get('turnover', float('nan')):.3f}/bar)")
         promo_rows.extend(roll_promo_rows)
 
-        # Flush EVERY roll: a run killed at roll N keeps rolls 0..N-1.
+        # Flush EVERY roll (ledger, promotions AND llm usage): a run killed
+        # at roll N keeps rolls 0..N-1, and inspect sees usage mid-run.
         if save:
             ledger.flush()
             _save(tables['promotions'], pd.DataFrame(roll_promo_rows),
                   fresh=False, save=True)
+            if usage_rows and usage_rows[-1]['roll_id'] == roll.roll_id:
+                _save(tables['llm_usage'], pd.DataFrame(usage_rows[-1:]),
+                      fresh=False, save=True)
 
     print(f"\n=== promotions ===")
     if not promo_rows:
@@ -267,9 +271,7 @@ def main():
     else:
         print("\n=== LLM cost ===\n$0.00 (no API calls)")
 
-    # promotions were appended per roll; only usage is left.
-    _save(tables['llm_usage'], pd.DataFrame(usage_rows), fresh=False,
-          save=save)
+    # ledger/promotions/usage were all flushed per roll.
     if save:
         ledger.flush()
         print(f"Saved: {tables['ledger']}, {tables['promotions']}, "

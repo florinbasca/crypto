@@ -73,12 +73,13 @@ from the persisted `wf_portfolio_*` tables.
 ## Signals: how they're found
 
 Signals aren't written by hand. An LLM proposes small formulas (feature columns
-combined with a few operators and optional gates); a deterministic search scores
-each one by the return of the book it implies (per-bet, in return units — not a
-rank correlation) on rolling monthly windows, and promotes only those whose
-return stays statistically significant on a held-out month. The promoted
-formulas are the only signals the portfolio trades — discovery itself never
-trades.
+combined with a few operators and optional gates) — one stateless prompt→JSON
+call per batch; the loop, memory and every decision are deterministic code. The
+search scores each formula by the per-bet return of its normalized long/short
+weights (return units, not a rank correlation) on rolling monthly windows, and
+promotes only those whose return stays statistically significant on a held-out
+month. The promoted formulas are the only signals the portfolio trades —
+discovery itself never trades.
 
 ```bash
 uv run research/signals/discovery.py --max-rolls 2   # quick test
@@ -94,7 +95,7 @@ signals in that roll's OOS month only — the month discovery never saw.
 
 **The full design — DSL grammar, the LLM prompt, the reward, the promotion
 gates, the walk-forward windows — is documented in
-[`research/signals/agent.md`](research/signals/agent.md).**
+[`research/signals/signal.md`](research/signals/signal.md).**
 
 
 ## Limitations
