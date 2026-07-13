@@ -38,8 +38,9 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from config import BARS_PER_DAY, get
 from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
-from research.signals.data import (Roll, purge_bars, slice_window,
-                                         strided_stamps, target_col)
+from research.signals.data import (Roll, book_returns, purge_bars,
+                                         slice_window, strided_stamps,
+                                         target_col)
 from research.signals.generation import (_to_list, ast_similarity,
                                                candidate_subtrees,
                                                Candidate, Proposer,
@@ -61,25 +62,6 @@ def empty_metrics() -> dict:
         'rank_ic_tstat': 0.0, 'target_dispersion': np.nan,
         'n_cross_sections': 0, 'n_days': 0,
     }
-
-
-def _book_returns(df: pd.DataFrame, tcol: str, min_assets: int) -> pd.Series:
-    """Per-stamp return of the gross-1 dollar-neutral book built from the
-    signal cross-section: v_t = sum_i w_i * target_i with w = demeaned signal
-    scaled to gross 1. Return units per bet - money, not correlation."""
-    d = df[['timestamp', 'signal', tcol]].dropna()
-    if d.empty:
-        return pd.Series(dtype=float)
-    g = d.groupby('timestamp')
-    n = g['signal'].transform('size')
-    d = d[n >= min_assets]
-    if d.empty:
-        return pd.Series(dtype=float)
-    g = d.groupby('timestamp')
-    w = d['signal'] - g['signal'].transform('mean')
-    gross = w.abs().groupby(d['timestamp']).transform('sum')
-    w = w / gross.replace(0, np.nan)
-    return (w * d[tcol]).groupby(d['timestamp']).sum(min_count=1).dropna()
 
 
 def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
@@ -116,7 +98,7 @@ def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
     if df.empty:
         return empty_metrics()
 
-    bets = _book_returns(df, tcol, min_assets)
+    bets = book_returns(df, tcol, min_assets)
     if bets.empty:
         return empty_metrics()
     alpha_mean = float(bets.mean())
@@ -124,7 +106,7 @@ def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
     daily_alpha = bets.groupby(lambda ts: ts.normalize()).mean()
 
     if 'is_liquid' in df.columns:
-        liq = _book_returns(df[df['is_liquid']], tcol,
+        liq = book_returns(df[df['is_liquid']], tcol,
                             max(3, min_assets // 2))
         liq_alpha = float(liq.mean()) if not liq.empty else np.nan
     else:

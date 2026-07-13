@@ -669,7 +669,7 @@ config = {
                                'mx_vix_z', 'ev_hours_since_event'],
             'top_per_family': 6,             # compressed view size
             # Ranking blend for which features get full diagnostics (each term
-            # rank-normalized within the family): monotonic IC t-stat + decile
+            # rank-normalized within the family): monotonic alpha t-stat + decile
             # nonlinearity + regime spread + stability, so U-shaped/threshold/
             # regime-only features are not hidden by a t-stat-only sort.
             'top_blend': {'monotonic': 1.0, 'nonlinear': 0.6,

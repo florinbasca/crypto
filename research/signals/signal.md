@@ -157,9 +157,9 @@ and direction. Promotion neither trades nor sizes.
 Train diagnostics only — never returns or the raw panel:
 
 - A one-line description of each column.
-- Per-column rank IC, decile curve, regime-split IC, stability (proposer
-  diagnostics only — selection uses per-bet returns).
-- The top columns per family, ranked by a blend of monotonic IC, decile
+- Per-column per-bet return (alpha) with its t-stat, decile curve,
+  regime-split alpha, stability — the same currency the reward uses.
+- The top columns per family, ranked by a blend of monotonic alpha, decile
   nonlinearity, regime spread, and stability (so U-shaped/threshold features
   aren't hidden by a t-stat-only rank).
 - Current survivors with scores, best first; recently-culled ones and over-mined

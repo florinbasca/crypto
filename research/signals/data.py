@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from config import get, get_frequency_config, BASE_FREQUENCY
-from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
+from research.lib.signal_eval import _nw_tstat
 
 TARGET_PREFIX = 'fwd_'
 
@@ -433,15 +433,15 @@ def describe_column(col: str) -> str:
 
 def _decile_nonlinearity(binned) -> float:
     """Spread of a feature's decile forward-return curve. Large for U-shapes,
-    thresholds and sign-flips even when the monotonic IC is ~0 - so these
+    thresholds and sign-flips even when the monotonic alpha is ~0 - so these
     features are not hidden from the LLM by a t-stat-only ranking."""
     vals = [v for v in (binned or []) if v is not None and np.isfinite(v)]
     return float(max(vals) - min(vals)) if len(vals) >= 3 else 0.0
 
 
 def _regime_spread(regime_ic) -> float:
-    """Largest high-vs-low regime IC gap: a feature that works only in one
-    regime scores high here even with weak pooled IC."""
+    """Largest high-vs-low regime alpha gap: a feature that works only in
+    one regime scores high here even with weak pooled alpha."""
     gaps = [abs(d['high'] - d['low']) for d in (regime_ic or {}).values()
             if d.get('high') is not None and d.get('low') is not None]
     return float(max(gaps)) if gaps else 0.0
@@ -455,17 +455,44 @@ def _rank01(values: Dict[str, float]) -> Dict[str, float]:
     return pd.Series(values).rank(pct=True).to_dict()
 
 
-def _feature_ic(df: pd.DataFrame, col: str, tcol: str,
-                min_assets: int) -> dict:
-    sub = df[['timestamp', col, tcol]].rename(columns={col: 'signal'})
-    ics = rank_ic_per_timestamp(sub, tcol, min_assets=min_assets)
-    if ics.empty:
-        return {'ic': np.nan, 'tstat': 0.0, 'n': 0}
-    daily = ics.set_index('timestamp')['ic'].groupby(
-        lambda ts: ts.normalize()).mean()
-    return {'ic': float(ics['ic'].mean()),
+def book_returns(df: pd.DataFrame, tcol: str, min_assets: int) -> pd.Series:
+    """Per-stamp return of the gross-1 dollar-neutral book built from the
+    signal cross-section: v_t = sum_i w_i * target_i with w = demeaned signal
+    scaled to gross 1. Return units per bet."""
+    d = df[['timestamp', 'signal', tcol]].dropna()
+    if d.empty:
+        return pd.Series(dtype=float)
+    g = d.groupby('timestamp')
+    n = g['signal'].transform('size')
+    d = d[n >= min_assets]
+    if d.empty:
+        return pd.Series(dtype=float)
+    g = d.groupby('timestamp')
+    w = d['signal'] - g['signal'].transform('mean')
+    gross = w.abs().groupby(d['timestamp']).transform('sum')
+    w = w / gross.replace(0, np.nan)
+    return (w * d[tcol]).groupby(d['timestamp']).sum(min_count=1).dropna()
+
+
+def _feature_alpha(df: pd.DataFrame, col: str, tcol: str,
+                   min_assets: int) -> dict:
+    """Per-bet return of the raw column, measured EXACTLY like a candidate:
+    per-stamp z-score + clip +-3 (the compiler pipeline for the identity
+    expression ["col", x]), then demean/gross-1/dot with the target. Same
+    currency as the reward, so the proposer is pointed at what scores."""
+    sub = df[['timestamp', col, tcol]].rename(columns={col: 'signal'}).dropna()
+    if sub.empty:
+        return {'alpha': np.nan, 'tstat': 0.0, 'n': 0}
+    g = sub.groupby('timestamp')['signal']
+    sub['signal'] = ((sub['signal'] - g.transform('mean'))
+                     / (g.transform('std') + 1e-10)).clip(-3, 3)
+    bets = book_returns(sub, tcol, min_assets)
+    if bets.empty:
+        return {'alpha': np.nan, 'tstat': 0.0, 'n': 0}
+    daily = bets.groupby(lambda ts: ts.normalize()).mean()
+    return {'alpha': float(bets.mean()),
             'tstat': float(_nw_tstat(daily.values, 'auto')),
-            'n': int(len(ics))}
+            'n': int(len(bets))}
 
 
 def _binned_curve(df: pd.DataFrame, col: str, tcol: str, n_bins: int) -> list:
@@ -482,7 +509,7 @@ def _binned_curve(df: pd.DataFrame, col: str, tcol: str, n_bins: int) -> list:
 
 def _thirds_stability(df: pd.DataFrame, col: str, tcol: str,
                       min_assets: int) -> int:
-    """How many time-thirds share the pooled IC sign (0-3)."""
+    """How many time-thirds share the pooled alpha sign (0-3)."""
     stamps = np.sort(df['timestamp'].unique())
     if len(stamps) < 9:
         return 0
@@ -490,8 +517,9 @@ def _thirds_stability(df: pd.DataFrame, col: str, tcol: str,
     signs = []
     for part in parts:
         sub = df[df['timestamp'].isin(part)]
-        signs.append(np.sign(_feature_ic(sub, col, tcol, min_assets)['ic']))
-    pooled = np.sign(_feature_ic(df, col, tcol, min_assets)['ic'])
+        signs.append(np.sign(
+            _feature_alpha(sub, col, tcol, min_assets)['alpha']))
+    pooled = np.sign(_feature_alpha(df, col, tcol, min_assets)['alpha'])
     return int(sum(1 for s in signs if s == pooled and s != 0))
 
 
@@ -516,27 +544,30 @@ def build_diagnostics(train_panel: pd.DataFrame,
         for col in cols:
             if col not in df.columns or col in features:
                 continue
-            base = _feature_ic(df, col, tcol, min_assets)
+            base = _feature_alpha(df, col, tcol, min_assets)
             entry = {
                 'family': family,
                 'desc': describe_column(col),
-                'ic': round(base['ic'], 5) if np.isfinite(base['ic']) else None,
-                'ic_tstat': round(base['tstat'], 2),
+                'alpha_per_bet': (round(base['alpha'], 6)
+                                  if np.isfinite(base['alpha']) else None),
+                'alpha_tstat': round(base['tstat'], 2),
                 'binned_fwd': _binned_curve(df, col, tcol, n_bins),
                 'stable_thirds': _thirds_stability(df, col, tcol, min_assets),
-                'regime_ic': {},
+                'regime_alpha': {},
             }
             for rc in regime_cols:
                 if rc == col:
                     continue
                 med = df.groupby('timestamp')[rc].transform('median')
-                hi = _feature_ic(df[df[rc] >= med], col, tcol,
-                                 max(3, min_assets // 2))
-                lo = _feature_ic(df[df[rc] < med], col, tcol,
-                                 max(3, min_assets // 2))
-                entry['regime_ic'][rc] = {
-                    'high': round(hi['ic'], 5) if np.isfinite(hi['ic']) else None,
-                    'low': round(lo['ic'], 5) if np.isfinite(lo['ic']) else None,
+                hi = _feature_alpha(df[df[rc] >= med], col, tcol,
+                                    max(3, min_assets // 2))
+                lo = _feature_alpha(df[df[rc] < med], col, tcol,
+                                    max(3, min_assets // 2))
+                entry['regime_alpha'][rc] = {
+                    'high': (round(hi['alpha'], 6)
+                             if np.isfinite(hi['alpha']) else None),
+                    'low': (round(lo['alpha'], 6)
+                            if np.isfinite(lo['alpha']) else None),
                 }
             features[col] = entry
 
@@ -557,10 +588,10 @@ def build_diagnostics(train_panel: pd.DataFrame,
             top[family] = []
             continue
         comps = {
-            'monotonic': {c: abs(features[c]['ic_tstat']) for c in fam},
+            'monotonic': {c: abs(features[c]['alpha_tstat']) for c in fam},
             'nonlinear': {c: _decile_nonlinearity(features[c]['binned_fwd'])
                           for c in fam},
-            'regime': {c: _regime_spread(features[c]['regime_ic']) for c in fam},
+            'regime': {c: _regime_spread(features[c]['regime_alpha']) for c in fam},
             'stability': {c: float(features[c]['stable_thirds']) for c in fam},
         }
         score = {c: 0.0 for c in fam}
