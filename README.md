@@ -15,9 +15,16 @@ uv run etl/universe.py        # Hyperliquid perp candidates (~130, no stables)
 uv run etl/prices_raw.py      # 1m Binance spot klines, last 3y (~big download)
 uv run etl/prices.py          # resample 1m -> 10min `prices` table
 uv run etl/marketcap.py       # daily mcap
-uv run etl/funding.py         # perp funding rates
+uv run etl/funding.py         # perp funding rates (Binance)
 uv run etl/futures.py         # OI / positioning metrics (optional)
 uv run etl/macro.py           # macro/event data: FRED market series (needs .env FRED_KEY)
+
+# 1b. Slow/fundamental data (all free, no keys; optional but feeds
+#     whole feature families - see "Slow data" below)
+uv run etl/stablecoins.py     # DefiLlama stablecoin supply (total + per chain)
+uv run etl/unlocks.py         # token unlock calendar (needs the exporter, see its docstring)
+uv run etl/dev_activity.py    # Electric Capital developer activity (~75MB download)
+uv run etl/listings.py        # true first perp trade date per name
 
 # 2. Risk model
 uv run risk_model/factor_returns.py    # builds factor returns
@@ -117,6 +124,31 @@ How far the backtested numbers should be trusted out of sample:
   TVL, Fear&Greed. Macro enters as event/state conditioners (ev_/mx_, DSL
   gate material) and per-name sensitivities (mb_). Still no order-book/L2,
   news, or per-name on-chain data.
+- **Slow data (free-only stack).** The walk-forward showed the price/volume
+  feature space holds mostly fast alpha, so slower fundamental inputs were
+  added — all $0, no keys:
+  - *Stablecoin supply* (`etl/stablecoins.py` → `mx_stable_`, gate-only):
+    DefiLlama total + per-chain (ETH/SOL/Tron) supply growth, 1-day lagged.
+  - *Token unlocks* (`etl/unlocks.py` → `un_`): vesting calendar from the
+    self-run DefiLlama emissions-adapters (vendored fork under `vendor/`);
+    forward dates are legitimately knowable (calendar convention, like ev_).
+    Caveat: schedules are the current-known version — revisions are not
+    versioned; a `schedule_hash` is printed per run to detect changes.
+  - *Developer activity* (`etl/dev_activity.py` → `dv_`): Electric Capital
+    Open Dev Data, daily 28-day-window active-dev counts per ecosystem,
+    ~110/130 names mapped (memecoins legitimately NaN). Snapshots are
+    rebuilt under the current repo taxonomy, so features carry a 30-day lag.
+  - *Listing age* (`etl/listings.py` → `ls_`): true first perp trade date
+    (Binance fapi earliest kline), because the `prices` table is
+    window-clipped; PIT by construction.
+  Deferred at $0: per-name exchange flows (no vendor has PIT flow labels
+  older than ~2024 — a 3y flow backtest would be fiction at any price),
+  social data (cheapest usable history is ~$300/mo), historical
+  *predicted* funding (only exists at Amberdata, $1.5k+/mo), and
+  multi-venue funding spreads (dropped: no second venue passes the
+  "reliable history back to 2023-01" rule - OKX's public API serves ~3
+  months, Hyperliquid perps only exist since ~mid-2023, and a
+  Bybit-Binance CEX spread is arbitraged to ~zero).
 - **Costs: conservative 5 bps/side + volume-participation cap.**
   `portfolio.cost_bps = 5.0` is a deliberately conservative all-in per-side
   assumption (for reference, Hyperliquid perp maker is 0.000% at tier 4+ and

@@ -107,18 +107,27 @@ def prune_to_window(start_dt: datetime.datetime, end_dt: datetime.datetime) -> N
 
 
 async def download_funding_rate(session, semaphore, symbol, year_month):
-    """Download monthly funding rate data from Binance Vision."""
-    async with semaphore:
-        perp_symbol = f"{symbol}{QUOTE_CURRENCY}"
-        url = f"{BASE_URL}{FUTURES_PATH}/{perp_symbol}/{perp_symbol}-fundingRate-{year_month}.zip"
+    """Download monthly funding rate data from Binance Vision.
 
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 404:
-                    return None
-                resp.raise_for_status()
-                zip_data = await resp.read()
-        except Exception:
+    Tiny-price names have no {SYM}USDT perp - Binance lists them as
+    1000-contracts (1000PEPEUSDT). Funding RATES are unitless, so the
+    fallback needs no rescaling."""
+    async with semaphore:
+        zip_data = None
+        for perp_symbol in (f"{symbol}{QUOTE_CURRENCY}",
+                            f"1000{symbol}{QUOTE_CURRENCY}"):
+            url = (f"{BASE_URL}{FUTURES_PATH}/{perp_symbol}/"
+                   f"{perp_symbol}-fundingRate-{year_month}.zip")
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 404:
+                        continue
+                    resp.raise_for_status()
+                    zip_data = await resp.read()
+                    break
+            except Exception:
+                continue
+        if zip_data is None:
             return None
 
         try:

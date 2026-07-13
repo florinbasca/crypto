@@ -1052,6 +1052,195 @@ def calculate_macro_state_features(df: pd.DataFrame,
     return features
 
 
+UN_FEATURE_NAMES = [
+    'un_days_to_next', 'un_next_pct', 'un_days_since_last',
+    'un_trailing_30d_pct',
+]
+UN_CLIFF_MIN_DAILY_PCT = 0.001    # a "cliff" day unlocks >= 0.1% of total
+
+
+def calculate_unlock_features(df: pd.DataFrame,
+                              symbol: str) -> Dict[str, pd.Series]:
+    """Token-unlock calendar features from token_unlocks_daily
+    (etl/unlocks.py). The schedule is a CALENDAR: forward dates are
+    legitimately knowable at bar t (same convention as ev_ event timing),
+    so days_to_next/next_pct read the future side of the schedule. Names
+    without a schedule stay NaN (meaning: no known vesting)."""
+    features = _nan_series(df, UN_FEATURE_NAMES)
+    try:
+        ul = load_data('token_unlocks_daily', filters={'symbol': symbol})
+        if ul is None or ul.empty:
+            return features
+        ul['date'] = pd.to_datetime(ul['date'])
+        ul = ul.sort_values('date')
+        ts = pd.to_datetime(df['timestamp'])
+        days = ts.dt.normalize()
+
+        cliffs = ul.loc[ul['daily_pct'] >= UN_CLIFF_MIN_DAILY_PCT,
+                        ['date', 'daily_pct']]
+        if not cliffs.empty:
+            cliff_dates = cliffs['date'].values
+            idx_next = np.searchsorted(cliff_dates, days.values, side='left')
+            has_next = idx_next < len(cliff_dates)
+            nxt = pd.Series(pd.NaT, index=df.index)
+            nxt[has_next] = pd.Series(
+                cliff_dates[idx_next.clip(max=len(cliff_dates) - 1)],
+                index=df.index)[has_next]
+            features['un_days_to_next'] = (
+                (nxt - days).dt.total_seconds() / 86400)
+            nxt_pct = pd.Series(np.nan, index=df.index)
+            nxt_pct[has_next] = cliffs['daily_pct'].values[
+                idx_next.clip(max=len(cliff_dates) - 1)][has_next]
+            features['un_next_pct'] = nxt_pct
+            idx_prev = np.searchsorted(cliff_dates, days.values,
+                                       side='right') - 1
+            has_prev = idx_prev >= 0
+            prv = pd.Series(pd.NaT, index=df.index)
+            prv[has_prev] = pd.Series(
+                cliff_dates[idx_prev.clip(min=0)], index=df.index)[has_prev]
+            features['un_days_since_last'] = (
+                (days - prv).dt.total_seconds() / 86400)
+
+        trailing = (ul.set_index('date')['daily_pct']
+                    .rolling('30D').sum())
+        features['un_trailing_30d_pct'] = _daily_to_bars(trailing, ts)
+    except Exception as e:
+        logging.error(f"Error calculating unlock features for {symbol}: {e}")
+    return features
+
+
+DV_FEATURE_NAMES = [
+    'dv_active_devs', 'dv_devs_chg_3m', 'dv_full_time_share',
+    'dv_exclusive_share',
+]
+DV_LAG_DAYS = 30    # snapshot publication + taxonomy-backfill margin
+
+_DEV_CACHE: Optional[pd.DataFrame] = None
+
+
+def calculate_dev_activity_features(df: pd.DataFrame,
+                                    symbol: str) -> Dict[str, pd.Series]:
+    """Developer-activity features from dev_activity (etl/dev_activity.py,
+    Electric Capital, daily 28d-window MADs). Snapshots are regenerated
+    with the current repo taxonomy, so every series is lagged DV_LAG_DAYS
+    before mapping to bars. Unmapped names (memecoins) stay NaN."""
+    global _DEV_CACHE
+    features = _nan_series(df, DV_FEATURE_NAMES)
+    try:
+        if _DEV_CACHE is None:
+            _DEV_CACHE = load_data('dev_activity')
+        dev = _DEV_CACHE
+        if dev is None or dev.empty:
+            return features
+        dev = dev[dev['symbol'] == symbol]
+        if dev.empty:
+            return features
+        d = (dev.assign(date=lambda x: pd.to_datetime(x['date']))
+             .set_index('date').sort_index()
+             .resample('D').ffill())       # sparse days -> daily grid
+        ts = pd.to_datetime(df['timestamp'])
+        devs = d['all_devs'].astype(float)
+
+        def lagged(s):
+            return _daily_to_bars(s.shift(DV_LAG_DAYS), ts)
+
+        features['dv_active_devs'] = lagged(np.log1p(devs))
+        # +1 in the base: small integer counts hit zero
+        features['dv_devs_chg_3m'] = lagged(
+            (devs - devs.shift(90)) / (devs.shift(90) + 1.0))
+        features['dv_full_time_share'] = lagged(
+            d['full_time_devs'] / devs.replace(0, np.nan))
+        features['dv_exclusive_share'] = lagged(
+            d['exclusive_devs'] / devs.replace(0, np.nan))
+    except Exception as e:
+        logging.error(f"Error calculating dev-activity features for {symbol}: {e}")
+    return features
+
+
+LS_FEATURE_NAMES = ['ls_days_since_listing', 'ls_newly_listed']
+LS_NEWLY_LISTED_DAYS = 30
+
+_LISTINGS_CACHE: Optional[pd.DataFrame] = None
+
+
+def calculate_listing_features(df: pd.DataFrame,
+                               symbol: str) -> Dict[str, pd.Series]:
+    """Listing age from listings (etl/listings.py, true first perp trade
+    date - the prices table is window-clipped so its first bar can't be
+    used). A listing date is PIT by construction."""
+    global _LISTINGS_CACHE
+    features = _nan_series(df, LS_FEATURE_NAMES)
+    try:
+        if _LISTINGS_CACHE is None:
+            _LISTINGS_CACHE = load_data('listings')
+        lst = _LISTINGS_CACHE
+        if lst is None or lst.empty:
+            return features
+        row = lst[lst['symbol'] == symbol]
+        if row.empty:
+            return features
+        first = pd.to_datetime(row['first_trade'].iloc[0])
+        ts = pd.to_datetime(df['timestamp'])
+        age = (ts - first).dt.total_seconds() / 86400
+        age[age < 0] = np.nan          # bars before listing (shouldn't occur)
+        features['ls_days_since_listing'] = age
+        features['ls_newly_listed'] = (
+            (age <= LS_NEWLY_LISTED_DAYS).astype(float).where(age.notna()))
+    except Exception as e:
+        logging.error(f"Error calculating listing features for {symbol}: {e}")
+    return features
+
+
+MX_STABLE_FEATURE_NAMES = [
+    'mx_stable_total_chg_30d', 'mx_stable_eth_chg_7d',
+    'mx_stable_sol_chg_7d', 'mx_stable_tron_chg_7d',
+]
+
+_STABLE_CACHE: Optional[pd.DataFrame] = None
+
+
+def calculate_stablecoin_features(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """Cross-sectionally CONSTANT stablecoin-supply state (gate material)
+    from stablecoin_supply (etl/stablecoins.py). Supply stamped D is knowable
+    during D+1, so every series is shifted 1 day before mapping to bars.
+    Complements mx_stables_flow_7d (total, from etl/macro) with a 30d total
+    and per-chain 7d growth."""
+    global _STABLE_CACHE
+    features = _nan_series(df, MX_STABLE_FEATURE_NAMES)
+    try:
+        if _STABLE_CACHE is None:
+            _STABLE_CACHE = load_data('stablecoin_supply')
+        sup = _STABLE_CACHE
+        if sup is None or sup.empty:
+            return features
+        sup = sup.copy()
+        sup['date'] = pd.to_datetime(sup['date'])
+        ts = pd.to_datetime(df['timestamp'])
+
+        def series(asset, chain):
+            s = sup[(sup['asset'] == asset) & (sup['chain'] == chain)]
+            return (s.set_index('date')['supply_usd'].sort_index()
+                    if not s.empty else None)
+
+        total = None
+        for a in ('USDT', 'USDC', 'DAI'):
+            s = series(a, 'all')
+            if s is not None:
+                total = s if total is None else total.add(s, fill_value=0)
+        if total is not None:
+            features['mx_stable_total_chg_30d'] = _daily_to_bars(
+                total.pct_change(30).shift(1), ts)
+        for name, chain in (('mx_stable_eth_chg_7d', 'Ethereum'),
+                            ('mx_stable_sol_chg_7d', 'Solana'),
+                            ('mx_stable_tron_chg_7d', 'Tron')):
+            s = series('ALL', chain)
+            if s is not None:
+                features[name] = _daily_to_bars(s.pct_change(7).shift(1), ts)
+    except Exception as e:
+        logging.error(f"Error calculating stablecoin features: {e}")
+    return features
+
+
 def calculate_macrobeta_features(df: pd.DataFrame, residual_series: pd.Series,
                                  macro_daily: Optional[pd.DataFrame],
                                  dominance: Optional[pd.Series],
@@ -1566,6 +1755,10 @@ def calculate_all_features(df: pd.DataFrame, config: Dict, symbol: str,
     feature_dfs.append(pd.DataFrame(calculate_range_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_microstructure_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_order_flow_features(df, config), index=df.index))
+    feature_dfs.append(pd.DataFrame(calculate_stablecoin_features(df), index=df.index))
+    feature_dfs.append(pd.DataFrame(calculate_unlock_features(df, symbol), index=df.index))
+    feature_dfs.append(pd.DataFrame(calculate_dev_activity_features(df, symbol), index=df.index))
+    feature_dfs.append(pd.DataFrame(calculate_listing_features(df, symbol), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_momentum_quality_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_statistical_features(df, config), index=df.index))
     feature_dfs.append(pd.DataFrame(calculate_price_features(df, config), index=df.index))

@@ -44,8 +44,6 @@ POS_FEATURE_NAMES = [
     'pos_toptrader_ls_zscore', 'pos_retail_vs_smart', 'pos_taker_ratio',
     'pos_taker_zscore',
 ]
-
-
 def _nan_features(df: pd.DataFrame, names) -> Dict[str, pd.Series]:
     return {n: pd.Series([np.nan] * len(df), index=df.index) for n in names}
 

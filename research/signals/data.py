@@ -256,6 +256,26 @@ def beta_columns(panel: pd.DataFrame) -> List[str]:
 # Keep in sync with the feature calculators.
 
 FEATURE_DESCRIPTIONS = {
+    # cross-venue funding structure (daily-equivalent rates)
+    # developer activity (per name; Electric Capital, 30d-lagged)
+    'dv_active_devs': "log monthly-active developers on the name's ecosystem (28d window, 30d-lagged)",
+    'dv_devs_chg_3m': "3-month change in active developers, relative to the prior level",
+    'dv_full_time_share': "share of active developers classified full-time",
+    'dv_exclusive_share': "share of active developers working only on this ecosystem",
+    # listing age (per name; from true first perp trade date)
+    'ls_days_since_listing': "days since the perp first traded (Binance/Hyperliquid listing date)",
+    'ls_newly_listed': "1 if the perp listed within the last 30 days, else 0",
+    # token-unlock calendar (per name; forward-knowable schedule)
+    'un_days_to_next': "days until the next unlock cliff (>=0.1% of total supply); NaN = no known vesting",
+    'un_next_pct': "size of the next unlock cliff as a fraction of total token allocation",
+    'un_days_since_last': "days since the last unlock cliff",
+    'un_trailing_30d_pct': "fraction of total allocation unlocked over the trailing 30 days",
+    # stablecoin supply state (constant across coins; gate material)
+    'mx_stable_total_chg_30d': "30d growth of total USDT+USDC+DAI supply — identical for all coins; use as a gate",
+    'mx_stable_eth_chg_7d': "7d growth of stablecoin supply on Ethereum — identical for all coins; use as a gate",
+    'mx_stable_sol_chg_7d': "7d growth of stablecoin supply on Solana — identical for all coins; use as a gate",
+    'mx_stable_tron_chg_7d': "7d growth of stablecoin supply on Tron — identical for all coins; use as a gate",
+
     # cross-sectional (per-timestamp rank/relative vs the universe)
     'cs_rel_volume': "own bar $volume vs its trailing average, relative to the universe median (volume surprise)",
     'cs_ret_rank_1h': "cross-sectional percentile rank of the trailing 1h return",
@@ -391,6 +411,9 @@ _DESC_PREFIX = [
     ('vl_', "volume / taker-flow feature"),
     ('ms_', "market-microstructure feature (volume, trade size, order-flow imbalance)"),
     ('fr_', "perpetual funding-rate feature"),
+    ('un_', "token-unlock calendar feature (vesting cliffs: timing, size, trailing supply released)"),
+    ('dv_', "developer-activity feature (Electric Capital ecosystem dev counts, 30d-lagged)"),
+    ('ls_', "listing-age feature (time since the perp's true first trade)"),
     ('oi_', "open-interest / positioning feature"),
     ('pos_', "trader-positioning feature (retail vs top-trader, taker flow)"),
     ('cs_', "cross-sectional rank/relative feature vs the universe"),

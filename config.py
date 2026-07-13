@@ -475,6 +475,13 @@ config = {
                                   'ms_vol_return', 'ms_trade_intensity',
                                   'vl_taker', 'vl_signed'],
             'derivatives':       ['fr_', 'oi_', 'pos_'],
+            # un_ = token-unlock calendar (etl/unlocks.py): a FORWARD-
+            # knowable vesting schedule per name (cliff timing/size).
+            'unlocks':           ['un_'],
+            # dv_ = Electric Capital dev activity (30d-lagged);
+            # ls_ = listing age (true first perp trade date).
+            'dev_activity':      ['dv_'],
+            'listing':           ['ls_'],
             'cross_sectional':   ['cs_'],
             'factor_context':    ['fl_', 'mk_'],
             'seasonality':       ['sn_'],

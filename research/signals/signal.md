@@ -27,7 +27,7 @@ cross-sectional (`rank zscore demean`), and `where` gates. Bounds: depth ≤ 4,
 ≤ 2 conditions, ≤ 24 nodes (`discovery.dsl`).
 
 The compiler evaluates the expression, applies gates, then per bar demeans,
-z-scores, and clips to ±3 (the demean is what makes each bar sum to ~0). Columns are grouped into families, themed sets like volatility, funding, order flow, trend (`discovery.families`).
+z-scores, and clips to ±3 (the demean is what makes each bar sum to ~0). Columns are grouped into families, themed sets like volatility, funding, order flow, trend (`discovery.families`). Beyond the fast price/volume families, slow fundamental families come from free sources (see README "Slow data"): token-unlock calendar (`un_`), developer activity (`dv_`), listing age (`ls_`), and stablecoin-supply state (`mx_stable_`, gate-only).
 
 ## Search loop
 
