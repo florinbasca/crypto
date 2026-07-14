@@ -105,7 +105,11 @@ config = {
 
     # Raw data collection
     'data': {
-        'start_date': '2023-01-01',     # Earliest date all ETL jobs should keep
+        # Earliest date all ETL jobs should keep. 2022-01: the earliest date
+        # EVERY source exists (Binance futures/OI metrics start 2021-12; the
+        # universe is ~41 names then, ramping to ~130 - membership is clipped
+        # per name at its true first trade, see etl/universe.py).
+        'start_date': '2022-01-01',
         'history_years': 3,             # Legacy fallback if start_date is unset
         'raw_interval': '1m',           # Binance kline interval for prices_raw
         'quote_currencies': ['USDT', 'USDC'],  # Spot quote preference order
@@ -422,7 +426,9 @@ config = {
     # walk-forward. Design in research/signals/signal.md. Everything here
     # is read via config.get('discovery.<...>') - never hardcoded.
     'discovery': {
-        'start_date': '2023-08-01',      # First roll's train start
+        # First roll's train start: data.start_date + 7 months of warmup
+        # (factor betas, rolling features, residual history).
+        'start_date': '2022-08-01',
         'end_date': '2026-06-01',        # No roll's OOS end may exceed this
         'train_months': 5,               # Candidates generated/fit here
         'select_months': 1,              # Held out from the search; promotion tests it ONCE
@@ -437,7 +443,27 @@ config = {
         # grid (train + select, per lag) - the profile IS the signal's alpha
         # term structure, and its fitted half-life drives the persistence
         # discount at the portfolio layer.
+        # 432 (3d) was REMOVED on ledger evidence: across every candidate
+        # measured at it, directed select follow-through was 23% (worse than
+        # a coin flip; other lags 35-41%), median |select t| 0.16, train t
+        # correlated only 0.11 with the 1d lag (noise, not a distinct term
+        # structure), and the slow families it existed for measured BETTER
+        # at 1d. It also cost every horizon ~2 days of train/select data per
+        # window via the purge (max lag + embargo). Multi-day theses for
+        # unlocks/dev/listing belong to research/signals/event_study.py.
         'horizon_lags_bars': [6, 36, 72, 144],
+        # Per-family horizon restriction: each family is scored/promoted only
+        # at its natural horizons (intersected with horizon_lags_bars;
+        # 'default' covers families not listed). Slow fundamental families
+        # (unlocks / dev activity / listing age) are measured at 1d only -
+        # concentrating their evidence at one lag instead of spreading it
+        # across sub-day horizons they can't plausibly own.
+        'family_horizon_lags': {
+            'default': [6, 36, 72, 144],
+            'unlocks': [144],
+            'dev_activity': [144],
+            'listing': [144],
+        },
         # Reference lag for the proposer's compressed diagnostics only.
         'target_lag_bars': 36,
         'min_assets_per_timestamp': 10,
@@ -514,11 +540,12 @@ config = {
             'batch_size': 32,
             'survivors': 12,                 # population carried between generations
             'mutation_prob': 0.6,            # mutate a parent vs sample fresh
-            'diversity_max_corr': 0.8,       # survivor de-correlation ceiling (output)
-            # Structural de-dup: reject a survivor whose AST (subtree) overlap
-            # with a kept one exceeds this - catches clones that slip under the
-            # output-correlation ceiling. 1.0 disables.
-            'diversity_max_ast_sim': 0.6,
+            # Survivor de-correlation ceiling on the signal OUTPUT - what a
+            # signal outputs is what the book trades, so two builds that rank
+            # the coins the same way are one signal. The single diversity
+            # guard (a structural AST check used to double it; output
+            # correlation subsumes what mattered).
+            'diversity_max_corr': 0.8,
             # Frequent-subtree avoidance: how many over-mined building blocks to
             # show the LLM each generation (with a 'vary away' instruction).
             'overused_subtrees_shown': 6,
@@ -526,61 +553,80 @@ config = {
         },
         # Reward = sum_k weight_k * term_k / scale_k, TRAIN window ONLY.
         # The search (reward, survival, breeding, direction) never sees the
-        # select window; promotion touches select exactly once per survivor.
-        # Optimizing the same window promotion tests is a winner's curse the
-        # deflation haircut cannot repair - hence the hard train/select split.
-        # Scales are FIXED constants (not batch-relative) so rewards are
-        # comparable across generations, rolls and resumed runs.
-        # The performance term is the PER-BET RETURN (alpha in return
-        # units: gross-1 dollar-neutral book from the signal, held for the
-        # horizon) - money, not rank IC. Rank IC is recorded as a diagnostic
-        # only: this crop proved a signal can order names correctly (rank IC
-        # t~15 at 1d) while the large moves run against it (negative dollars).
-        # alpha_tstat is the CAPTURE-WEIGHTED day-equivalent train t of that
-        # per-bet return at the candidate's best lag:
+        # select window - hence the hard train/select split. Scales are FIXED
+        # constants (not batch-relative) so rewards are comparable across
+        # generations, rolls and resumed runs.
+        # TWO terms, deliberately. alpha_tstat is the CAPTURE-WEIGHTED
+        # day-equivalent train t of the PER-BET RETURN (money, not rank IC;
+        # rank IC is a diagnostic only - a signal can order names correctly
+        # while the large moves run against it) at the candidate's best lag:
         #   t / sqrt(stamps per day)  x  1/(1 + phi/kappa)
         # (phi = ln2 / effective persistence, kappa = the GP trade rate).
-        # liquid_alpha_ratio is the liquid-half alpha vs the full book.
-        # incremental is the train per-bet return the candidate ADDS to the
-        # current survivor book. Scale is in return units (~1bp per bet).
-        # complexity/instability/similarity are search hygiene; instability
-        # is the std of per-bet alpha across train thirds (return units).
+        # similarity (max train-signal correlation vs the kept survivors)
+        # de-duplicates the pool. Every additional hand-tuned term is a
+        # place the search can silently optimize the wrong thing: the first
+        # LLM run's absolute-units instability term single-handedly culled a
+        # train-t-5.7 (select-t-6.6) candidate at reward -1.9 while smooth
+        # near-zero-alpha candidates survived. Stability pressure now lives
+        # where it is measured honestly - promotion's cross-roll pooling: a
+        # signal that is noisy across months never accumulates pooled t.
         'reward': {
-            'weights': {
-                'alpha_tstat': 1.0,
-                'liquid_alpha_ratio': 0.25,
-                'incremental': 0.5,
-                'complexity': -0.15,
-                'instability': -0.75,
-                'similarity': -0.5,
-            },
-            'scales': {
-                'alpha_tstat': 2.0,
-                'liquid_alpha_ratio': 1.0,
-                'incremental': 0.0001,
-                'complexity': 10.0,
-                'instability': 0.0005,
-                'similarity': 0.5,
-            },
+            'weights': {'alpha_tstat': 1.0, 'similarity': -0.5},
+            'scales': {'alpha_tstat': 2.0, 'similarity': 0.5},
         },
-        # Promotion gates, applied once per roll to the search survivors.
+        # Promotion: RANK + K SLOTS + SANITY FLOORS. No significance gates.
+        # Evidence is the POOLED directed select t across every month the
+        # candidate was ever measured on (each roll re-evaluates carried-over
+        # survivors on a fresh, never-searched select month; prior months'
+        # alphas are sign-aligned to the current traded direction). Survivors
+        # are ranked by capture-weighted day-equivalent pooled t at their
+        # family's horizons and the top book_size promote. With a FIXED
+        # promotion count, FDR/deflation-style significance gates add nothing
+        # the quota does not already do - the first run stacked three of them
+        # into an accidental one-month bar of t~3.5 (a true Sharpe-2 signal's
+        # expected monthly t is ~0.58) and promoted nothing, which carried no
+        # information. The walk-forward is the only money judge; the floors
+        # below reject only candidates that are ACTIVELY bad, never enforce
+        # significance.
         'promotion': {
-            'fdr_alpha': 0.10,
-            'fdr_method': 'by',              # 'by' or 'bh'
-            # Minimum directed select t on the PER-BET RETURN (not rank IC)
-            # at a promoted lag.
-            'min_select_alpha_tstat': 2.0,
-            # Select-window p-values use Student-t with (n_days - 1) dof: a
-            # 1-month select gives ~30 daily alpha observations, where the
-            # normal approximation is anti-conservative.
-            # A survivor promotes if ANY lag of its profile clears the gates;
-            # multiplicity is priced by the deflation haircut over the ACTUAL
-            # looks at select: |t| must clear deflation_mult x
-            # E[max |N(0,1)| over (n_survivors x n_lags)]. The search itself
-            # never touches select (train-only reward), so trials that never
-            # looked at select do not inflate the bar. 0 disables.
-            'deflation_mult': 1.0,
-            # Minimum daily alpha observations behind a select t-stat.
+            # Promoted per roll (the book re-forms every roll): ~top quintile
+            # of the 12 search survivors. Fixed count = fixed look budget.
+            'book_size': 3,
+            # Ranking prior: the cross-sectional std (annualized) of TRUE
+            # Sharpes we believe the candidate pool can contain. The ranking
+            # metric is posterior Sharpe x capture, where posterior Sharpe
+            # shrinks the observed pooled annualized Sharpe by
+            # n / (n + 365/tau^2) - one interpretable constant combining
+            # effect size (Sharpe), evidence (t, obs count) and cross-month
+            # stability (inconsistent months cancel inside the pooled t).
+            # POWER (tau = 1.0, true Sharpe-2 signal, ~30 obs days/month):
+            #   pooled months k:        1     4     9     16
+            #   E[pooled t] 0.57*rt(k): 0.57  1.14  1.71  2.27
+            #   P(directed floor, t>0): 71%   87%   96%   99%
+            #   E[posterior Sharpe]:    0.15  0.49  0.85  1.13
+            # while a noise candidate's pooled t random-walks around 0 (half
+            # fail the directed floor outright) AND it must re-win the
+            # train-side survivor cut every roll to keep being measured.
+            # Real Sharpe-2 signals rise; they are never discarded by a
+            # threshold.
+            'prior_sharpe_std': 1.0,
+            # RETENTION: candidates promoted within the last N rolls are
+            # re-seeded into the search even if they missed the previous
+            # roll's survivor cut. Every seed is re-measured on the new
+            # windows and recorded in the ledger whether or not it
+            # re-survives, so its pooled select evidence keeps accumulating
+            # and it re-enters the book when it re-earns survival. Without
+            # this, ONE noisy train month would discard a real signal's
+            # entire evidence stream. 0 disables.
+            'reseed_promoted_rolls': 6,
+            # Floors. Pooled directed t > 0 is built in: a signal whose
+            # held-out months net-ran AGAINST its traded direction never
+            # promotes, regardless of rank.
+            # Minimum CALENDAR days of pooled select evidence (multi-day
+            # horizons bet once per lag/1d days, so their obs counts are
+            # converted to calendar coverage first - a 3d signal's 9
+            # bets/month = 27 calendar days and passes in its first roll,
+            # same as every other horizon).
             'min_select_days': 20,
             # Fraction of profile lags whose train alpha agrees in sign with
             # the traded direction: a genuine alpha term structure has one
@@ -588,11 +634,9 @@ config = {
             'min_profile_sign_agreement': 0.75,
             'max_book_corr': 0.5,            # signal corr vs already-promoted book
             # Consecutive-roll survival required before promotion. 1 =
-            # OFF: each month stands alone, promoted purely on its own
-            # train + held-out select month, with no dependence on prior
-            # months. (>1 would re-couple months as an anti-overfit filter.)
+            # OFF: each month stands alone (pooling still accumulates the
+            # months that exist; this floor only demands they exist).
             'min_rolls_survived': 1,
-            'max_book_size': 15,      # per roll (the book re-forms every roll)
             # Capture floor: minimum persistence weight 1/(1 + phi/kappa) a
             # candidate needs to promote. phi uses EFFECTIVE persistence
             # min(alpha half-life, position life 1/turnover_per_bar); kappa is
@@ -604,12 +648,52 @@ config = {
             # Turnover CEILING (backstop above the capture floor, which
             # already binds at ~0.07/bar): rejects a signal whose per-bar
             # churn (0.5*sum|dw| on the gross-1 signal) exceeds the cap.
-            # Calibration: measured survivor churn is median ~0.14/bar with
-            # only ~8% below 0.01 - the first pick (0.01) rejected every
-            # statistically-passing survivor and left only sparse macro-gated
-            # signals too thin to measure. 0.10 is a fails-open extremes
-            # backstop; the capture floor does the graded work. None disables.
+            # 0.10 is a fails-open extremes backstop; the capture floor does
+            # the graded work. None disables.
             'max_turnover': 0.10,
+        },
+        # Event studies for the SLOW families (research/signals/event_study.py):
+        # unlocks / listings / dev activity produce a handful of events per
+        # month, so the monthly-roll harness can never confirm them - they are
+        # tested ONCE over the full history instead. Each event is a named
+        # trigger on a feature column; entry = the first day the trigger fires
+        # (per symbol, deduped by cooldown_days). The study measures the mean
+        # cumulative forward RESIDUAL return across events with t-stats
+        # clustered by calendar day (same-day events share shocks). Purely
+        # diagnostic - nothing here feeds discovery or the walk-forward.
+        'event_study': {
+            'horizon_days': 10,        # post-event CAR curve length
+            'pre_days': 5,             # pre-event drift (leakage/anticipation)
+            'min_events': 30,          # below this, report but flag low power
+            'cooldown_days': 30,       # min days between same-symbol events
+            'report_days': [1, 3, 5, 10],
+            # trigger ops: 'cross_below'/'cross_above' fire on the day the
+            # column first crosses the threshold; 'below'/'above' fire on the
+            # first day of a contiguous spell. 'require' adds an AND clause
+            # evaluated on the event day.
+            'events': {
+                'unlock_cliff_ahead': {
+                    'column': 'un_days_to_next', 'op': 'cross_below',
+                    'threshold': 7.0,
+                    'require': [['un_next_pct', 'above', 0.005]],
+                },
+                'unlock_cliff_passed': {
+                    'column': 'un_days_since_last', 'op': 'below',
+                    'threshold': 1.0,
+                },
+                'new_listing': {
+                    'column': 'ls_days_since_listing', 'op': 'below',
+                    'threshold': 5.0,
+                },
+                'dev_activity_surge': {
+                    'column': 'dv_devs_chg_3m', 'op': 'cross_above',
+                    'threshold': 0.25,
+                },
+                'dev_activity_collapse': {
+                    'column': 'dv_devs_chg_3m', 'op': 'cross_below',
+                    'threshold': -0.25,
+                },
+            },
         },
         # LLM proposer (untrusted: sees compressed diagnostics only, emits DSL
         # JSON; everything it returns is re-validated and re-scored by code).
@@ -695,7 +779,10 @@ config = {
 
     # Walk-forward configuration (no look-ahead)
     'walk_forward': {
-        'start_date': '2023-08-01',      # First usable panel date (after warmup)
+        # First usable panel date: data.start_date + 7 months of warmup
+        # (kept in lockstep with discovery.start_date so the walk-forward
+        # windows mirror the discovery rolls).
+        'start_date': '2022-08-01',
         'end_date': '2026-06-01',        # Last complete month of data
         'train_months': 6,
         'test_days': 30,

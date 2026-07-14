@@ -64,9 +64,11 @@ def test_cfg():
     # min_select_days 0: the synthetic select window is only ~6 days long.
     # min_capture 0: a single-lag test grid fits every half-life to the
     # shortest grid value, which the production capture floor would block.
-    cfg['promotion'].update({'min_rolls_survived': 1, 'deflation_mult': 1.0,
-                             'max_book_size': 10, 'min_select_days': 0,
-                             'min_capture': 0.0, 'max_turnover': None})
+    # Pooling/ranking specifics are covered by
+    # tests/promotion_pooling_checks.py.
+    cfg['promotion'].update({'min_rolls_survived': 1, 'book_size': 10,
+                             'min_select_days': 0, 'min_capture': 0.0,
+                             'max_turnover': None})
     return cfg
 
 
@@ -251,9 +253,12 @@ for label, cand in [
         check(f"boundedness: {label} rejected", True)
 
 # ---------------------------------------------------------------------------
-# 4. Noise in, nothing out: FDR + deflation on a pure-noise panel
+# 4. Noise in, bounded out: rank + K slots on a pure-noise panel. There is
+#    deliberately NO significance gate anymore - the fixed book_size caps
+#    what noise can supply, the directed floor rejects wrong-way evidence,
+#    and the walk-forward is the judge.
 # ---------------------------------------------------------------------------
-print("--- 4. noise -> no promotion ---")
+print("--- 4. noise -> bounded, directed-only promotion ---")
 t0 = time.perf_counter()
 noise_panel = make_panel(plant=0.0, seed=11)
 noise_ledger = search_mod.DiscoveryLedger(None)
@@ -266,9 +271,12 @@ noise_survivors = search_mod.run_search(noise_panel, ROLL, family_cols,
 noise_promoted = bt_mod.promote(noise_survivors, ROLL, noise_ledger, CFG)
 check("noise: search ran a full budget", noise_ledger.n_trials(0) >= 10,
       f"({noise_ledger.n_trials(0)} trials)")
-check("noise: ~nothing promoted from pure noise", len(noise_promoted) <= 1,
+check("noise: promotions capped at book_size",
+      len(noise_promoted) <= CFG['promotion']['book_size'],
       f"({len(noise_promoted)} promoted, "
       f"{time.perf_counter() - t0:,.1f}s)")
+check("noise: every promotion has POSITIVE directed pooled evidence",
+      all(p['pooled_select_tstat'] > 0 for p in noise_promoted))
 
 # ---------------------------------------------------------------------------
 # 5. End-to-end: planted effect found, ledger complete, reproducible,
@@ -314,16 +322,14 @@ check("e2e: planted effect promoted through the gates", len(promoted) >= 1,
 check("e2e: ledger promoted flags set",
       len(ledger_a.to_frame().query('promoted')) == len(promoted))
 
-# Directional gate (regression): promotion tests the DIRECTED select t, not
-# |t|. Every promoted lag must be positive in the traded direction; a signal
-# that REVERSES sign out-of-sample must be rejected, not admitted on magnitude.
-# (passing_lags once used abs(ic_tstat) - two prod signals promoted while
-# trading the WRONG way on the hold-out month, at directed t of -5.2 and -3.8.)
-min_sel_t = float(CFG['promotion']['min_select_alpha_tstat'])
-check("directional: every promoted lag has positive directed select t",
-      all(max((p['profile_select'][l].get('alpha_tstat') or 0.0)
-              for l in p['promoted_lags']) >= min_sel_t
-          for p in promoted),
+# Directional floor (regression): promotion ranks the DIRECTED pooled t, not
+# |t|. Every promotion must be positive in the traded direction; a signal
+# that REVERSES sign out-of-sample must be rejected, not admitted on
+# magnitude. (an earlier gate once used abs(ic_tstat) - two prod signals
+# promoted while trading the WRONG way on the hold-out month, at directed t
+# of -5.2 and -3.8.)
+check("directional: every promotion has positive directed pooled t",
+      all(p['pooled_select_tstat'] > 0 for p in promoted),
       f"({len(promoted)} promoted)")
 
 # Flip the winner's select profile: same magnitude, opposite sign - abs()
@@ -449,12 +455,15 @@ check("carry-over: ledger survivor_candidates round-trips",
 # walk-forward (the only money judge) needs to trade them.
 if promoted:
     p0 = promoted[0]
-    check("e2e: promotion carries profile + half-life + capture",
+    check("e2e: promotion carries evidence lag + half-life + capture + "
+          "pooled stats",
           'half_life_bars' in p0 and 'capture' in p0
-          and 'promoted_lags' in p0 and len(p0['promoted_lags']) >= 1
+          and 'select_lag' in p0 and 'pooled_select_tstat' in p0
+          and p0['pooled_select_months'] >= 1
           and 0.0 < p0['capture'] <= 1.0,
           f"(hl {p0['half_life_bars']:.0f}b, capture {p0['capture']:.2f}, "
-          f"lags {p0['promoted_lags']})")
+          f"lag {p0['select_lag']}, pooled t "
+          f"{p0['pooled_select_tstat']:.1f})")
 print(f"(end-to-end block: {time.perf_counter() - t0:,.1f}s)")
 
 # ---------------------------------------------------------------------------
@@ -605,19 +614,27 @@ check("persistence weight: closed form, fast crushed, monotone",
       f"(rate {rate:.4f}/bar: hl 1008 -> {w_slow:.3f}, hl 3 -> {w_fast:.3f})")
 
 # capture-weighted reward: a slow signal outscores an equally-strong fast
-# one; the IC term is exactly (day-equivalent t) x capture.
+# one; the alpha term is exactly (day-equivalent t) x capture, and the
+# reward has exactly TWO terms (alpha + similarity - anything more is a
+# hand-tuned constant that can silently dominate alpha).
 m_eq = {'alpha_mean': 0.0002, 'alpha_tstat': 5.0, 'alpha_ir': 0.3,
         'liquid_alpha_ratio': 0.5, 'target_dispersion': 0.01,
         'n_cross_sections': 100, 'n_days': 20}
-cand_r = gen.Candidate(name='r', family='residual_shape',
-                       expression=('col', 'res_zscore'))
-t_fast = search_mod.reward_terms(m_eq, 144, 6, 0.0, cand_r, 0.0)
-t_slow = search_mod.reward_terms(m_eq, 144, 288, 0.0, cand_r, 0.0)
+t_fast = search_mod.reward_terms(m_eq, 144, 6, 0.0)
+t_slow = search_mod.reward_terms(m_eq, 144, 288, 0.0)
 check("reward: capture-weighted alpha term (slow beats equally-strong fast)",
       t_slow['alpha_tstat'] > 2.5 * t_fast['alpha_tstat']
       and abs(t_slow['alpha_tstat']
               - 5.0 * search_mod.persistence_weight(288, rate)) < 1e-9,
       f"(fast {t_fast['alpha_tstat']:.2f} vs slow {t_slow['alpha_tstat']:.2f})")
+check("reward: exactly two terms (alpha_tstat, similarity)",
+      set(t_slow) == {'alpha_tstat', 'similarity'}
+      and set(get('discovery.reward.weights')) == {'alpha_tstat',
+                                                   'similarity'})
+_r_dup, _ = search_mod.compute_reward(m_eq, 144, 288, 1.0)
+_r_new, _ = search_mod.compute_reward(m_eq, 144, 288, 0.0)
+check("reward: similarity to the kept pool lowers the reward",
+      _r_dup < _r_new)
 
 # analytic flip mirrors IC metrics exactly
 m0 = {'alpha_mean': 0.0002, 'alpha_tstat': 3.0, 'alpha_ir': 0.4,
@@ -630,13 +647,6 @@ check("flip: alpha/t/ir + rank IC negate; ratio/dispersion/counts unchanged",
       and mf['rank_ic_mean'] == -0.02
       and mf['target_dispersion'] == 0.01 and mf['n_days'] == 10)
 
-# Student-t p-values: on 30 daily obs the normal approximation is
-# anti-conservative - the t p-value must be LARGER.
-p_t = bt_mod._tstat_pvalue(2.5, n_days=30)
-p_norm = bt_mod._tstat_pvalue(2.5)
-check("p-values: Student-t (30 days) > normal for the same t",
-      p_t > p_norm, f"(t-dist {p_t:.4f} vs normal {p_norm:.4f})")
-
 # capture floor: with min_capture above the single-lag fit's capture,
 # nothing may promote (the gate that replaced the PnL scoreboard).
 cap_cfg = copy.deepcopy(CFG)
@@ -645,9 +655,9 @@ check("capture floor: min_capture blocks fast-alpha promotion",
       bt_mod.promote(survivors_a, ROLL, ledger_a, cap_cfg) == [])
 
 # ---------------------------------------------------------------------------
-# 5e. feedback.md #1/#2/#3: diagnostic blend, AST diversity, incremental reward
+# 5e. diagnostic blend + output-correlation diversity
 # ---------------------------------------------------------------------------
-print("--- 5e. diagnostic blend / AST diversity / incremental reward ---")
+print("--- 5e. diagnostic blend / output-correlation diversity ---")
 
 # #1 nonlinearity + regime helpers: a U-shaped decile curve scores high even
 # with ~0 monotonic IC; a flat one scores ~0.
@@ -661,61 +671,35 @@ _r01 = data_mod._rank01({'a': 1.0, 'b': 3.0, 'c': 2.0})
 check("diag: rank01 percentile-ranks within the group",
       _r01['b'] == 1.0 and _r01['a'] < _r01['c'] < _r01['b'])
 
-# #2 AST similarity: identical structure = 1; a shared concrete subtree gives
-# partial overlap; a pure column swap (no shared concrete block) = 0.
-_A = gen.Candidate('a', 'f', ('neg', ('square', ('col', 'res_zscore'))))
-_A2 = gen.Candidate('a2', 'f', ('neg', ('square', ('col', 'res_zscore'))))
-_Bclone = gen.Candidate('b', 'f',                       # shares 2 of _A's blocks
-                        ('tanh', ('neg', ('square', ('col', 'res_zscore')))))
+# candidate_subtrees still feeds the over-mined-blocks prompt hint
 _C = gen.Candidate('c', 'f', ('mul', ('square', ('col', 'res_zscore')),
                               ('col', 'res_mom')))
-_D = gen.Candidate('d', 'f', ('neg', ('square', ('col', 'res_mom'))))
-check("ast: identical structure -> 1.0", gen.ast_similarity(_A, _A2) == 1.0)
-check("ast: shared concrete subtree -> partial", 0.0 < gen.ast_similarity(_A, _C) < 1.0)
-check("ast: structural clone -> high (> 0.5)", gen.ast_similarity(_A, _Bclone) > 0.5)
-check("ast: column swap (no shared block) -> 0.0", gen.ast_similarity(_A, _D) == 0.0)
-check("ast: candidate_subtrees excludes bare leaves",
+check("subtrees: candidate_subtrees excludes bare leaves",
       all(gen._depth(s) >= 2 for s in gen.candidate_subtrees(_C)))
 
-# select_survivors: a structural clone that is OUTPUT-uncorrelated with the
-# original - the AST gate must still drop the lower-reward one.
+# select_survivors: the SINGLE diversity guard is output correlation - a
+# clone that outputs the same ranking is dropped (best reward wins), an
+# uncorrelated candidate is kept.
+_A = gen.Candidate('a', 'f', ('neg', ('square', ('col', 'res_zscore'))))
+_D = gen.Candidate('d', 'f', ('neg', ('square', ('col', 'res_mom'))))
 _ts = pd.date_range('2024-01-01', periods=40, freq='1h')
 def _sig_panel(vals):
     return pd.DataFrame({'timestamp': np.repeat(_ts, 3),
                          'symbol': np.tile(['X', 'Y', 'Z'], 40),
                          'signal': vals})
 rng_s = np.random.default_rng(3)
-v1 = rng_s.normal(size=120); v2 = rng_s.normal(size=120)  # ~uncorrelated
-pop_ast = [
+v1 = rng_s.normal(size=120)
+pop_div = [
     {'candidate': _A, 'reward': 2.0, 'signal_train': _sig_panel(v1)},
-    {'candidate': _Bclone, 'reward': 1.0, 'signal_train': _sig_panel(v2)},
-    {'candidate': _D, 'reward': 0.5, 'signal_train': _sig_panel(rng_s.normal(size=120))},
+    {'candidate': _C, 'reward': 1.0, 'signal_train': _sig_panel(v1 * 2)},
+    {'candidate': _D, 'reward': 0.5,
+     'signal_train': _sig_panel(rng_s.normal(size=120))},
 ]
 kept_hashes = {s['candidate'].hash for s in
-               search_mod.select_survivors(pop_ast, 3, 0.99, max_ast_sim=0.5)}
-check("select_survivors: AST gate drops a structural clone",
-      _A.hash in kept_hashes and _Bclone.hash not in kept_hashes
+               search_mod.select_survivors(pop_div, 3, 0.8)}
+check("select_survivors: output-correlated clone dropped, best reward wins",
+      _A.hash in kept_hashes and _C.hash not in kept_hashes
       and _D.hash in kept_hashes)
-check("select_survivors: AST gate off (1.0) keeps both clones",
-      len(search_mod.select_survivors(pop_ast, 3, 0.99, 1.0)) == 3)
-
-# #3 incremental reward: pooled_signal averages; the reward carries the term
-# and it lifts the reward for a positive marginal contribution.
-_pooled = search_mod.pooled_signal([_sig_panel(np.ones(120)),
-                                    _sig_panel(3 * np.ones(120))])
-check("pooled_signal: averages the panels", bool((_pooled['signal'] == 2.0).all()))
-_m = {'alpha_mean': 0.0002, 'alpha_tstat': 4.0, 'liquid_alpha_ratio': 0.5,
-      'target_dispersion': 0.01, 'n_days': 20}
-_t_hi = search_mod.reward_terms(_m, 36, 288, 0.0, _A, 0.0, incremental=0.01)
-_t_lo = search_mod.reward_terms(_m, 36, 288, 0.0, _A, 0.0, incremental=0.0)
-check("reward: incremental term present and passed through",
-      _t_hi['incremental'] == 0.01 and _t_lo['incremental'] == 0.0)
-_rwd_hi, _ = search_mod.compute_reward(_m, 36, 288, 0.0, _A, 0.0,
-                                       incremental=0.01, reward_cfg=CFG['reward'])
-_rwd_lo, _ = search_mod.compute_reward(_m, 36, 288, 0.0, _A, 0.0,
-                                       incremental=0.0, reward_cfg=CFG['reward'])
-check("reward: positive incremental raises the reward",
-      _rwd_hi > _rwd_lo)
 
 # ---------------------------------------------------------------------------
 # 6. Proposer providers + cost tracking (no API calls: clients are lazy)

@@ -271,16 +271,6 @@ def candidate_subtrees(cand: Candidate, min_depth: int = 2) -> set:
     return {n for n in nodes if _depth(n) >= min_depth}
 
 
-def ast_similarity(a: Candidate, b: Candidate) -> float:
-    """Jaccard overlap of two candidates' building blocks: 1.0 = identical
-    structure, 0.0 = nothing shared. Catches near-clones that slip under
-    output-correlation de-dup (same recipe, one column/window swapped)."""
-    sa, sb = candidate_subtrees(a), candidate_subtrees(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
 # =============================================================================
 # Validation (boundedness): only allowed columns, ops, windows, and size caps
 # =============================================================================

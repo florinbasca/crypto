@@ -11,15 +11,26 @@ volume among the AVAILABLE names - so dead candidates don't consume slots.
 
 The result is the CANDIDATE list used by the downloaders, factor model,
 research, and portfolio (missing history naturally produces NaNs). Each run
-also updates `universe_membership` - a point-in-time interval table
-[symbol, valid_from, valid_to] of candidate spells - so membership becomes
-genuinely point-in-time as snapshots accrue (see update_membership_history).
+also refreshes two side tables:
 
-Caveat (documented, unavoidable without historical listing dates): history
-BEFORE the first snapshot is seeded as "member since the data start", so the
-backtest there is still conditioned on the Hyperliquid listing as of that
-first snapshot. Use walk_forward.min_listing_age_days to bound the
-sensitivity to newly listed (survivor-biased) names.
+- `listings` (symbol, first_trade, venue): the TRUE first perp trade date
+  per candidate - earliest Binance USD-M 1d kline (with the 1000-contract
+  fallback), Hyperliquid candleSnapshot for HL-only names. The prices table
+  is clipped to the backtest window, so "first bar" is left-censored;
+  listing dates are PIT by construction (the date was known on the date)
+  and first trades never change, so the refresh only queries NEW names.
+  Consumed by the ls_ features, the membership clipping below, the
+  new_listing event study, and walk_forward.min_listing_age_days.
+- `universe_membership`: a point-in-time interval table [symbol,
+  valid_from, valid_to] of candidate spells - membership becomes genuinely
+  point-in-time as snapshots accrue (see update_membership_history).
+
+Caveat (documented): history BEFORE the first snapshot is seeded as "member
+since the data start", clipped per name at its true first trade - but it is
+still conditioned on the Hyperliquid listing as of that first snapshot
+(names that died earlier can never enter). Use
+walk_forward.min_listing_age_days to bound the sensitivity to newly listed
+(survivor-biased) names.
 """
 
 import sys
@@ -28,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncio
 import datetime
+import time
 
 import aiohttp
 import pandas as pd
@@ -39,6 +51,7 @@ from config import get, get_data_start_date
 
 BASE_URL = 'https://data.binance.vision'
 SPOT_PATH = '/data/spot/monthly/klines'
+FAPI_KLINES_URL = 'https://fapi.binance.com/fapi/v1/klines'
 
 
 def fetch_hyperliquid_universe() -> pd.DataFrame:
@@ -200,17 +213,169 @@ def evolve_membership(mem, current_symbols, as_of, seed_from) -> tuple:
     return mem, len(new), len(closed)
 
 
+def extend_membership_start(mem, new_start, first_trade) -> pd.DataFrame:
+    """Backdate the SEEDED cohort when data.start_date moves earlier.
+
+    Pre-first-snapshot membership is seeded fiction ("member since the data
+    start"), so when the configured start moves back, only the spells still
+    anchored at the OLD seed stamp - the earliest valid_from in the table,
+    shared by the whole seeded cohort - are extended. Spells opened by real
+    snapshots (valid_from = a later as_of) are never touched.
+
+    Each extended spell is clipped at the name's TRUE first perp trade
+    (`first_trade`: {symbol: Timestamp}, from the listings table): a name
+    cannot be a member before it traded anywhere. That is the minimal
+    point-in-time honesty available without a historical HL listing feed;
+    the residual bias (today's HL list over-selects names that survived the
+    extension years) is documented in the README limitations.
+    """
+    mem = mem.copy()
+    mem['valid_from'] = pd.to_datetime(mem['valid_from'])
+    new_start = pd.Timestamp(new_start)
+    seed_stamp = mem['valid_from'].min()
+    if seed_stamp <= new_start:
+        return mem
+    seeded = mem['valid_from'] == seed_stamp
+    ft = mem.loc[seeded, 'symbol'].map(first_trade or {})
+    mem.loc[seeded, 'valid_from'] = (
+        pd.to_datetime(ft).fillna(new_start).clip(lower=new_start))
+    n_ext = int(seeded.sum())
+    print(f"universe_membership: extended {n_ext} seeded spells back from "
+          f"{seed_stamp.date()} toward {new_start.date()} "
+          f"(clipped per name at its first perp trade)")
+    return mem
+
+
+async def _binance_first_trade(session, symbol):
+    for perp in (f"{symbol}USDT", f"1000{symbol}USDT"):
+        params = {'symbol': perp, 'interval': '1d',
+                  'startTime': 0, 'limit': 1}
+        try:
+            async with session.get(FAPI_KLINES_URL, params=params) as r:
+                if r.status != 200:
+                    continue
+                rows = await r.json()
+                if rows:
+                    return pd.to_datetime(rows[0][0], unit='ms'), 'binance'
+        except Exception:
+            continue
+    return None, None
+
+
+async def _hl_first_trade(session, symbol):
+    # HL returns at most ~5000 candles; 1d covers any listing age.
+    body = {'type': 'candleSnapshot',
+            'req': {'coin': symbol, 'interval': '1d',
+                    'startTime': 0, 'endTime': int(time.time() * 1000)}}
+    try:
+        async with session.post(get('universe.hyperliquid_api'),
+                                json=body) as r:
+            if r.status != 200:
+                return None, None
+            rows = await r.json()
+            if rows:
+                return pd.to_datetime(rows[0]['t'], unit='ms'), 'hyperliquid'
+    except Exception:
+        pass
+    return None, None
+
+
+async def _fetch_first_trades(symbols):
+    sem = asyncio.Semaphore(int(get('data.max_concurrent_symbols', 8)))
+
+    async def one(session, s):
+        async with sem:
+            ts, venue = await _binance_first_trade(session, s)
+            if ts is None:
+                ts, venue = await _hl_first_trade(session, s)
+            return s, ts, venue
+
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return await asyncio.gather(*[one(session, s) for s in symbols])
+
+
+def refresh_listings(symbols) -> pd.DataFrame:
+    """Maintain `listings` (symbol, first_trade, venue) - see the module
+    docstring. Incremental: a first trade never changes, so only names not
+    already in the table are queried. Names with no date on either venue are
+    reported but never block the run (their ls_ features are NaN and their
+    membership seed falls back to the data start)."""
+    symbols = sorted({str(s).upper() for s in symbols})
+    existing = (load_data('listings') if table_exists('listings')
+                else pd.DataFrame(columns=['symbol', 'first_trade', 'venue']))
+    have = set(existing['symbol']) if not existing.empty else set()
+    todo = [s for s in symbols if s not in have]
+    if not todo:
+        print(f"listings: all {len(have)} candidates cached, nothing to fetch")
+        return existing
+
+    results = asyncio.run(_fetch_first_trades(todo))
+    rows = [(s, ts, v) for s, ts, v in results if ts is not None]
+    missing = [s for s, ts, _ in results if ts is None]
+    out = pd.concat([existing,
+                     pd.DataFrame(rows, columns=['symbol', 'first_trade',
+                                                 'venue'])],
+                    ignore_index=True)
+    out['first_trade'] = pd.to_datetime(out['first_trade'])
+    out = (out.drop_duplicates('symbol').sort_values('symbol')
+           .reset_index(drop=True))
+    save_data('listings', out, mode='overwrite',
+              datetime_columns=['first_trade'])
+    print(f"listings: {len(rows)} fetched, {len(have)} cached "
+          f"({(out['venue'] == 'binance').sum()} binance, "
+          f"{(out['venue'] == 'hyperliquid').sum()} hyperliquid)")
+    if missing:
+        print(f"listings: no first-trade date found for {', '.join(missing)}")
+    return out
+
+
+def clip_seed_at_first_trade(mem, first_trade, floor) -> pd.DataFrame:
+    """Clip a FRESHLY SEEDED cohort's valid_from at each name's true first
+    perp trade (never below `floor` = the data start): a name listed in
+    2024 must not be seeded as a member from 2022. Pure; applied only when
+    the whole table was just seeded."""
+    if mem is None or mem.empty or not first_trade:
+        return mem
+    mem = mem.copy()
+    floor = pd.Timestamp(floor)
+    vf = pd.to_datetime(mem['valid_from'])
+    ft = pd.to_datetime(mem['symbol'].map(first_trade)).fillna(floor)
+    mem['valid_from'] = pd.concat(
+        [vf, ft.clip(lower=floor)], axis=1).max(axis=1)
+    return mem
+
+
+def _first_trade_by_symbol() -> dict:
+    """{symbol: first perp trade Timestamp} from the listings table
+    (refresh_listings above); empty when the table is absent."""
+    if not table_exists('listings'):
+        return {}
+    l = load_data('listings')
+    if l is None or l.empty:
+        return {}
+    return dict(zip(l['symbol'], pd.to_datetime(l['first_trade'])))
+
+
 def update_membership_history(current_symbols, as_of) -> pd.DataFrame:
     """Maintain the point-in-time `universe_membership` interval table.
 
     IO wrapper around `evolve_membership` (see its docstring for semantics).
-    Consumed automatically by research/lib/signal_eval.py
-    (universe_member_mask) and the walk-forward DataContext.
+    When data.start_date has moved EARLIER since the table was seeded, the
+    seeded cohort is backdated first (extend_membership_start). Consumed
+    automatically by research/lib/signal_eval.py (universe_member_mask) and
+    the walk-forward DataContext.
     """
     mem = load_data('universe_membership') if table_exists('universe_membership') \
         else None
+    ft_map = _first_trade_by_symbol()
+    was_empty = mem is None or mem.empty
+    if not was_empty:
+        mem = extend_membership_start(mem, get_data_start_date(), ft_map)
     mem, n_new, n_closed = evolve_membership(
         mem, current_symbols, as_of, get_data_start_date())
+    if was_empty:
+        mem = clip_seed_at_first_trade(mem, ft_map, get_data_start_date())
     save_data('universe_membership', mem, mode='overwrite',
               datetime_columns=['valid_from', 'valid_to'])
     print(f"universe_membership: {len(mem)} spells "
@@ -222,6 +387,9 @@ def main():
     df = build_universe()
     save_data(table_name='universe', data=df, mode='overwrite',
               datetime_columns=['fetched_at'])
+    # Listing dates BEFORE membership: the seeded-spell backdating/clipping
+    # reads the freshly-updated listings table.
+    refresh_listings(df['symbol'])
     update_membership_history(df['symbol'], df['fetched_at'].iloc[0])
 
     print(f"\nSaved {len(df)} candidate symbols to 'universe' table "

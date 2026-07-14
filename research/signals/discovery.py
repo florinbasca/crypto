@@ -15,9 +15,12 @@ OOS month exists only as the promotion's valid_from date):
      select window. The reward's alpha term is the candidate's
      PER-BET RETURN (not rank IC), CAPTURE-WEIGHTED (x 1/(1 + phi/kappa)), so
      persistent signals outscore equally-strong fast ones.
-  3. PROMOTE survivors through the gates - the first and only look at
-     select (per-lag profile FDR, deflation over the actual looks,
-     persistence, sign agreement, capture floor, orthogonality)
+  3. PROMOTE the top book_size survivors by POOLED select evidence (this
+     roll's held-out month + every prior month the candidate was measured
+     on, sign-aligned to the current direction), subject to sanity floors
+     (directed t > 0, sign agreement, capture, turnover, orthogonality).
+     Rank + K slots + floors - no significance gates; the walk-forward is
+     the judge.
   4. roll forward. Output: the promotions table, consumed by the
      walk-forward via research/lib/discovered.py.
 
@@ -91,6 +94,13 @@ def main():
                     'statistical promotion (the walk-forward is the money judge)')
     parser.add_argument('--max-rolls', type=int, default=0,
                         help='Only run the first N rolls (0 = all)')
+    parser.add_argument('--last-rolls', type=int, default=0,
+                        help='Only run the LAST N rolls (0 = all). The live '
+                             'workflow: --last-rolls 1 searches the most '
+                             'recent train/select windows only (~1 roll of '
+                             'compute) - its promotions are what the next '
+                             'OOS month would trade. The full sweep is for '
+                             'walk-forward evidence, not signal supply.')
     parser.add_argument('--no-fresh', action='store_true',
                         help='Keep existing discovery tables (default is a '
                              'fresh start: tables cleared before running)')
@@ -132,6 +142,8 @@ def main():
     rolls = data_mod.make_rolls(cfg)
     if args.max_rolls > 0:
         rolls = rolls[:args.max_rolls]
+    if args.last_rolls > 0:
+        rolls = rolls[-args.last_rolls:]
     print(f"{len(rolls)} rolls: train {cfg['train_months']}mo / "
           f"select {cfg['select_months']}mo / OOS {cfg['oos_months']}mo")
 
@@ -169,6 +181,19 @@ def main():
         if not seeds and roll.roll_id > 0:
             # resumed/partial runs: recover the previous roll's survivors
             seeds = ledger.survivor_candidates(roll.roll_id - 1)
+
+        # RETENTION: recent book members stay under measurement even after
+        # missing a survivor cut. Every seed is re-evaluated and recorded in
+        # the ledger whether or not it re-survives, so a real signal with one
+        # bad train month keeps accumulating select evidence and re-enters
+        # the book when it re-earns survival.
+        reseed_rolls = int(cfg['promotion'].get('reseed_promoted_rolls', 0))
+        if reseed_rolls > 0 and roll.roll_id > 0:
+            have = {c.hash for c in seeds}
+            seeds = seeds + [
+                c for c in ledger.promoted_candidates(
+                    roll.roll_id - reseed_rolls, roll.roll_id - 1)
+                if c.hash not in have]
 
         usage_before = proposer.usage_snapshot()
         survivors = search_mod.run_search(panel, roll, family_columns,
@@ -209,24 +234,36 @@ def main():
                 'roll_id': roll.roll_id, 'cand_hash': c.hash, 'name': c.name,
                 'family': c.family, 'direction': p['direction'],
                 'target_lag': int(p.get('target_lag', 0) or 0),
+                'select_lag': int(p.get('select_lag', 0) or 0),
                 'half_life_bars': float(p.get('half_life_bars', 0) or 0),
                 'capture': float(p.get('capture', 0) or 0),
                 'turnover': float(p.get('turnover', float('nan'))),
-                'promoted_lags': ','.join(str(l) for l in
-                                          p.get('promoted_lags', [])),
                 'candidate_json': c.to_json(),
-                # Select alpha t at the STRONGEST promoted lag (the evidence
-                # the signal actually cleared on), not the best-TRAIN-lag t.
+                # This roll's select t at the evidence lag, plus the POOLED
+                # directed evidence across every select month the candidate
+                # was measured on (the promotion currency).
                 'select_alpha_tstat': p.get('select_alpha_tstat',
                                             p['metrics_select']['alpha_tstat']),
+                'pooled_select_tstat': float(p.get('pooled_select_tstat',
+                                                   float('nan'))),
+                'pooled_select_months': int(p.get('pooled_select_months', 1)),
+                'pooled_sign_frac': float(p.get('pooled_sign_frac',
+                                                float('nan'))),
+                # The ranking currency: shrunk expected annualized Sharpe,
+                # and the slot score (posterior Sharpe x capture).
+                'posterior_sharpe': float(p.get('posterior_sharpe',
+                                                float('nan'))),
+                'promotion_score': float(p.get('promotion_score',
+                                               float('nan'))),
                 'reward': p['reward'],
-                'n_looks_at_promotion': p.get('n_looks_at_promotion', 0),
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
             })
             print(f"  + {c.name} ({c.family}) "
-                  f"select $t={roll_promo_rows[-1]['select_alpha_tstat']:.2f} "
+                  f"posterior SR={roll_promo_rows[-1]['posterior_sharpe']:.2f} "
+                  f"(pooled $t={roll_promo_rows[-1]['pooled_select_tstat']:.2f} "
+                  f"over {roll_promo_rows[-1]['pooled_select_months']}mo, "
+                  f"this roll t={roll_promo_rows[-1]['select_alpha_tstat']:.2f}) "
                   f"@ lag {p.get('select_lag', p.get('target_lag'))} "
-                  f"of [{roll_promo_rows[-1]['promoted_lags']}] "
                   f"half-life {p.get('half_life_bars', 0):,.0f} bars "
                   f"(capture {p.get('capture', 0):.2f}, "
                   f"turnover {p.get('turnover', float('nan')):.3f}/bar)")

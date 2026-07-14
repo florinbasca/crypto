@@ -1,7 +1,8 @@
 # Crypto Stat-Arb: Factor-Neutral Strategy
 
 Cross-sectional stat-arb on ~130 Hyperliquid-tradeable crypto names.
-1-minute Binance spot data (last 3 years) -> 10-minute base panel ->
+1-minute Binance spot data (2022-01 onward; ~41 names then, ramping to ~130,
+each admitted at its true first perp trade) -> 10-minute base panel ->
 market+size+momentum+vol+meme factor model -> residual-return prediction -> MVO optimized, dollar / market / size /
 momentum / vol / meme-beta neutral.
 
@@ -12,7 +13,7 @@ momentum / vol / meme-beta neutral.
 ```bash
 # 1. ETL
 uv run etl/universe.py        # Hyperliquid perp candidates (~130, no stables)
-uv run etl/prices_raw.py      # 1m Binance spot klines, last 3y (~big download)
+uv run etl/prices_raw.py      # 1m Binance spot klines from data.start_date (~big download)
 uv run etl/prices.py          # resample 1m -> 10min `prices` table
 uv run etl/marketcap.py       # daily mcap
 uv run etl/funding.py         # perp funding rates (Binance)
@@ -24,7 +25,6 @@ uv run etl/macro.py           # macro/event data: FRED market series (needs .env
 uv run etl/stablecoins.py     # DefiLlama stablecoin supply (total + per chain)
 uv run etl/unlocks.py         # token unlock calendar (needs the exporter, see its docstring)
 uv run etl/dev_activity.py    # Electric Capital developer activity (~75MB download)
-uv run etl/listings.py        # true first perp trade date per name
 
 # 2. Risk model
 uv run risk_model/factor_returns.py    # builds factor returns
@@ -79,14 +79,10 @@ from the persisted `wf_portfolio_*` tables.
 
 ## Signals: how they're found
 
-Signals aren't written by hand. An LLM proposes small formulas (feature columns
-combined with a few operators and optional gates) — one stateless prompt→JSON
-call per batch; the loop, memory and every decision are deterministic code. The
-search scores each formula by the per-bet return of its normalized long/short
-weights (return units, not a rank correlation) on rolling monthly windows, and
-promotes only those whose return stays statistically significant on a held-out
-month. The promoted formulas are the only signals the portfolio trades —
-discovery itself never trades.
+Signals aren't written by hand. An LLM proposes small formulas, deterministic
+code scores them on rolling monthly windows, and each roll the best few by
+held-out evidence are promoted. The promoted formulas are the only signals the
+portfolio trades — discovery itself never trades.
 
 ```bash
 uv run research/signals/discovery.py --max-rolls 2   # quick test
@@ -100,8 +96,8 @@ Promotions land in `discovery_promotions` and become `disc_*` registry entries
 (`research/lib/discovered.py`). The walk-forward trades each roll's promoted
 signals in that roll's OOS month only — the month discovery never saw.
 
-**The full design — DSL grammar, the LLM prompt, the reward, the promotion
-gates, the walk-forward windows — is documented in
+**The full design — DSL grammar, the LLM prompt, the reward, evidence
+pooling, the promotion ranking, the walk-forward windows — is documented in
 [`research/signals/signal.md`](research/signals/signal.md).**
 
 
@@ -139,9 +135,9 @@ How far the backtested numbers should be trusted out of sample:
     Open Dev Data, daily 28-day-window active-dev counts per ecosystem,
     ~110/130 names mapped (memecoins legitimately NaN). Snapshots are
     rebuilt under the current repo taxonomy, so features carry a 30-day lag.
-  - *Listing age* (`etl/listings.py` → `ls_`): true first perp trade date
-    (Binance fapi earliest kline), because the `prices` table is
-    window-clipped; PIT by construction.
+  - *Listing age* (fetched by `etl/universe.py` → `listings` table → `ls_`):
+    true first perp trade date (Binance fapi earliest kline), because the
+    `prices` table is window-clipped; PIT by construction.
   Deferred at $0: per-name exchange flows (no vendor has PIT flow labels
   older than ~2024 — a 3y flow backtest would be fiction at any price),
   social data (cheapest usable history is ~$300/mo), historical
@@ -165,16 +161,23 @@ How far the backtested numbers should be trusted out of sample:
   selection) or nonlinear impact, and assumes fills at 10-min bar stamps —
   the 1-bar-lag Sharpe is the closest stress for this. Set cost_bps to 0
   to model pure top-tier maker execution.
-- **Single short sample / regime.** ~3 years of one asset class, no
-  out-of-regime or crisis validation — and crypto regimes shift fast.
+- **Single asset class, ~4.5-year sample.** 2022-01 onward covers the
+  LUNA/FTX collapse, the 2023 chop and the 2024-25 bull, but it is still one
+  asset class and crypto regimes shift fast.
+- **Pre-2023 universe survivorship.** Hyperliquid (the tradability filter)
+  launched mid-2023; earlier membership is today's HL list backdated, clipped
+  per name at its true first perp trade (`etl/universe.py`). Names that died
+  before HL existed can never enter, so the 2022 cross-section over-selects
+  survivors.
 - **Five-factor risk model.** Market, size, momentum, vol and meme are
   hedged; other systematic exposures (liquidity, narrative sectors beyond
   meme) still stay in the residual (only partly addressed by the soft
   cluster penalty).
 - **Multiple testing.** The discovery search screens hundreds of candidate
-  programs per roll across 4 horizons; the FDR + deflation gates on the
-  held-out month mitigate but do not eliminate the risk of promoting overfit
-  signals.
+  programs per roll; the promotion controls (see
+  [`research/signals/signal.md`](research/signals/signal.md)) mitigate but the
+  risk of trading overfit signals is only truly priced in the walk-forward's
+  out-of-sample PnL.
 
 ## License
 

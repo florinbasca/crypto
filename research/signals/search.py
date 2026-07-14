@@ -6,19 +6,24 @@ loop that decides what gets tried next.
   reusing the production math from research/lib/signal_eval.py (vectorized
   rank IC, Newey-West HAC t-stat on the daily IC series). Non-overlapping
   stamps (stride = target lag).
-- compute_reward(): TRAIN-only metrics -> one scalar. The search (reward,
-  survival, breeding, direction) NEVER sees the select window - promotion
-  touches select exactly once per survivor, so a select t-stat is a
-  measurement, not the maximum of a directed search on itself. Scales are
-  FIXED config constants, never batch-relative: the same candidate must earn
-  the same reward regardless of its batch-mates, or rewards stop being
-  comparable across generations/rolls/resumes.
-- NO PINNING: each candidate is evaluated at EVERY lag in
-  discovery.horizon_lags_bars on train AND select; the per-lag profile is
-  its alpha term structure. best_lag (day-equivalent t, so fast lags get no
-  mechanical sqrt(stamps) advantage) picks the direction and the reward
-  term; the WHOLE profile travels to promotion and the portfolio layer,
-  where fit_half_life() turns it into the persistence discount.
+- compute_reward(): TRAIN-only metrics -> one scalar, TWO terms only
+  (capture-weighted day-equivalent per-bet-alpha t, minus similarity to the
+  kept survivors). The search (reward, survival, breeding, direction) NEVER
+  sees the select window - promotion reads select once per survivor per
+  roll, so a select t-stat is a measurement, not the maximum of a directed
+  search on itself. Scales are FIXED config constants, never batch-relative:
+  the same candidate must earn the same reward regardless of its
+  batch-mates, or rewards stop being comparable across
+  generations/rolls/resumes.
+- NO PINNING: each candidate is evaluated at EVERY lag its family owns
+  (family_horizon_lags) on train AND select; the per-lag profile is its
+  alpha term structure. best_lag (day-equivalent t, so fast lags get no
+  mechanical sqrt(stamps) advantage) picks the reward term; the traded
+  SIGN is fitted from the candidate's POOLED train evidence across every
+  roll it was measured in (pooled_train_direction - one 5-month window is
+  wrong ~26% of the time for a Sharpe-1 signal). The WHOLE profile travels
+  to promotion and the portfolio layer, where fit_half_life() turns it
+  into the persistence discount.
 - DiscoveryLedger: one row per (roll, candidate) evaluation - the debug
   surface, the dedup index, and the memory behind the N-consecutive-rolls
   persistence gate.
@@ -41,11 +46,10 @@ from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
 from research.signals.data import (Roll, book_returns, purge_bars,
                                          slice_window, strided_stamps,
                                          target_col)
-from research.signals.generation import (_to_list, ast_similarity,
-                                               candidate_subtrees,
+from research.signals.generation import (_to_list, candidate_subtrees,
                                                Candidate, Proposer,
                                                ValidationError,
-                                               compile_candidate, complexity,
+                                               compile_candidate,
                                                validate_candidate)
 
 DAYS_PER_YEAR = 365
@@ -170,12 +174,47 @@ def day_equivalent_tstat(m: dict, lag_bars: int) -> float:
     return float(t) / math.sqrt(stamps_per_day)
 
 
-def pooled_signal(signals: List[pd.DataFrame]) -> pd.DataFrame:
-    """Average several [timestamp, symbol, signal] panels into one alpha panel
-    (rank IC is scale-invariant, so a plain mean is enough)."""
-    wide = pd.concat([s.set_index(['timestamp', 'symbol'])['signal']
-                      for s in signals], axis=1)
-    return wide.mean(axis=1).rename('signal').reset_index()
+def pooled_train_direction(months: List[dict]) -> int:
+    """Traded sign from POOLED raw train measurements: the inverse-variance
+    weighted mean of the per-window per-bet alphas (se = |mean/t| per
+    window) decides the sign.
+
+    Why pooled: one 5-month train window fits the wrong direction
+    Phi(-SR*sqrt(train_years)) of the time - ~26% for a true Sharpe-1
+    signal, and consecutive windows overlap 4 of 5 months so the error can
+    persist for several rolls, each wrong-way month then correctly counting
+    AGAINST the signal at promotion. Pooling every train window the
+    candidate was ever measured on drops the error with candidate age
+    (train-only: the select window is never consulted). Consecutive windows
+    overlap, so this is an over-counted but unbiased sign estimate - fine
+    for a direction, never usable as a t-stat. A candidate whose current
+    window disagrees with its pooled history keeps the historical sign and
+    pays for the disagreement in this roll's directed reward - a signal
+    that flip-flops SHOULD rank low.
+
+    Months without a measurable (mean, t) fall out; if nothing is
+    measurable, the LAST month's raw sign decides (the current window -
+    the single-window behavior)."""
+    num = den = 0.0
+    for m in months or []:
+        mu, t = m.get('alpha_mean'), m.get('alpha_tstat')
+        if mu is None or t is None:
+            continue
+        mu, t = float(mu), float(t)
+        if not (np.isfinite(mu) and np.isfinite(t)) or t == 0.0:
+            continue
+        se = abs(mu / t)
+        if not np.isfinite(se) or se <= 0:
+            continue
+        num += mu / se ** 2
+        den += 1.0 / se ** 2
+    if den > 0:
+        return 1 if num / den >= 0 else -1
+    for m in reversed(months or []):
+        mu = m.get('alpha_mean')
+        if mu is not None and np.isfinite(mu):
+            return 1 if mu >= 0 else -1
+    return 1
 
 
 def signal_turnover(sig: pd.DataFrame) -> float:
@@ -323,18 +362,19 @@ def max_signal_correlation(signal: pd.DataFrame, others: list) -> float:
 # =============================================================================
 
 def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
-                 instability: float, cand: Candidate,
-                 similarity: float, incremental: float = 0.0,
+                 similarity: float,
                  turnover: Optional[float] = None) -> dict:
     """The raw (unscaled) reward terms - TRAIN window only. All finite.
 
-    alpha_tstat is the CAPTURE-WEIGHTED day-equivalent train t of the
-    candidate's PER-BET RETURN (not rank IC) at its best lag,
-    discounted by the fraction of it a book trading at the portfolio rate
-    can hold long enough to be exposed to (see persistence_weight - duration,
-    never bps). instability is the std of the alpha across train thirds.
-    incremental is the per-bet return the candidate ADDS to the current
-    survivor book (marginal edge), measured on train."""
+    TWO terms. alpha_tstat is the CAPTURE-WEIGHTED day-equivalent train t of
+    the candidate's PER-BET RETURN (not rank IC) at its best lag, discounted
+    by the fraction of it a book trading at the portfolio rate can hold long
+    enough to be exposed to (see persistence_weight - duration, never bps).
+    similarity (max train-signal correlation vs the kept survivors)
+    de-duplicates the pool. Anything more is a hand-tuned constant that can
+    silently dominate alpha - the first LLM run's instability term did
+    exactly that; cross-month consistency is now priced at promotion, where
+    it is measured on held-out data instead of modeled on train."""
     def _f(x, default=0.0):
         return float(x) if x is not None and np.isfinite(x) else default
 
@@ -344,17 +384,12 @@ def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
     capture = persistence_weight(p_eff, trade_rate_per_bar())
     return {
         'alpha_tstat': day_equivalent_tstat(train_metrics, best_lag) * capture,
-        'liquid_alpha_ratio': _f(train_metrics.get('liquid_alpha_ratio')),
-        'incremental': _f(incremental),
-        'complexity': float(complexity(cand)),
-        'instability': _f(instability),
         'similarity': _f(similarity),
     }
 
 
 def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
-                   instability: float, cand: Candidate, similarity: float,
-                   incremental: float = 0.0,
+                   similarity: float,
                    reward_cfg: Optional[dict] = None,
                    turnover: Optional[float] = None) -> tuple:
     """reward = sum_k weight_k * term_k / scale_k. TRAIN window only, fixed
@@ -363,29 +398,11 @@ def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
     weights = cfg['weights']
     scales = cfg['scales']
     terms = reward_terms(train_metrics, best_lag, half_life_bars,
-                         instability, cand, similarity, incremental,
-                         turnover=turnover)
+                         similarity, turnover=turnover)
     total = 0.0
     for key, w in weights.items():
         total += float(w) * terms[key] / float(scales[key])
     return float(total), terms
-
-
-def train_thirds_instability(sig: pd.DataFrame, train: pd.DataFrame,
-                             tcol: str, lag_bars: int,
-                             min_assets: int) -> float:
-    """Std of the signal's per-bet alpha over three contiguous time-thirds of
-    TRAIN - the search-hygiene consistency term (select is never consulted)."""
-    stamps = np.sort(train['timestamp'].unique())
-    if len(stamps) < 9:
-        return 0.0
-    alphas = []
-    for part in np.array_split(stamps, 3):
-        sub = train[train['timestamp'].isin(part)]
-        m = evaluate_window(sig, sub, tcol, lag_bars, min_assets)
-        a = m.get('alpha_mean')
-        alphas.append(float(a) if a is not None and np.isfinite(a) else 0.0)
-    return float(np.std(alphas))
 
 
 # =============================================================================
@@ -466,7 +483,7 @@ class DiscoveryLedger:
     # -- queries ------------------------------------------------------------
 
     def n_trials(self, roll_id: int) -> int:
-        """Candidates evaluated this roll - the deflation denominator."""
+        """Candidates evaluated this roll (recorded on each promotion)."""
         return sum(1 for r in self._rows if r['roll_id'] == roll_id)
 
     def seen_hashes(self, roll_id: Optional[int] = None) -> set:
@@ -481,10 +498,24 @@ class DiscoveryLedger:
     def survivor_candidates(self, roll_id: int) -> List[Candidate]:
         """Rebuild a roll's surviving Candidates from their stored JSON
         (used to seed the next roll's search on resumed runs)."""
-        import json
         out, seen = [], set()
         for r in self._rows:
             if (r['roll_id'] == roll_id and r['survivor']
+                    and r['cand_hash'] not in seen):
+                seen.add(r['cand_hash'])
+                out.append(Candidate.from_dict(json.loads(r['candidate_json'])))
+        return out
+
+    def promoted_candidates(self, min_roll: int,
+                            max_roll: int) -> List[Candidate]:
+        """Distinct Candidates promoted in rolls min_roll..max_roll
+        (inclusive) - the retention re-seed pool: recent book members stay
+        under measurement even after missing a survivor cut (see
+        discovery.py), so one bad train month never discards an accumulated
+        evidence stream."""
+        out, seen = [], set()
+        for r in self._rows:
+            if (min_roll <= r['roll_id'] <= max_roll and r.get('promoted')
                     and r['cand_hash'] not in seen):
                 seen.add(r['cand_hash'])
                 out.append(Candidate.from_dict(json.loads(r['candidate_json'])))
@@ -498,6 +529,67 @@ class DiscoveryLedger:
             count += 1
             rid -= 1
         return count
+
+    def train_history(self, cand_hash: str, lag: int,
+                      up_to_roll: Optional[int] = None) -> List[dict]:
+        """RAW-SIGN train measurements of cand_hash at `lag`, one per roll it
+        was evaluated in. Stored profiles are directed by that roll's fitted
+        direction, so entries are un-flipped here. Feeds
+        pooled_train_direction: the traded sign is fitted from EVERY train
+        window the candidate was ever measured on - train-only, so the
+        select window stays unspent."""
+        out = []
+        for r in self._rows:
+            if r['cand_hash'] != cand_hash:
+                continue
+            if up_to_roll is not None and r['roll_id'] > up_to_roll:
+                continue
+            pj = r.get('profile_json')
+            if not isinstance(pj, str) or not pj:
+                continue
+            try:
+                m = (json.loads(pj).get(str(int(lag))) or {}).get('train')
+            except (ValueError, TypeError):
+                continue
+            if not m or m.get('alpha_tstat') is None:
+                continue
+            d = int(r.get('direction', 1) or 1)
+            out.append({'roll_id': int(r['roll_id']),
+                        'alpha_mean': (None if m.get('alpha_mean') is None
+                                       else d * float(m['alpha_mean'])),
+                        'alpha_tstat': d * float(m['alpha_tstat']),
+                        'n_days': int(m.get('n_days', 0) or 0)})
+        return sorted(out, key=lambda x: x['roll_id'])
+
+    def select_history(self, cand_hash: str, lag: int,
+                       up_to_roll: Optional[int] = None) -> List[dict]:
+        """Every select-month measurement of cand_hash at `lag`, one per roll
+        it was evaluated in (rolls advance monthly, so each roll's select
+        window is a DISTINCT, never-searched month - independent evidence).
+        Metrics are directed by THAT roll's train-fitted direction, which is
+        returned alongside so the caller can sign-align them before pooling.
+        Rows without a parseable profile (pre-profile runs) are skipped."""
+        out = []
+        for r in self._rows:
+            if r['cand_hash'] != cand_hash:
+                continue
+            if up_to_roll is not None and r['roll_id'] > up_to_roll:
+                continue
+            pj = r.get('profile_json')
+            if not isinstance(pj, str) or not pj:
+                continue
+            try:
+                m = (json.loads(pj).get(str(int(lag))) or {}).get('select')
+            except (ValueError, TypeError):
+                continue
+            if not m or m.get('alpha_tstat') is None:
+                continue
+            out.append({'roll_id': int(r['roll_id']),
+                        'direction': int(r.get('direction', 1) or 1),
+                        'alpha_mean': m.get('alpha_mean'),
+                        'alpha_tstat': float(m['alpha_tstat']),
+                        'n_days': int(m.get('n_days', 0) or 0)})
+        return sorted(out, key=lambda x: x['roll_id'])
 
     def to_frame(self) -> pd.DataFrame:
         return pd.DataFrame(self._rows)
@@ -539,26 +631,21 @@ def allocate_batch(bandit: Dict[str, dict], families: List[str],
     return alloc
 
 
-def select_survivors(population: List[dict], k: int, max_corr: float,
-                     max_ast_sim: float = 1.0) -> List[dict]:
+def select_survivors(population: List[dict], k: int,
+                     max_corr: float) -> List[dict]:
     """Best-first greedy de-duplication: keep the highest-reward candidates
-    that are novel on TWO axes vs every already-kept one - OUTPUT correlation
-    (train signal corr <= max_corr) AND STRUCTURE (AST similarity <=
-    max_ast_sim). Correlation alone misses structural clones (same recipe,
-    one column/window swapped, weakly correlated by luck); the AST check
-    catches them. Train only - select stays unseen until promotion."""
+    whose OUTPUT (train signal correlation) stays <= max_corr vs every
+    already-kept one. What a signal outputs is what the book trades - two
+    builds that rank the coins the same way are one signal. Train only -
+    select stays unseen until promotion."""
     ranked = sorted(population, key=lambda s: -s['reward'])
     kept: List[dict] = []
     for cand in ranked:
         if len(kept) >= k:
             break
-        corr_ok = max_signal_correlation(
-            cand['signal_train'],
-            [x['signal_train'] for x in kept]) <= max_corr
-        ast_ok = max_ast_sim >= 1.0 or all(
-            ast_similarity(cand['candidate'], x['candidate']) <= max_ast_sim
-            for x in kept)
-        if corr_ok and ast_ok:
+        if max_signal_correlation(
+                cand['signal_train'],
+                [x['signal_train'] for x in kept]) <= max_corr:
             kept.append(cand)
     return kept
 
@@ -581,12 +668,12 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     cfg = cfg or get('discovery', {})
     search_cfg = cfg['search']
     rng = np.random.default_rng(int(search_cfg['seed']) + roll.roll_id)
-    # NO PINNING: every candidate is evaluated at EVERY search lag on train
-    # and select - the per-lag profile is its alpha term structure. best_lag
-    # (day-equivalent train t) only picks direction and the reward term.
-    # target_lag_bars stays the reference lag for proposer diagnostics only.
-    from research.signals.data import resolve_search_lags
-    search_lags = resolve_search_lags(cfg)
+    # NO PINNING: every candidate is evaluated at EVERY lag its FAMILY owns
+    # (family_horizon_lags: slow families at 1d-3d, the rest sub-day-to-1d)
+    # on train and select - the per-lag profile is its alpha term structure.
+    # best_lag (day-equivalent train t) only picks direction and the reward
+    # term. target_lag_bars stays the reference lag for diagnostics only.
+    from research.signals.data import family_lags
     diag_lag = int(cfg['target_lag_bars'])
     diag_tcol = target_col(diag_lag)
     min_assets = int(cfg['min_assets_per_timestamp'])
@@ -612,11 +699,6 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     # tried this roll, so the LLM can be told which recipes are over-mined.
     from collections import Counter
     subtree_counts: "Counter" = Counter()
-    # Incremental-contribution reward: the current survivor book (directed train
-    # signals) and a per-lag cache of its pooled IC, refreshed each generation.
-    incr_weight = float(cfg['reward']['weights'].get('incremental', 0.0))
-    book_signals: List[pd.DataFrame] = []
-    book_ic_cache: Dict[int, float] = {}
 
     def try_candidate(cand, gen: int) -> None:
         """Validate, compile, evaluate the FULL train+select profile, reward
@@ -634,20 +716,27 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             return
         subtree_counts.update(candidate_subtrees(cand))
 
-        # Train profile across the whole horizon grid. best_lag by the
+        # Train profile across the family's horizon grid. best_lag by the
         # DAY-EQUIVALENT t (per-bet-fair: no sqrt(stamps/day) advantage for
         # fast lags) picks direction and the reward term - nothing else.
+        cand_lags = family_lags(cand.family, cfg)
         m_train_by_lag = {
             lag_i: evaluate_window(sig, train, target_col(lag_i), lag_i,
                                    min_assets)
-            for lag_i in search_lags
+            for lag_i in cand_lags
         }
         best_lag = max(m_train_by_lag,
                        key=lambda l: abs(day_equivalent_tstat(
                            m_train_by_lag[l], l)))
-        # Traded sign is fixed on TRAIN; the flip mirrors the whole profile
-        # (the per-bet return is exactly antisymmetric under signal negation).
-        direction = 1 if m_train_by_lag[best_lag]['alpha_mean'] >= 0 else -1
+        # Traded sign: fitted from the candidate's POOLED train evidence -
+        # this window plus every prior roll's raw train measurement at this
+        # lag (train-only; see pooled_train_direction). The flip mirrors the
+        # whole profile (the per-bet return is exactly antisymmetric under
+        # signal negation).
+        direction = pooled_train_direction(
+            ledger.train_history(cand.hash, best_lag,
+                                 up_to_roll=roll.roll_id - 1)
+            + [m_train_by_lag[best_lag]])
         if direction < 0:
             sig = sig.assign(signal=-sig['signal'])
             m_train_by_lag = {l: flip_metrics(m)
@@ -663,7 +752,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         m_select_by_lag = {
             lag_i: evaluate_window(sig, select, target_col(lag_i), lag_i,
                                    min_assets)
-            for lag_i in search_lags
+            for lag_i in cand_lags
         }
         m_select = m_select_by_lag[best_lag]
         sig_select = sig[sig['timestamp'] >= roll.select_start]
@@ -673,30 +762,10 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         # promotion term - real cost belongs to the walk-forward.
         turnover = signal_turnover(sig_train)
 
-        instability = train_thirds_instability(sig, train,
-                                               target_col(best_lag),
-                                               best_lag, min_assets)
         similarity = max_signal_correlation(
             sig_train, [s['signal_train'] for s in population])
-        # Marginal contribution: the train per-bet return the candidate ADDS to
-        # the current survivor book at its best lag (pooled alpha minus the
-        # book's own). 0 when the book is empty or the reward ignores it.
-        incremental = 0.0
-        if incr_weight != 0.0 and book_signals:
-            tcol_b = target_col(best_lag)
-            if best_lag not in book_ic_cache:
-                bk = evaluate_window(pooled_signal(book_signals), train,
-                                     tcol_b, best_lag,
-                                     min_assets)['alpha_mean']
-                book_ic_cache[best_lag] = bk if np.isfinite(bk) else 0.0
-            comb = evaluate_window(pooled_signal(book_signals + [sig_train]),
-                                   train, tcol_b, best_lag,
-                                   min_assets)['alpha_mean']
-            comb = comb if np.isfinite(comb) else 0.0
-            incremental = comb - book_ic_cache[best_lag]
         rwd, terms = compute_reward(m_train, best_lag, half_life,
-                                    instability, cand, similarity,
-                                    incremental, cfg['reward'],
+                                    similarity, cfg['reward'],
                                     turnover=turnover)
         profile = {
             str(l): {'train': {k: (None if v is None or not np.isfinite(v)
@@ -705,7 +774,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                      'select': {k: (None if v is None or not np.isfinite(v)
                                     else round(float(v), 8))
                                 for k, v in m_select_by_lag[l].items()}}
-            for l in search_lags
+            for l in cand_lags
         }
         ledger.record(roll.roll_id, gen, cand, direction,
                       m_train, m_select, rwd, terms, target_lag=best_lag,
@@ -748,7 +817,6 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         } for s in pop}
 
     n_overused = int(search_cfg.get('overused_subtrees_shown', 6))
-    max_ast_sim = float(search_cfg.get('diversity_max_ast_sim', 1.0))
     # API proposal calls within a generation are independent (same
     # parents/diagnostics snapshot), so they run CONCURRENTLY - the LLM
     # round-trips are the roll's wall-clock, not the scoring. Sequential for
@@ -794,10 +862,6 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                           'conditions': c.to_dict()['conditions'],
                           'reward': round(float(r), 3)}
                          for c, r in sorted(failures, key=lambda x: x[1])[:6]]
-            # Refresh the survivor book the incremental-contribution reward
-            # scores against (directed train signals from the last cull).
-            book_signals[:] = [s['signal_train'] for s in population]
-            book_ic_cache.clear()
             # Over-mined structural building blocks: tell the LLM to vary away.
             overused = [_to_list(st)
                         for st, _ in subtree_counts.most_common(n_overused)]
@@ -809,8 +873,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             pre_cull = population
             population = select_survivors(population,
                                           int(search_cfg['survivors']),
-                                          float(search_cfg['diversity_max_corr']),
-                                          max_ast_sim)
+                                          float(search_cfg['diversity_max_corr']))
             # Whatever was tried this gen but did not survive is a failure to
             # remember (low reward first is selected at prompt time).
             kept = {s['candidate'].hash for s in population}

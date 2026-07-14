@@ -1165,9 +1165,9 @@ _LISTINGS_CACHE: Optional[pd.DataFrame] = None
 
 def calculate_listing_features(df: pd.DataFrame,
                                symbol: str) -> Dict[str, pd.Series]:
-    """Listing age from listings (etl/listings.py, true first perp trade
-    date - the prices table is window-clipped so its first bar can't be
-    used). A listing date is PIT by construction."""
+    """Listing age from the listings table (fetched by etl/universe.py,
+    true first perp trade date - the prices table is window-clipped so its
+    first bar can't be used). A listing date is PIT by construction."""
     global _LISTINGS_CACHE
     features = _nan_series(df, LS_FEATURE_NAMES)
     try:

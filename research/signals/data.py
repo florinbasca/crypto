@@ -91,6 +91,24 @@ def resolve_search_lags(cfg: Optional[dict] = None) -> List[int]:
     return [int(x) for x in cfg['horizon_lags_bars']]
 
 
+def family_lags(family: str, cfg: Optional[dict] = None) -> List[int]:
+    """The horizons a family is scored and promoted at: its
+    family_horizon_lags entry ('default' for unlisted families) intersected
+    with horizon_lags_bars. Restricting each family to its natural horizons
+    keeps promotion's look count (survivors x lags) from being inflated by
+    horizons the family can't plausibly own. Falls back to the full grid
+    when the config section is absent or the intersection is empty."""
+    cfg = cfg or get('discovery', {})
+    grid = [int(x) for x in cfg['horizon_lags_bars']]
+    fam_map = cfg.get('family_horizon_lags') or {}
+    allowed = fam_map.get(family, fam_map.get('default'))
+    if not allowed:
+        return grid
+    allowed = {int(x) for x in allowed}
+    out = [l for l in grid if l in allowed]
+    return out or grid
+
+
 def slice_window(panel: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
                  purge_end_bars: int = 0) -> pd.DataFrame:
     """Rows with start <= timestamp < end - purge_end_bars * bar."""
