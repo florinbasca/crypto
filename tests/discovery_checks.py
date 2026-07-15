@@ -816,6 +816,56 @@ except Exception as e:
     check("providers: retired model (404) aborts the run (fail fast)", False,
           f"(wrong exception: {type(e).__name__}: {e})")
 
+class _DepletedCreditsProposer(gen.GeminiProposer):
+    """Simulates prepay credits running out mid-run: 429 RESOURCE_EXHAUSTED
+    with a BILLING message. Permanent for the run - must abort with resume
+    guidance (a live run skipped every batch for hours on this)."""
+    def __init__(self):
+        super().__init__(llm_cfg={'candidates_per_call': 8})
+
+    def _prompt(self, *args, **kwargs):
+        return 'x'
+
+    def _complete(self, prompt):
+        raise Exception(
+            "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': "
+            "'Your prepayment credits are depleted. Please go to AI Studio "
+            "to manage your project and billing.', "
+            "'status': 'RESOURCE_EXHAUSTED'}}")
+
+
+try:
+    _DepletedCreditsProposer().propose(4, 'residual_shape', {}, [], {}, rng)
+    check("providers: depleted credits (429 billing) aborts with resume hint",
+          False, "(no exception raised)")
+except SystemExit as e:
+    check("providers: depleted credits (429 billing) aborts with resume hint",
+          '--resume' in str(e), f"({str(e)[:80]}...)")
+except Exception as e:
+    check("providers: depleted credits (429 billing) aborts with resume hint",
+          False, f"(wrong exception: {type(e).__name__}: {e})")
+
+
+class _RateLimitedProposer(gen.GeminiProposer):
+    """An ORDINARY 429 rate limit (no billing language) is transient: the
+    proposer must keep the retry -> skip-batch degradation, never abort."""
+    def __init__(self):
+        super().__init__(llm_cfg={'candidates_per_call': 8})
+
+    def _prompt(self, *args, **kwargs):
+        return 'x'
+
+    def _complete(self, prompt):
+        raise Exception(
+            "429 RESOURCE_EXHAUSTED. Quota exceeded for metric "
+            "generate_requests_per_minute_per_project. Retry in 12s.")
+
+
+check("providers: plain 429 rate limit degrades to an empty batch (no abort)",
+      _RateLimitedProposer().propose(4, 'residual_shape', {}, [], {}, rng)
+      == [])
+
+
 class _FlakyProposer(gen.GeminiProposer):
     """First call truncates INSIDE the first object (nothing salvageable);
     the retry returns a clean array."""
@@ -886,6 +936,52 @@ check("parallel: both families' candidates evaluated",
 check("parallel: locked usage counters exact under concurrency",
       par.usage['calls'] == len(family_cols),
       f"({par.usage['calls']} calls for {len(family_cols)} families)")
+
+# OpenAI-compatible providers (OpenRouter / xAI): chat-completions parsing,
+# usage accounting, and HTTP errors carrying .code for the fail-fast rules.
+import requests as _rq
+
+
+class _FakeHTTPResp:
+    def __init__(self, status=200, payload=None, text=''):
+        self.status_code = status
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+_orig_post = _rq.post
+try:
+    _rq.post = lambda *a, **k: _FakeHTTPResp(payload={
+        'choices': [{'message': {'content':
+            '[{"family": "residual_shape", '
+            '"expression": ["col", "res_zscore"], "conditions": []}]'}}],
+        'usage': {'prompt_tokens': 100, 'completion_tokens': 20}})
+    _orp = gen.make_proposer('openrouter')
+    _got = _orp.propose(4, 'residual_shape', {}, [], {}, rng)
+    check("openai-compat: chat completion parsed + usage counted",
+          len(_got) == 1 and _orp.usage['input_tokens'] == 100
+          and _orp.usage['output_tokens'] == 20 and _orp.usage['calls'] == 1)
+
+    _rq.post = lambda *a, **k: _FakeHTTPResp(
+        status=429, text="Your prepayment credits are depleted; check billing")
+    try:
+        gen.make_proposer('xai').propose(4, 'residual_shape', {}, [], {}, rng)
+        check("openai-compat: 429 billing aborts via .code fail-fast", False,
+              "(no exception raised)")
+    except SystemExit as e:
+        check("openai-compat: 429 billing aborts via .code fail-fast",
+              '--resume' in str(e))
+finally:
+    _rq.post = _orig_post
+
+check("providers: 'openrouter'/'xai' -> OpenAI-compatible proposers",
+      isinstance(gen.make_proposer('openrouter'), gen.OpenRouterProposer)
+      and isinstance(gen.make_proposer('xai'), gen.XAIProposer)
+      and gen.make_proposer('openrouter').model
+      == get('discovery.llm.model')['openrouter'])
 
 check("providers: 'random' -> RandomProposer",
       isinstance(gen.make_proposer('random'), gen.RandomProposer))

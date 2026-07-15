@@ -201,8 +201,19 @@ The mechanism is **rank + K slots + sanity floors** — no significance gates:
 
 Promotions are written with the evidence lag, half-life, turnover, direction
 and the evidence (`pooled_select_tstat`, `pooled_select_months`,
-`pooled_sign_frac`, `posterior_sharpe`, `promotion_score`). Promotion
-neither trades nor sizes.
+`pooled_sign_frac`, `posterior_sharpe`, `promotion_score`), plus a
+provenance stamp (`run_id`, `config_hash`, `data_hash`, `git_sha`) so every
+row is attributable to the exact run/config/data that produced it — a table
+mixing runs after a config change is detectable, never silently blended.
+Promotion neither trades nor sizes.
+
+The walk-forward consumes each roll's promotions at that roll's **evidence
+lag** and **fitted direction** (never the registry's deduped defaults), and
+converts per-bet alpha to per-bar linearly (returns scale with time; the
+√h convention belongs to correlations). Null controls
+(`walk_forward.py --control shuffle|sign_flip|random`) backtest placebo
+books that the real book must clearly beat; control results are printed
+but never persisted.
 
 ### Power: what happens to a true Sharpe-2 signal
 
@@ -296,12 +307,14 @@ are traded in that roll's OOS month only. All knobs live under `discovery.*` in
 
 ## Cost and run time
 
-A full run is 28 rolls (windows) × 16 generations. The model for now is Gemini
-3.1-flash-lite ($0.25 / $1.50 per million input / output tokens — the
-price-equivalent successor to 2.5-flash, which Google retired mid-2026). That
-works out to roughly **$1–3 per roll, order $30–80 for the full run**. The
-script prints the measured tokens and dollars per roll; trust that over these
-estimates.
+A full run is ~40 rolls (windows) × 16 generations. The default model is
+Gemini 3.1-flash-lite ($0.25 / $1.50 per million input / output tokens),
+measuring ~$1/roll — order $40 for the full run. Cheaper providers are one
+config switch away (`discovery.llm.provider` + the key in `.env`):
+`openrouter` (DeepSeek V4 Flash, ~$0.42/roll) and `xai` (Grok 4.1 Fast,
+~$0.63/roll) share a plain OpenAI-compatible client; `base_url` covers any
+other compatible endpoint. The script prints the measured tokens and dollars
+per roll; trust that over these estimates.
 
 Run time is dominated by candidate scoring (~15–20s per candidate on the
 5-month train panel), not the LLM: proposal calls run concurrently

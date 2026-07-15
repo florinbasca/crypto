@@ -35,8 +35,13 @@ uv run risk_model/features.py
 uv run research/signals/discovery.py
 
 # 4. Portfolio walk-forward: one window per discovery roll - each OOS month
-#    trades that month's promoted signals in a factor-neutral MVO backtest.
+#    trades that month's promoted signals (at each roll's evidence lag and
+#    fitted direction) in a factor-neutral MVO backtest.
 uv run research/portfolio/walk_forward.py
+# Null controls (printed only, never persisted): the real book must clearly
+# beat shuffle/random and mirror under sign_flip.
+uv run research/portfolio/walk_forward.py --control shuffle
+uv run research/portfolio/walk_forward.py --control sign_flip
 ```
 
 Each stage reads the tables the previous one writes, so run in order. If

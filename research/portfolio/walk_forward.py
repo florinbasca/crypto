@@ -78,6 +78,56 @@ LEGACY_BACKTEST_TABLES = ('wf_portfolio_equity', 'wf_portfolio_returns_ew',
                           'wf_portfolio_returns_bench')
 
 
+def apply_signal_control(composites: Dict[str, pd.DataFrame], mode: str,
+                         seed: int) -> Dict[str, pd.DataFrame]:
+    """Placebo transforms for null-control walk-forward runs (pure; applied
+    to the per-bucket composite z-panels just before backtesting). A claimed
+    signal-extraction system must clearly beat its own controls:
+
+    - 'sign_flip': trade the exact OPPOSITE book. Real alpha should mirror
+      into comparable NEGATIVE gross PnL; if flipped PnL looks like the
+      original, the "PnL" was construction artifact, not signal.
+    - 'shuffle':   per bar, permute scores ACROSS SYMBOLS (NaN membership
+      preserved). Destroys all cross-sectional information while keeping the
+      score distribution and book character - the sharpest "is the pipeline
+      manufacturing PnL?" control.
+    - 'random':    iid N(0,1) scores on the same index/columns/NaN mask -
+      the weakest null (also destroys persistence, so turnover rises).
+
+    Deterministic per (mode, seed, bucket). 'none' returns the input.
+    """
+    if mode == 'none':
+        return composites
+    out = {}
+    for j, (b, panel) in enumerate(sorted(composites.items())):
+        rng = np.random.default_rng(seed * 1000 + j)
+        vals = panel.to_numpy(copy=True)
+        mask = np.isfinite(vals)
+        if mode == 'sign_flip':
+            vals = -vals
+        elif mode == 'shuffle':
+            for i in range(vals.shape[0]):
+                m = mask[i]
+                if m.sum() > 1:
+                    vals[i, m] = rng.permutation(vals[i, m])
+        elif mode == 'random':
+            noise = rng.standard_normal(vals.shape)
+            vals = np.where(mask, noise, np.nan)
+        else:
+            raise ValueError(f"unknown control mode: {mode!r}")
+        out[b] = pd.DataFrame(vals, index=panel.index, columns=panel.columns)
+    return out
+
+
+def per_bar_alpha(alpha_per_bet: float, h_bars: float) -> float:
+    """Per-BAR expected residual return from a per-BET alpha measured over
+    h_bars (discovery's unit: the gross-1 book's return held for the
+    horizon). Returns scale LINEARLY with holding time - never sqrt (that
+    convention belongs to correlations/ICs, and applying it here overstated
+    slow buckets' per-bar edge by sqrt(h))."""
+    return float(alpha_per_bet) / max(float(h_bars), 1.0)
+
+
 def gp_trade_rate(cost_bps: float, gp: dict, legacy_halflife: float) -> float:
     """Per-bar trade rate: the fraction of the gap to the aim portfolio traded
     each bar (book_t = (1-rate)*book_{t-1} + rate*aim_t).
@@ -378,11 +428,18 @@ class DataContext:
 # =============================================================================
 
 class WalkForwardPortfolio:
-    def __init__(self):
+    def __init__(self, control: str = 'none', control_seed: int = 0):
         # Per-month mirror of discovery: no scoring pipeline. Each OOS month
         # trades ONLY the signals its roll promoted, sized from the metadata
         # discovery already measured (direction, lag, train IC, half-life,
         # turnover).
+        # control != 'none' runs a NULL-CONTROL backtest (see
+        # apply_signal_control): results are printed but NEVER persisted to
+        # the wf_portfolio_* tables - a placebo run must not overwrite or
+        # masquerade as the real one.
+        self.control = str(control)
+        self.control_seed = int(control_seed)
+        self.persist = self.control == 'none'
         self.registry = build_registry()
         if not self.registry:
             raise RuntimeError(
@@ -401,9 +458,22 @@ class WalkForwardPortfolio:
         self._carry: pd.Series = pd.Series(dtype=float)
 
     def _build_month_meta(self) -> Dict[pd.Timestamp, List[dict]]:
-        """{oos_start -> [{name, lag, ic, half_life, turnover}]} from the
-        promotions table (one entry per signal per month it was promoted),
-        joined with the ledger for that roll's train IC and turnover."""
+        """{oos_start -> [{name, lag, direction, ic, half_life, turnover}]}
+        from the promotions table (one entry per signal per month it was
+        promoted), joined with the ledger for that roll's train alpha and
+        turnover.
+
+        Horizon consistency: `lag` is the roll's EVIDENCE lag (select_lag -
+        the horizon whose pooled held-out alpha earned the promotion), not
+        the train-best target_lag; the two can differ, and the book must
+        hold the signal at the horizon that was actually validated
+        (target_lag remains the fallback for pre-select_lag tables). The
+        train alpha (`ic`, sizing weight) is read from the ledger's per-lag
+        profile AT that same lag, so horizon and expected return stay one
+        unit. `direction` is the ROLL's fitted direction - the registry's
+        deduped entry keeps only one direction per signal, and a roll that
+        traded the other way must be flipped back (see composite_scores)."""
+        import json as _json
         from research.signals.data import make_rolls
         tables = get('discovery.tables')
         promos = load_data(tables['promotions'])
@@ -419,7 +489,8 @@ class WalkForwardPortfolio:
                             getattr(r, 'train_ic_mean', np.nan))
                 led_key[(int(r.roll_id), r.cand_hash)] = (
                     float(a if a is not None else np.nan),
-                    float(getattr(r, 'turnover', np.nan) or np.nan))
+                    float(getattr(r, 'turnover', np.nan) or np.nan),
+                    getattr(r, 'profile_json', '') or '')
         oos_by_roll = {r.roll_id: pd.Timestamp(r.oos_start)
                        for r in make_rolls(get('discovery'))}
         out: Dict[pd.Timestamp, List[dict]] = {}
@@ -428,12 +499,24 @@ class WalkForwardPortfolio:
             oos = oos_by_roll.get(int(r['roll_id']))
             if oos is None or name not in self.registry:
                 continue
-            ic, to = led_key.get((int(r['roll_id']), r['cand_hash']),
-                                 (np.nan, np.nan))
+            ic, to, pj = led_key.get((int(r['roll_id']), r['cand_hash']),
+                                     (np.nan, np.nan, ''))
+            lag = int(r.get('select_lag') or r.get('target_lag') or 0) or 6
+            # Train alpha AT the evidence lag (best-lag alpha is the wrong
+            # horizon when they differ); fall back to the best-lag value.
+            if isinstance(pj, str) and pj:
+                try:
+                    m = (_json.loads(pj).get(str(lag)) or {}).get('train') or {}
+                    a_lag = m.get('alpha_mean')
+                    if a_lag is not None and np.isfinite(a_lag):
+                        ic = float(a_lag)
+                except (ValueError, TypeError):
+                    pass
             hl = float(r.get('half_life_bars') or 0) or None
             out.setdefault(oos, []).append({
                 'name': name,
-                'lag': int(r.get('target_lag') or 0) or 6,
+                'lag': lag,
+                'direction': int(r.get('direction', 1) or 1),
                 'ic': ic, 'half_life': hl, 'turnover': to,
             })
         n = sum(len(v) for v in out.values())
@@ -474,12 +557,17 @@ class WalkForwardPortfolio:
                          feat_start: pd.Timestamp,
                          test_start: pd.Timestamp,
                          test_end: pd.Timestamp,
-                         lag_of: Optional[Dict[str, int]] = None
+                         lag_of: Optional[Dict[str, int]] = None,
+                         dir_of: Optional[Dict[str, int]] = None
                          ) -> Dict[str, pd.DataFrame]:
         """Per-horizon composite z-score panel (wide: timestamp x symbol) on the
         test window. Signals recomputed at full resolution with warmup, each
         smoothed at the per-lag effective halflife of its SELECTED lag
-        (`lag_of`) so the traded signal matches the one that was scored."""
+        (`lag_of`) so the traded signal matches the one that was scored.
+        `dir_of` is the ROLL's fitted direction: compute_signal_panel applies
+        the registry's deduped default, so a month whose roll traded the
+        other way is sign-flipped back here - each OOS month trades the
+        direction its own roll validated."""
         all_sigs = sorted({s for sigs in selected.values() for s in sigs})
         if not all_sigs:
             return {}
@@ -504,6 +592,10 @@ class WalkForwardPortfolio:
                   if lag_of and sig in lag_of else None)
             p = compute_signal_panel(sig, self.registry, features, halflife=hl)
             p = p[p['timestamp'] >= test_start]
+            if dir_of and sig in dir_of:
+                reg_dir = int(self.registry[sig].get('direction', 1) or 1)
+                if int(dir_of[sig]) != reg_dir:
+                    p = p.assign(signal=-p['signal'])
             panels[sig] = p.pivot_table(index='timestamp', columns='symbol',
                                         values='signal', aggfunc='first')
 
@@ -525,8 +617,9 @@ class WalkForwardPortfolio:
     def month_book(self, meta: List[dict]):
         """One OOS month's tradable book from discovery metadata: buckets =
         distinct promoted lags, weights within a bucket proportional to train
-        IC. Returns (selected, weights, lag_of, bucket_ic, bucket_h,
-        bucket_to, bucket_hl)."""
+        IC. Returns (selected, weights, lag_of, dir_of, bucket_ic, bucket_h,
+        bucket_to, bucket_hl); dir_of is the ROLL's traded direction per
+        signal (may differ from the deduped registry default)."""
         selected, weights, bucket_ic, bucket_h = {}, {}, {}, {}
         bucket_to, bucket_hl = {}, {}
         by_lag: Dict[int, List[dict]] = {}
@@ -552,7 +645,8 @@ class WalkForwardPortfolio:
                                     / max(sum(wi for wi, _ in hls), 1e-12))
                               if hls else None)
         lag_of = {m['name']: m['lag'] for m in meta}
-        return (selected, weights, lag_of, bucket_ic, bucket_h,
+        dir_of = {m['name']: int(m.get('direction', 1) or 1) for m in meta}
+        return (selected, weights, lag_of, dir_of, bucket_ic, bucket_h,
                 bucket_to, bucket_hl)
 
     # ---------------- one window ----------------
@@ -567,7 +661,7 @@ class WalkForwardPortfolio:
         # within a bucket proportional to train IC (panels are already
         # direction-applied by compute_signal_panel).
         meta = self.month_meta.get(pd.Timestamp(train_end), [])
-        (selected, weights, lag_of, bucket_ic, bucket_h,
+        (selected, weights, lag_of, dir_of, bucket_ic, bucket_h,
          bucket_to, bucket_hl) = self.month_book(meta)
 
         res.selected = selected
@@ -586,9 +680,12 @@ class WalkForwardPortfolio:
 
         feat_start = train_end - pd.Timedelta(days=WARMUP_DAYS)
         composites = self.composite_scores(selected, weights, feat_start,
-                                           train_end, test_end, lag_of=lag_of)
+                                           train_end, test_end, lag_of=lag_of,
+                                           dir_of=dir_of)
         if not composites:
             return res
+        composites = apply_signal_control(composites, self.control,
+                                          self.control_seed + idx)
 
         self._ensure_context()
         bt_returns = self._backtest_window(composites, bucket_ic, bucket_h,
@@ -704,7 +801,14 @@ class WalkForwardPortfolio:
                 "  holding/persistence (bars): %s",
                 ", ".join(f"{b}:{hold_bars[b]:.0f} (to {(bucket_to or {}).get(b, float('nan')):.2f})"
                           for b in sorted(composites)))
-        # Two scales per bucket from the same (1 - ic_shrink) * IC_b / sqrt(h_b)
+        # ONE expected-return unit: PER-BAR residual return. bucket_ic is the
+        # per-BET alpha in RETURN units (the gross-1 book's return held for
+        # h_b bars, from discovery), so per-bar alpha = alpha / h_b - returns
+        # scale LINEARLY with holding time. The old / sqrt(h_b) was a leftover
+        # from the rank-IC era (correlations scale with sqrt(time); returns do
+        # not) and overstated slow buckets' per-bar edge by sqrt(h) - a 1d
+        # bucket got ~4.9x the per-bar alpha of an equally-profitable 1h one.
+        # Two scales per bucket from the same (1 - ic_shrink) * alpha_b / h_b
         # base:
         #  - ic_scale     applies the Garleanu-Pedersen aim discount
         #    p/(p + 1/kappa) at the bucket's turnover-implied PERSISTENCE p
@@ -721,8 +825,8 @@ class WalkForwardPortfolio:
         ic_scale = {}
         ic_scale_raw = {}
         for b in composites.keys():
-            h_b = max(bucket_h.get(b, 1.0), 1.0)
-            raw = ic_keep * bucket_ic.get(b, 0.0) / np.sqrt(h_b)
+            raw = ic_keep * per_bar_alpha(bucket_ic.get(b, 0.0),
+                                          bucket_h.get(b, 1.0))
             ic_scale_raw[b] = raw
             p_b = hold_bars[b]
             ic_scale[b] = raw * (p_b / (p_b + 1.0 / kappa)) if gp_on else raw
@@ -1274,14 +1378,20 @@ class WalkForwardPortfolio:
         self._cum_wealth = 1.0
         self._peak_wealth = 1.0
         self._carry = pd.Series(dtype=float)  # fresh run starts flat
-        self._reset_backtest_tables()
+        if self.persist:
+            self._reset_backtest_tables()
+        else:
+            logging.warning(f"NULL-CONTROL run (control={self.control}): "
+                            "results printed only, wf_portfolio_* tables "
+                            "untouched")
 
         prev = None
         for i, (t0, t1, t2) in enumerate(tqdm(schedule, desc="Windows")):
             res = self.run_window(i, t0, t1, t2, prev)
             if res is not None:
                 self.windows.append(res)
-                self._save_window(res)
+                if self.persist:
+                    self._save_window(res)
                 if res.selected:
                     prev = res
 
@@ -1458,13 +1568,36 @@ class WalkForwardPortfolio:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='Walk-forward market-neutral backtest over the '
+                    'discovery promotions (the only money judge)')
+    parser.add_argument('--control', default='none',
+                        choices=['none', 'sign_flip', 'shuffle', 'random'],
+                        help='Null-control run: sign_flip trades the exact '
+                             'opposite book; shuffle permutes scores across '
+                             'symbols per bar (destroys all cross-sectional '
+                             'information); random replaces scores with '
+                             'N(0,1). Control results are printed but never '
+                             'persisted. The real book must clearly beat '
+                             'shuffle/random and mirror under sign_flip.')
+    parser.add_argument('--control-seed', type=int, default=0,
+                        help='Seed for shuffle/random controls (report '
+                             'several seeds, not one)')
+    args = parser.parse_args()
+
     logging.info("Walk-forward starting (registry -> scoring -> panels)...")
-    wf = WalkForwardPortfolio()
-    # run() checkpoints each window to the DB (wf_portfolio_*) as it traverses.
+    wf = WalkForwardPortfolio(control=args.control,
+                              control_seed=args.control_seed)
+    # run() checkpoints each window to the DB (wf_portfolio_*) as it
+    # traverses - unless this is a control run (print-only).
     returns = wf.run()
     if returns.empty:
         print("No portfolio produced: no window had defensible tradable signals")
         return
+    if args.control != 'none':
+        print(f"\n=== NULL CONTROL: {args.control} "
+              f"(seed {args.control_seed}) - not persisted ===")
     wf.summary(returns)
 
 

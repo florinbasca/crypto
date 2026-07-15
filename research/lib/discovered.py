@@ -70,9 +70,17 @@ def entries_from_promotions(promos: pd.DataFrame,
     """Registry entries {name: info} from promotion rows (pure, testable).
 
     Deduped by cand_hash (the content hash of the program): the row with the
-    strongest |select_ic_tstat| wins the direction/metadata, and valid_from is
-    the EARLIEST promotion date seen for that hash. Names are hash-stable
-    (disc_<family>_<hash>) so scored stats stay consistent across runs.
+    strongest |select_alpha_tstat| wins the DEFAULT direction/metadata, and
+    valid_from is the EARLIEST promotion date seen for that hash. Names are
+    hash-stable (disc_<family>_<hash>) so scored stats stay consistent across
+    runs.
+
+    The deduped direction/lag here are DEFAULTS only: the walk-forward
+    overrides both per roll from the promotions table (each OOS month trades
+    the direction its own roll fitted, at that roll's evidence lag) - see
+    WalkForwardPortfolio._build_month_meta / composite_scores. The entry's
+    lag prefers the promotion's evidence lag (select_lag) over the
+    train-best target_lag when present.
     """
     from research.signals.generation import Candidate, candidate_columns
     import json
@@ -117,7 +125,8 @@ def entries_from_promotions(promos: pd.DataFrame,
             theme=f"disc_{cand.family}",
             rationale=cand.rationale or cand.name,
             candidate=cand,
-            lag=int(row.get('target_lag', 0) or 0),
+            lag=int(row.get('select_lag', 0) or row.get('target_lag', 0)
+                    or 0),
             halflife=half_life,
         )
         entries[name] = {

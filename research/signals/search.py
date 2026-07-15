@@ -417,6 +417,13 @@ class DiscoveryLedger:
     def __init__(self, table_name: Optional[str] = None):
         self.table_name = table_name
         self._rows: List[dict] = []
+        # Provenance stamp merged into every recorded row (run_id, config
+        # hash, data fingerprint - set by discovery.py). Config tuning across
+        # runs spends the select window's honesty; the stamp makes every row
+        # attributable to the exact run/config/data that produced it, so a
+        # table mixing runs (--resume after a config change) is DETECTABLE
+        # instead of silently blended.
+        self.run_stamp: dict = {}
         if table_name:
             self._load_existing()
 
@@ -466,6 +473,7 @@ class DiscoveryLedger:
             row[f'train_{k}'] = v
         for k, v in terms.items():
             row[f'term_{k}'] = v
+        row.update(self.run_stamp)
         self._rows.append(row)
 
     def _mark(self, roll_id: int, hashes, field: str) -> None:

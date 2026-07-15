@@ -50,8 +50,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import argparse
+import hashlib
+import json
 import logging
+import subprocess
 import time
+import uuid
 
 import pandas as pd
 
@@ -77,6 +81,29 @@ def _resolve_columns(cfg):
     for family, cols in family_columns.items():
         print(f"  {family:18s} {len(cols):3d} columns")
     return family_columns
+
+
+def _run_stamp(cfg: dict, panel: pd.DataFrame) -> dict:
+    """Provenance for every ledger/promotion row this run writes: a fresh
+    run_id, a hash of the exact discovery config, the git commit, and a
+    fingerprint of the data panel (shape + date range + symbol set). Config
+    tuning across runs spends the select window's honesty - the stamp makes
+    a table that mixes runs/configs/data DETECTABLE instead of silently
+    blended, and lets any promotion be traced to the run that produced it."""
+    cfg_hash = hashlib.sha256(
+        json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    data_hash = hashlib.sha256(
+        (f"{len(panel)}|{panel['timestamp'].min()}|{panel['timestamp'].max()}"
+         f"|{','.join(sorted(panel['symbol'].unique()))}"
+         ).encode()).hexdigest()[:12]
+    try:
+        git_sha = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'], capture_output=True,
+            text=True, timeout=5).stdout.strip() or 'unknown'
+    except Exception:
+        git_sha = 'unknown'
+    return {'run_id': uuid.uuid4().hex[:12], 'config_hash': cfg_hash,
+            'data_hash': data_hash, 'git_sha': git_sha}
 
 
 def _save(table: str, df: pd.DataFrame, fresh: bool, save: bool):
@@ -148,6 +175,10 @@ def main():
           f"select {cfg['select_months']}mo / OOS {cfg['oos_months']}mo")
 
     ledger = search_mod.DiscoveryLedger(tables['ledger'] if save else None)
+    stamp = _run_stamp(cfg, panel)
+    ledger.run_stamp = stamp
+    print(f"run {stamp['run_id']} (config {stamp['config_hash']}, "
+          f"data {stamp['data_hash']}, git {stamp['git_sha']})")
 
     # --resume: skip rolls already fully completed (the ledger flushes only at
     # the END of a roll, so every roll on disk is complete). Continue at the
@@ -174,9 +205,10 @@ def main():
     seeds = []         # previous roll's survivors, re-tested each new roll
 
     for roll in rolls:
-        print(f"\n=== roll {roll.roll_id}: train {roll.train_start.date()} "
-              f"select {roll.select_start.date()} OOS {roll.oos_start.date()}"
-              f"..{roll.oos_end.date()} ===")
+        print(f"\n=== roll {roll.roll_id}: "
+              f"train {roll.train_start.date()}..{roll.select_start.date()} "
+              f"| select ..{roll.oos_start.date()} "
+              f"| OOS ..{roll.oos_end.date()} ===")
 
         if not seeds and roll.roll_id > 0:
             # resumed/partial runs: recover the previous roll's survivors
@@ -257,6 +289,7 @@ def main():
                                                float('nan'))),
                 'reward': p['reward'],
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
+                **stamp,
             })
             print(f"  + {c.name} ({c.family}) "
                   f"posterior SR={roll_promo_rows[-1]['posterior_sharpe']:.2f} "

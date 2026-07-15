@@ -823,6 +823,21 @@ class _ApiProposer(Proposer):
                         f"{self.provider} model '{self.model}' not found "
                         f"(retired or mis-named): {e}. Update "
                         f"discovery.llm.model in config.py.") from e
+                # A 429 for DEPLETED CREDITS / billing is just as permanent
+                # (a live run burned through prepay mid-flight exactly this
+                # way: every batch skipped for hours, wall-clock wasted on a
+                # seeds-only search). Ordinary 429 rate limits stay transient
+                # (retry -> skip batch): only billing-shaped messages abort.
+                msg = str(e)
+                if ('depleted' in msg.lower() or 'billing' in msg.lower()) \
+                        and ('429' in msg or 'RESOURCE_EXHAUSTED' in msg
+                             or getattr(e, 'code', None) == 429):
+                    raise SystemExit(
+                        f"{self.provider} API credits exhausted: {e}. Top up "
+                        f"(or switch LLM_KEY in .env to a funded/free-tier "
+                        f"project), then continue the run with "
+                        f"'uv run research/signals/discovery.py --resume' - "
+                        f"completed rolls are preserved.") from e
                 last_err = e
         if items is None:
             logging.warning(f"{self.provider} proposer: unusable response "
@@ -1012,10 +1027,67 @@ class GeminiProposer(_ApiProposer):
         return resp.text or ''
 
 
+class OpenAICompatProposer(_ApiProposer):
+    """Any OpenAI-compatible chat API via plain requests - no SDK to
+    install. Subclasses pin the provider name (which selects the model and
+    price config entries) and a default endpoint; discovery.llm.base_url
+    overrides it, which also covers DeepSeek-direct or a self-hosted
+    server. Key from the same generic .env variable as every provider.
+
+    Errors carry .code = HTTP status so propose()'s fail-fast rules (404
+    retired model, 429 depleted credits) work unchanged."""
+
+    default_base_url = ''
+
+    def _complete(self, prompt: str) -> str:
+        import requests
+        base = str(self.llm_cfg.get('base_url')
+                   or self.default_base_url).rstrip('/')
+        resp = requests.post(
+            f'{base}/chat/completions',
+            headers={'Authorization': f'Bearer {self._api_key()}'},
+            json={
+                'model': self.model,
+                'max_tokens': int(self.llm_cfg['max_tokens']),
+                'messages': [
+                    {'role': 'system', 'content': _LLM_SYSTEM},
+                    {'role': 'user', 'content': prompt},
+                ],
+            },
+            timeout=float(self.llm_cfg.get('request_timeout_s', 120)))
+        if resp.status_code != 200:
+            e = Exception(f"{resp.status_code} {resp.text[:300]}")
+            e.code = resp.status_code
+            raise e
+        data = resp.json()
+        u = data.get('usage') or {}
+        self._add_usage(
+            input_tokens=int(u.get('prompt_tokens', 0) or 0),
+            output_tokens=int(u.get('completion_tokens', 0) or 0))
+        choices = data.get('choices') or []
+        if not choices:
+            raise Exception(f"no choices in response: {str(data)[:200]}")
+        return (choices[0].get('message') or {}).get('content') or ''
+
+
+class OpenRouterProposer(OpenAICompatProposer):
+    """OpenRouter (one key, many models incl. DeepSeek/Qwen and the :free
+    pool). Model names are 'vendor/model', e.g. deepseek/deepseek-v4-flash."""
+    provider = 'openrouter'
+    default_base_url = 'https://openrouter.ai/api/v1'
+
+
+class XAIProposer(OpenAICompatProposer):
+    """xAI (Grok) - grok-4.1-fast is the budget tier."""
+    provider = 'xai'
+    default_base_url = 'https://api.x.ai/v1'
+
+
 # Backward-compatible alias (pre-provider-split name)
 LLMProposer = AnthropicProposer
 
-_API_PROPOSERS = {'anthropic': AnthropicProposer, 'gemini': GeminiProposer}
+_API_PROPOSERS = {'anthropic': AnthropicProposer, 'gemini': GeminiProposer,
+                  'openrouter': OpenRouterProposer, 'xai': XAIProposer}
 
 
 def make_proposer(kind: str, **kwargs) -> Proposer:

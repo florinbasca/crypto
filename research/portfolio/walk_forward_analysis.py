@@ -101,10 +101,10 @@ def main():
         meta = wf.month_meta.get(pd.Timestamp(r.oos_start), [])
         if not meta:
             continue
-        selected, weights, lag_of, *_ = wf.month_book(meta)
+        selected, weights, lag_of, dir_of, *_ = wf.month_book(meta)
         comp = wf.composite_scores(
             selected, weights, r.oos_start - pd.Timedelta(days=WARMUP_DAYS),
-            r.oos_start, r.oos_end, lag_of=lag_of)
+            r.oos_start, r.oos_end, lag_of=lag_of, dir_of=dir_of)
         if not comp:
             continue
         z = None

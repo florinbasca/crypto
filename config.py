@@ -716,8 +716,17 @@ config = {
         # name below (key_name) - switching LLMs = change provider/model here
         # and swap the key value in .env; no code or variable renames.
         'llm': {
+            # 'anthropic', 'gemini', 'openrouter' or 'xai'. The last two
+            # share one OpenAI-compatible client (plain requests, no SDK);
+            # base_url below overrides their default endpoint, which also
+            # covers DeepSeek-direct or any self-hosted server. Switching =
+            # change provider (+ model entry) here and swap the key value
+            # in .env; nothing else.
             'provider': 'gemini',
             'key_name': 'LLM_KEY',       # .env variable holding the API key
+            # Endpoint override for the OpenAI-compatible providers (None =
+            # the provider's default: openrouter.ai/api/v1, api.x.ai/v1).
+            'base_url': None,
             # gemini-2.5-flash was RETIRED by Google mid-2026 (generate calls
             # 404 even though models.list still shows it). 3.1-flash-lite is
             # the price-equivalent replacement ($0.25/$1.50 vs the old
@@ -727,6 +736,10 @@ config = {
             'model': {
                 'anthropic': 'claude-sonnet-4-6',
                 'gemini': 'gemini-3.1-flash-lite',
+                # ~$0.42/roll at the measured token profile (vs ~$1 gemini)
+                'openrouter': 'deepseek/deepseek-v4-flash',
+                # ~$0.63/roll; 2M context
+                'xai': 'grok-4.1-fast',
             },
             # max_output_tokens must cover BOTH the reasoning budget below
             # AND the JSON (8 candidates ~= 2-3k tokens). 10240 leaves the
@@ -762,6 +775,11 @@ config = {
                 # includes thinking tokens. Update here if the model or
                 # Google's rates change.
                 'gemini': {'input': 0.25, 'output': 1.50},
+                # deepseek-v4-flash via OpenRouter (checked 2026-07; verify
+                # on the model page - listings varied 0.09-0.14 in).
+                'openrouter': {'input': 0.14, 'output': 0.28},
+                # grok-4.1-fast (checked 2026-07).
+                'xai': {'input': 0.20, 'output': 0.50},
             },
         },
         'diagnostics': {
