@@ -215,3 +215,4 @@ test_*.py
 
 # emissions-adapters clone (unlock schedules; see etl/unlocks.py docstring)
 vendor/
+data_unlock_schedules.json
