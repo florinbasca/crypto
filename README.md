@@ -23,7 +23,7 @@ uv run etl/macro.py           # macro/event data: FRED market series (needs .env
 # 1b. Slow/fundamental data (all free, no keys; optional but feeds
 #     whole feature families - see "Slow data" below)
 uv run etl/stablecoins.py     # DefiLlama stablecoin supply (total + per chain)
-uv run etl/unlocks.py         # token unlock calendar (needs the exporter, see its docstring)
+uv run etl/unlocks.py         # token unlock calendar (self-contained; one-time vendor clone, see its docstring)
 uv run etl/dev_activity.py    # Electric Capital developer activity (~75MB download)
 
 # 2. Risk model
