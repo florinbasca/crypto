@@ -385,11 +385,16 @@ check("turnover: sign-flipping every bar -> ~1 (full replacement)",
       abs(search_mod.signal_turnover(_flip) - 1.0) < 1e-9,
       f"({search_mod.signal_turnover(_flip):.4f})")
 _led_df = ledger_a.to_frame()
-check("turnover: recorded in the ledger for every candidate (finite)",
-      'turnover' in _led_df.columns
-      and _led_df['turnover'].notna().all()
-      and (_led_df['turnover'] >= 0).all(),
-      f"(range {_led_df['turnover'].min():.3f}-{_led_df['turnover'].max():.3f})")
+# Coverage-floor rejects are recorded WITHOUT turnover (their evaluation is
+# cut short by design) - the finiteness guarantee applies to fully-evaluated
+# rows only.
+_full = _led_df[_led_df['reward'] != CFG['search']['sparse_reward']]
+check("turnover: recorded in the ledger for every evaluated candidate",
+      'turnover' in _full.columns
+      and _full['turnover'].notna().all()
+      and (_full['turnover'] >= 0).all(),
+      f"(range {_full['turnover'].min():.3f}-{_full['turnover'].max():.3f}, "
+      f"{len(_led_df) - len(_full)} coverage rejects excluded)")
 check("turnover: survivors carry it in-memory too",
       all('turnover' in s and np.isfinite(s['turnover']) for s in survivors_a))
 
@@ -575,6 +580,34 @@ check("negative effect: select IC strongly positive AFTER the flip",
       f"(t {e_neg['metrics_select']['alpha_tstat']:.1f})")
 check("negative effect: train IC positive after the flip too",
       e_neg['metrics_train']['alpha_mean'] > 0)
+
+# ---------------------------------------------------------------------------
+# 5c. Coverage floor: sparse-gated lottery tickets are recorded with the
+#     penalty reward (bandit + failure memory learn) but never survive.
+# ---------------------------------------------------------------------------
+print("--- 5c. train coverage floor ---")
+cov_cfg = test_cfg()
+cov_cfg['search'] = {**cov_cfg['search'], 'n_generations': 0}
+dense_probe = gen.Candidate(name='dense_probe', family='residual_shape',
+                            expression=('col', 'res_zscore'))
+sparse_probe = gen.Candidate(name='sparse_probe', family='residual_shape',
+                             expression=('col', 'res_zscore'),
+                             conditions=(('abs_gt', ('col', 'res_mom'),
+                                          999.0),))
+led_cov = search_mod.DiscoveryLedger(None)
+pop_cov = search_mod.run_search(
+    planted_panel, ROLL, family_cols,
+    gen.RandomProposer(dsl_cfg=cov_cfg['dsl'], mutation_prob=0.6),
+    led_cov, cov_cfg, seed_candidates=[sparse_probe, dense_probe])
+_cov_hashes = {s['candidate'].hash for s in pop_cov}
+_cov_row = led_cov.to_frame().query('cand_hash == @sparse_probe.hash')
+check("coverage: sparse candidate ledger-recorded with the penalty reward",
+      len(_cov_row) == 1
+      and _cov_row['reward'].iloc[0] == cov_cfg['search']['sparse_reward'])
+check("coverage: sparse candidate never enters the population",
+      sparse_probe.hash not in _cov_hashes)
+check("coverage: dense candidate unaffected",
+      dense_probe.hash in _cov_hashes)
 
 # ---------------------------------------------------------------------------
 # 5d. Unit checks: day-equivalent t, half-life fit, persistence weight,

@@ -298,6 +298,26 @@ check("rank+K: book_size 0 promotes nothing",
       bt_mod.promote(pool, ROLL, search_mod.DiscoveryLedger(None), zero_cfg)
       == [])
 
+# Thin-lag hijack (regression, found live at roll 3 of the first extended
+# run): a flukey t on a handful of gated days must not win best-lag and then
+# kill the candidate on min_days when another lag qualifies outright.
+hj_cfg = copy.deepcopy(TCFG)
+hj_cfg['horizon_lags_bars'] = [72, 144]
+hijack = make_survivor(12, sel_t=1.5, n_days=27)     # solid at 144
+hijack['profile_select'][72] = {'alpha_mean': 0.004, 'alpha_tstat': 4.7,
+                                'n_days': 8}          # flukey thin at 72
+book_h = bt_mod.promote([hijack], ROLL, search_mod.DiscoveryLedger(None),
+                        hj_cfg)
+check("hijack: qualifying lag wins over a flukey thin lag",
+      len(book_h) == 1 and book_h[0]['select_lag'] == 144
+      and book_h[0]['pooled_select_days'] == 27,
+      f"(promoted at lag {book_h[0]['select_lag']})" if book_h
+      else "(nothing promoted)")
+only_thin = make_survivor(13, sel_t=4.7, sel_alpha=0.004, n_days=8)
+check("hijack: candidate with ONLY thin lags still rejected",
+      bt_mod.promote([only_thin], ROLL, search_mod.DiscoveryLedger(None),
+                     TCFG) == [])
+
 # Horizon parity: the same t over the same CALENDAR month must score the
 # same whether it arrived as 27 daily obs (1d lag) or 9 three-day obs
 # (3d lag). promote() converts obs days to calendar days before the

@@ -214,7 +214,19 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
                 ev['n_days'] * max(1.0, lag / BARS_PER_DAY)))
             ev['posterior_sharpe'] = posterior_sharpe(
                 ev['tstat'], ev['calendar_days'], prior_tau)
-            if best is None or ev['posterior_sharpe'] > best['posterior_sharpe']:
+            # A lag must be INDIVIDUALLY promotable (directed evidence on
+            # enough calendar days) to compete for best-lag: otherwise one
+            # flukey thin lag hijacks the argmax and the candidate dies on
+            # floors it passes elsewhere (found live: t 4.7 on 8 gated days
+            # outranked a qualifying t 1.15 on 24 days, then failed
+            # min_days). Qualifying lags always beat non-qualifying ones;
+            # when none qualify, the best overall carries the failure into
+            # floors() so the rejection is reported honestly.
+            ev['qualifies'] = (ev['tstat'] > 0.0
+                               and ev['calendar_days'] >= min_days)
+            if (best is None
+                    or (ev['qualifies'], ev['posterior_sharpe'])
+                    > (best['qualifies'], best['posterior_sharpe'])):
                 best = {**ev, 'lag': int(lag)}
         best['score'] = best['posterior_sharpe'] * capture(s)
         evidence.append(best)

@@ -684,6 +684,9 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     roll_panel = roll_panel.reset_index(drop=True)
     train = slice_window(roll_panel, roll.train_start, roll.select_start, pb)
     select = slice_window(roll_panel, roll.select_start, roll.oos_start, pb)
+    # Coverage-floor denominator + threshold (see try_candidate).
+    train_days_total = int(train['timestamp'].dt.normalize().nunique())
+    min_train_coverage = float(search_cfg.get('min_train_coverage', 0.0))
 
     from research.signals.data import (all_family_columns,
                                              build_diagnostics)
@@ -728,6 +731,27 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         best_lag = max(m_train_by_lag,
                        key=lambda l: abs(day_equivalent_tstat(
                            m_train_by_lag[l], l)))
+
+        # Coverage floor: a candidate whose gates leave less than
+        # min_train_coverage of the window's days measurable is a lottery
+        # ticket promotion can never accept (min_select_days) - huge t on a
+        # handful of correlated event days. Record it (ledger visibility;
+        # the penalty reward defunds its family in the bandit and feeds the
+        # LLM's failure memory) but never let it into the population.
+        cov = (max((m.get('n_days') or 0) for m in m_train_by_lag.values())
+               / max(train_days_total, 1))
+        if min_train_coverage > 0 and cov < min_train_coverage:
+            sparse = float(search_cfg['sparse_reward'])
+            if cand.family in bandit:
+                bandit[cand.family]['n'] += 1
+                bandit[cand.family]['sum'] += sparse
+            failures.append((cand, sparse))
+            ledger.record(roll.roll_id, gen, cand, 1,
+                          m_train_by_lag[best_lag], empty_metrics(),
+                          sparse, {}, target_lag=best_lag)
+            logging.debug(f"{cand.name}: train coverage {cov:.0%} < "
+                          f"{min_train_coverage:.0%} - rejected as sparse")
+            return
         # Traded sign: fitted from the candidate's POOLED train evidence -
         # this window plus every prior roll's raw train measurement at this
         # lag (train-only; see pooled_train_direction). The flip mirrors the
@@ -796,6 +820,11 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             'signal_select': sig_select.reset_index(drop=True),
         })
 
+    # Failure memory: recently-culled low-reward candidates (and coverage-
+    # floor rejects), so the LLM can be told what NOT to re-propose (worst
+    # first, capped). Defined before the seeding pass: try_candidate appends.
+    failures: List[tuple] = []
+
     # Generation -1: the previous roll's survivors re-earn their place on the
     # new windows before any fresh proposals are made.
     for cand in (seed_candidates or []):
@@ -803,10 +832,6 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     if seed_candidates:
         logging.debug(f"roll {roll.roll_id}: seeded {len(population)} of "
                      f"{len(seed_candidates)} previous survivors")
-
-    # Failure memory: recently-culled low-reward candidates, so the LLM can be
-    # told what NOT to re-propose (worst first, capped).
-    failures: List[dict] = []
 
     def _parent_scores(pop) -> Dict[str, dict]:
         return {s['candidate'].hash: {

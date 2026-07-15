@@ -549,6 +549,20 @@ config = {
             # Frequent-subtree avoidance: how many over-mined building blocks to
             # show the LLM each generation (with a 'vary away' instruction).
             'overused_subtrees_shown': 6,
+            # Coverage floor: reject candidates whose gates leave fewer than
+            # this fraction of the train window's days measurable (at their
+            # best lag). Sparse event-gated candidates (active ~4 days/month
+            # around CPI/NFP) post huge t-stats on a handful of correlated
+            # days, win survivor slots, then fail promotion's
+            # min_select_days - the first extended run's roll 3 promoted
+            # NOTHING because most survivor slots held these lottery
+            # tickets. Rejects are still ledger-recorded (with sparse_reward,
+            # so the family bandit defunds the pattern and the failure
+            # memory warns the LLM) but never enter the population.
+            # Ultra-sparse event hypotheses belong to event_study.py.
+            # 0 disables.
+            'min_train_coverage': 0.5,
+            'sparse_reward': -5.0,
             'bandit_ucb_c': 1.0,             # family-bandit exploration constant
         },
         # Reward = sum_k weight_k * term_k / scale_k, TRAIN window ONLY.

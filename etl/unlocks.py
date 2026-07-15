@@ -71,13 +71,17 @@ def main():
     schedules = json.loads(SCHEDULES_JSON.read_text())
     sym_map = symbol_protocol_map()
 
-    rows, failed = [], []
+    rows, failed, partial = [], [], []
     for symbol, protocol in sorted(sym_map.items()):
         entry = schedules.get(protocol)
         if not entry or entry.get('error') or not entry.get('sections'):
             failed.append((symbol, protocol,
                            (entry or {}).get('error', 'not exported')))
             continue
+        # Exporter salvage: broken sections (usually staking-reward feeds)
+        # were dropped so the vesting cliffs survive - keep it visible.
+        if entry.get('dropped'):
+            partial.append((symbol, entry['dropped']))
         cum = None
         for sec in entry['sections']:
             if not sec['series']:
@@ -111,6 +115,10 @@ def main():
     print(f"token_unlocks_daily: {len(out):,} rows, {n_syms} symbols, "
           f"{out['date'].min().date()} -> {out['date'].max().date()} "
           f"(forward dates included), schedule_hash={sched_hash}")
+    if partial:
+        print(f"partial ({len(partial)}, broken sections dropped by the "
+              "exporter): "
+              + ", ".join(f"{s}(-{','.join(d)})" for s, d in partial[:10]))
     if failed:
         print(f"not converted ({len(failed)}): "
               + ", ".join(f"{s}({r[:30]})" for s, _, r in failed[:10]))
