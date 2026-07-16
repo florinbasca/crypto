@@ -280,6 +280,9 @@ def main():
                                             p['metrics_select']['alpha_tstat']),
                 'test_days': int(p.get('test_days', 0) or 0),
                 'econ_margin': float(p.get('econ_margin', float('nan'))),
+                # Curve anatomy: where the response tops out (the portfolio's
+                # holding inputs are capped here via half_life_bars).
+                'peak_bars': int(p.get('peak_bars') or 0),
                 'reward': p['reward'],
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
                 **stamp,
@@ -287,8 +290,8 @@ def main():
             print(f"  + {c.name} ({c.family}) "
                   f"test $t={roll_promo_rows[-1]['select_alpha_tstat']:.2f} "
                   f"over {roll_promo_rows[-1]['test_days']}d "
-                  f"@ lag {p.get('select_lag', p.get('target_lag'))} "
-                  f"margin {roll_promo_rows[-1]['econ_margin'] * 1e4:.2f}bp/bar "
+                  f"peak {roll_promo_rows[-1]['peak_bars']}b "
+                  f"net rate {roll_promo_rows[-1]['econ_margin'] * 1e4:.3f}bp/bar "
                   f"(capture {p.get('capture', 0):.2f}, "
                   f"turnover {p.get('turnover', float('nan')):.3f}/bar)")
         promo_rows.extend(roll_promo_rows)

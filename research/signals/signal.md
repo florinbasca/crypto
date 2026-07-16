@@ -54,6 +54,17 @@ Two windows per roll, advancing one month at a time (5 + 5 + 1):
 - **Test**: held out. A formula's verdict is its most recent 5-month test
   window — one verdict per formula per roll, **no cross-roll pooling**: the
   long window IS the evidence. New formulas wait for their window to fill.
+- **The verdict instrument is the response curve** (`discovery.curve`): the
+  gross-1 book's cumulative return tracked bar-by-bar for 144 bars after
+  entry, averaged over entries every 6 bars of the test window, then fitted
+  (deterministically) to: **a0** (edge at the curve's peak), **half-life**
+  (real decay — kills the saturated 4-point artifact), **peak_k** (where
+  the response tops out; beyond it the alpha actively reverses) and
+  **rev_frac** (how much is given back). A hump-shaped edge is positive at
+  every legacy lag yet poison to a slow book — only the curve sees it. The
+  curve never feeds the search reward (train-only) — it is read once, at
+  promotion. Rows without curves (old ledgers) fall back to the 4-lag
+  verdict.
 - Windows slide monthly, so every month gets a fresh verdict and a fresh
   OOS month; consecutive test windows overlap 4 of 5 months (each verdict
   is still strictly causal for its own OOS month).
@@ -149,35 +160,40 @@ window (per-bet return, not rank IC; directed by the sign committed on
 train). Four filters, then the quintile — no significance gates, no fixed
 counts:
 
-1. **Made money** — the verdict is net positive in the committed direction.
-   A sign, not a bar. (~150 test days give a true Sharpe-2 formula a ~90%
-   pass rate, Sharpe-1 ~74%, noise 50% — the filter removes the backwards
-   half of noise; the quintile does the actual selecting.) Directed, never
-   |t|: a formula whose test ran backwards is rejected, not flipped —
-   re-signing after seeing the test is how noise gets promoted.
-2. **Enough activity** (`min_select_days`) — fired on enough real days
-   within the test window. Dense formulas pass trivially; a tight gate on
-   dense features (active 4 days/month) does not get a trusted verdict
-   until it has accumulated enough firings.
-3. **Pays for itself** — expected per-bar profit (verdict alpha / holding
-   bars) exceeds the formula's own per-bar trading cost (churn ×
-   `econ_cost_bps`, defaulting to the portfolio layer's cost model), AND
-   the alpha is holdable at the book's measured fill rate
-   (`min_capture`). Churn is priced, never capped.
+1. **Made money** — the curve's peak edge a0 is positive in the committed
+   direction, AND (`curve.median_gate`) the **median** entry outcome at the
+   peak is positive — a formula whose whole profit is one jump day passes
+   a mean, never a median. Directed, never |t|: a formula whose test ran
+   backwards is rejected, not flipped — re-signing after seeing the test
+   is how noise gets promoted. (~150 test days give a true Sharpe-2
+   formula ~90% pass, Sharpe-1 ~74%, noise 50% — the filter halves noise;
+   the quintile does the actual selecting.)
+2. **Enough activity** (`min_select_days`) — enough real entry days within
+   the test window for the curve to mean anything.
+3. **Pays for itself** — the curve, judged at its own optimum, must cover
+   a round trip at a positive rate: `max over k of
+   (A(k) − roundtrip_cost)/k > 0` (round trip = `curve.roundtrip_mult` ×
+   the cost rate, `econ_cost_bps` defaulting to the portfolio layer's
+   cost model). AND holdable: capture at the book's measured fill rate ≥
+   `min_capture`, with holding inputs **capped at the measured peak** —
+   persistence past the point where the alpha reverses is worthless.
 4. **Not a duplicate** (`max_book_corr`) — signal correlation vs formulas
    already chosen this roll, greedy best-first.
 
 Then promote the **best quintile of the passers**: ceil(`book_frac` ×
-n_passers), bounded by `book_min`/`book_max`, ranked by day-equivalent
-verdict t × capture. Proportional — the book breathes with how much quality
-exists; a rich roll promotes more, a barren one less.
+n_passers), bounded by `book_min`/`book_max`, **ranked by net economic
+rate at each formula's own optimal holding** (money-ordered, not
+significance-ordered). Proportional — the book breathes with how much
+quality exists.
 
-Promotions are written with the verdict lag, half-life, turnover, direction
-and the economics (`select_alpha_tstat`, `test_days`, `econ_margin`), plus
-a provenance stamp (`run_id`, `config_hash`, `data_hash`, `git_sha`) so
-every row is attributable to the exact run/config/data that produced it — a
-table mixing runs after a config change is detectable, never silently
-blended. Promotion neither trades nor sizes.
+Promotions are written with the verdict lag (= the curve's peak), peak
+bars, half-life (**capped at the peak** — this is what the walk-forward
+consumes for smoothing, holding and its capture discount, so the portfolio
+is never told it may hold past the reversal), turnover, direction and the
+economics (`select_alpha_tstat` = a0 vs its error bar, `test_days`,
+`econ_margin` = net rate), plus a provenance stamp (`run_id`,
+`config_hash`, `data_hash`, `git_sha`). Promotion neither trades nor
+sizes.
 
 The walk-forward consumes each roll's promotions at that roll's **evidence
 lag** and **fitted direction** (never the registry's deduped defaults), and

@@ -471,6 +471,26 @@ config = {
         # Reference lag for the proposer's compressed diagnostics only.
         'target_lag_bars': 36,
         'min_assets_per_timestamp': 10,
+        # Response curves (the verdict instrument): on each formula's 5-month
+        # test window, track the gross-1 book's cumulative return bar-by-bar
+        # for horizon_bars after entry, averaged over entries every
+        # entry_stride_bars. The fitted curve (edge size a0, decay half-life,
+        # peak/reversal point) replaces the 4-lag verdict: filters judge each
+        # formula at its own optimal holding, the peak caps how long the
+        # portfolio may hold it, and the saturated 4-point half-life artifact
+        # dies. sample_ks = where the curve is stored (log-spaced) so the
+        # economics can be re-priced at any cost without re-running.
+        'curve': {
+            'horizon_bars': 144,
+            'entry_stride_bars': 6,
+            'sample_ks': [1, 2, 3, 6, 12, 24, 48, 72, 96, 120, 144],
+            # Filter 1 robustness: also require the MEDIAN entry outcome at
+            # the peak to be positive (a formula whose whole profit is one
+            # jump day passes the mean, fails the median).
+            'median_gate': True,
+            # Filter 3 round trip = this many one-sided costs (enter + exit).
+            'roundtrip_mult': 2.0,
+        },
         # Feature coverage check (upstream of the LLM, per roll): a feature
         # with at most this many non-NaN values over the roll's train+test
         # window is dropped for that roll - not shown to the proposer, not

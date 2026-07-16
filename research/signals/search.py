@@ -301,6 +301,120 @@ def persistence_weight(half_life_bars: float, rate_bar: float) -> float:
     return 1.0 / (1.0 + phi / max(float(rate_bar), 1e-9))
 
 
+# =============================================================================
+# Response curve (the verdict instrument): the book's cumulative return
+# bar-by-bar after entry, averaged over an entry grid on the TEST window.
+# =============================================================================
+
+def response_curve(sig: pd.DataFrame, res_wide: pd.DataFrame,
+                   horizon_bars: int, entry_stride: int,
+                   min_assets: int) -> Optional[dict]:
+    """Mean cumulative response curve of the gross-1 dollar-neutral book.
+
+    For each entry stamp t on the grid (every entry_stride bars of sig's
+    schedule, restricted to entries whose full horizon fits inside
+    res_wide): weights w_t = demeaned signal scaled to gross 1; the path is
+    A_e(k) = sum_{j=1..k} w_t . r_{t+j}. Returns the entry-mean curve plus
+    per-entry outcomes at the horizon for robustness stats:
+
+      {'A': (H,) mean cumulative curve,
+       'entries': n, 'entry_days': distinct entry dates,
+       'n_eff': entries deflated for path overlap (stride/H) - error bars
+                must use this, adjacent paths share almost all their bars,
+       'per_entry_at': {k: (n,) array of per-entry A_e(k)} at sparse ks}
+
+    None when no entry has a full path (window too short) - callers fall
+    back to the 4-lag verdict. Missing residuals along a path (delistings)
+    contribute zero (the book stops earning on names that vanish)."""
+    if sig is None or sig.empty:
+        return None
+    w = sig.pivot_table(index='timestamp', columns='symbol',
+                        values='signal', aggfunc='first')
+    w = w.sub(w.mean(axis=1), axis=0)
+    gross = w.abs().sum(axis=1)
+    w = w.div(gross.where(gross > 0), axis=0)
+    n_names = w.notna().sum(axis=1)
+
+    idx = res_wide.index
+    pos = idx.get_indexer(w.index)
+    ok = (pos >= 0) & (pos + horizon_bars < len(idx)) & \
+         (n_names.values >= min_assets)
+    entry_rows = np.flatnonzero(ok)[::max(1, int(entry_stride))]
+    if len(entry_rows) == 0:
+        return None
+
+    r_vals = res_wide.reindex(columns=w.columns).to_numpy(copy=False)
+    paths = np.empty((len(entry_rows), horizon_bars))
+    for e, row in enumerate(entry_rows):
+        we = np.nan_to_num(w.values[row])
+        blk = r_vals[pos[row] + 1: pos[row] + 1 + horizon_bars]
+        paths[e] = np.cumsum(np.nan_to_num(blk) @ we)
+
+    entry_ts = w.index[entry_rows]
+    return {
+        'A': paths.mean(axis=0),
+        'entries': int(len(entry_rows)),
+        'entry_days': int(pd.DatetimeIndex(entry_ts).normalize().nunique()),
+        'n_eff': max(1.0, len(entry_rows) * entry_stride / horizon_bars),
+        'per_entry_at': {int(k): paths[:, int(k) - 1]
+                         for k in (1, horizon_bars // 4, horizon_bars // 2,
+                                   horizon_bars)},
+    }
+
+
+def fit_response_curve(A: np.ndarray, n_eff: float,
+                       per_entry_at: Optional[dict] = None) -> dict:
+    """Deterministic anatomy of a response curve (no optimizer, grid fits
+    only - same reproducibility contract as the rest of the search):
+
+      a0        edge per bet if held to the curve's peak (A at peak)
+      half_life exponential-decay fit (HALF_LIFE_GRID least squares) over
+                the pre-peak curve - the REAL phi, replacing the saturated
+                4-point artifact
+      peak_k    bar where the smoothed curve tops out; holding beyond it is
+                actively harmful when rev_frac is material
+      rev_frac  fraction of the peak edge given back by the horizon end
+      se_peak   error bar on a0 from per-entry spread, deflated by n_eff
+                (overlapping paths are not independent observations)
+      median_peak  median per-entry outcome at (nearest sampled k to) peak
+    """
+    H = len(A)
+    smooth = pd.Series(A).rolling(5, center=True, min_periods=1).mean().values
+    peak_k = int(np.argmax(smooth)) + 1
+    a0 = float(smooth[peak_k - 1])
+    a_end = float(smooth[-1])
+    rev_frac = float(1.0 - a_end / a0) if a0 > 0 else 0.0
+
+    ks = np.arange(1, min(peak_k, H) + 1, dtype=float)
+    seg = A[:len(ks)]
+    best_hl, best_sse = HALF_LIFE_GRID[0], np.inf
+    for hl in HALF_LIFE_GRID:
+        phi = math.log(2.0) / hl
+        shape = 1.0 - np.exp(-phi * ks)
+        denom = float((shape ** 2).sum())
+        if denom <= 0:
+            continue
+        amp = float((seg * shape).sum()) / denom
+        if amp <= 0:
+            continue
+        sse = float(((seg - amp * shape) ** 2).sum())
+        if sse < best_sse:
+            best_hl, best_sse = hl, sse
+
+    se_peak = float('nan')
+    median_peak = float('nan')
+    if per_entry_at:
+        k_near = min(per_entry_at, key=lambda k: abs(k - peak_k))
+        vals = np.asarray(per_entry_at[k_near], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if len(vals) > 1:
+            se_peak = float(np.std(vals, ddof=1) / math.sqrt(max(n_eff, 1.0)))
+            median_peak = float(np.median(vals))
+    return {'a0': a0, 'half_life': float(best_hl), 'peak_k': peak_k,
+            'rev_frac': rev_frac, 'se_peak': se_peak,
+            'median_peak': median_peak}
+
+
 # Candidate alpha half-lives (bars) for the deterministic grid fit below.
 HALF_LIFE_GRID = [3, 6, 12, 24, 48, 96, 144, 288, 432, 720, 1008, 2016]
 
@@ -665,6 +779,16 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     # Coverage-floor denominator + threshold (see try_candidate).
     train_days_total = int(train['timestamp'].dt.normalize().nunique())
     min_train_coverage = float(search_cfg.get('min_train_coverage', 0.0))
+    # Residual matrix for response curves (built once per roll; ends at
+    # oos_start, so no path can touch OOS). The curve is computed on the
+    # TEST window only - the verdict instrument - and never feeds the
+    # reward/breeding loop.
+    curve_cfg = cfg.get('curve') or {}
+    res_wide = None
+    if curve_cfg:
+        res_wide = (roll_panel.pivot_table(
+            index='timestamp', columns='symbol',
+            values='residual_return', aggfunc='first').sort_index())
 
     from research.signals.data import (all_family_columns,
                                              build_diagnostics)
@@ -783,6 +907,26 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         # promotion term - real cost belongs to the walk-forward.
         turnover = signal_turnover(sig_train)
 
+        # Response curve on the TEST window (the verdict instrument): the
+        # book's bar-by-bar cumulative return after entry, fitted to (a0,
+        # half-life, peak, reversal). Train-side reward/half-life below stay
+        # UNTOUCHED by it - the search must never see the test.
+        curve = None
+        if res_wide is not None:
+            rc = response_curve(sig_select, res_wide,
+                                int(curve_cfg['horizon_bars']),
+                                int(curve_cfg['entry_stride_bars']),
+                                min_assets)
+            if rc is not None:
+                fit = fit_response_curve(rc['A'], rc['n_eff'],
+                                         rc['per_entry_at'])
+                ks = [int(k) for k in curve_cfg['sample_ks']
+                      if int(k) <= len(rc['A'])]
+                curve = {**fit, 'entries': rc['entries'],
+                         'entry_days': rc['entry_days'],
+                         'n_eff': round(float(rc['n_eff']), 2), 'ks': ks,
+                         'A': [round(float(rc['A'][k - 1]), 8) for k in ks]}
+
         similarity = max_signal_correlation(
             sig_train, [s['signal_train'] for s in population])
         rwd, terms = compute_reward(m_train, best_lag, half_life,
@@ -797,6 +941,10 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                                 for k, v in m_select_by_lag[l].items()}}
             for l in cand_lags
         }
+        if curve is not None:
+            profile['curve'] = {k: (None if isinstance(v, float)
+                                    and not np.isfinite(v) else v)
+                                for k, v in curve.items()}
         ledger.record(roll.roll_id, gen, cand, direction,
                       m_train, m_select, rwd, terms, target_lag=best_lag,
                       profile_json=json.dumps(profile),
@@ -810,6 +958,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             'half_life_bars': float(half_life),
             'profile_train': m_train_by_lag,
             'profile_select': m_select_by_lag,
+            'curve': curve,
             'reward': rwd, 'metrics_train': m_train,
             'metrics_select': m_select,
             'turnover': turnover,

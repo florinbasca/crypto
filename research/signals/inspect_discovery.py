@@ -143,7 +143,7 @@ def main():
               "book means nothing passed)")
     else:
         cols = ['roll_id', 'name', 'family', 'direction', 'select_lag',
-                'half_life_bars', 'capture', 'turnover',
+                'peak_bars', 'half_life_bars', 'capture', 'turnover',
                 'select_alpha_tstat', 'test_days', 'econ_margin', 'reward',
                 'n_trials_at_promotion']
         print(promos[[c for c in cols if c in promos.columns]]

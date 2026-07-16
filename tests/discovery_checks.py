@@ -349,6 +349,14 @@ for m in (list(reversed_s['profile_select'].values())
               'rank_ic_mean', 'rank_ic_tstat'):
         if m.get(k) is not None:
             m[k] = -m[k]
+# ... and the response curve (a truly reversed hold-out reverses its curve).
+if reversed_s.get('curve'):
+    _c = dict(reversed_s['curve'])
+    _c['a0'] = -_c['a0'] if _c.get('a0') is not None else None
+    _c['A'] = [None if a is None else -a for a in _c.get('A', [])]
+    if _c.get('median_peak') is not None:
+        _c['median_peak'] = -_c['median_peak']
+    reversed_s['curve'] = _c
 reversed_promoted = bt_mod.promote([reversed_s], ROLL, ledger_a, CFG)
 check("directional: sign-reversed hold-out signal is NOT promoted",
       len(reversed_promoted) == 0,
@@ -400,27 +408,25 @@ check("turnover: recorded in the ledger for every evaluated candidate",
 check("turnover: survivors carry it in-memory too",
       all('turnover' in s and np.isfinite(s['turnover']) for s in survivors_a))
 
-# PAYS-FOR-ITSELF (filter 3): churn is priced, not capped. With a cost rate
-# high enough that the churniest promotee's cost exceeds its per-bar alpha,
-# it must drop out; with cost 0 (test default) economics never rejects.
+# PAYS-FOR-ITSELF (filter 3) on the curve: the round-trip cost is judged
+# against the curve at its own optimum. A round trip larger than any
+# measured edge must reject everything; NaN turnover never blocks on the
+# curve path (turnover only enters capture, which fails open).
 _base = bt_mod.promote(survivors_a, ROLL, ledger_a, CFG)
 assert _base, "e2e produced no promotions to gate"
-_worst = max(_base, key=lambda p: p['turnover'])
-# Cost that exactly kills the churniest: alpha_per_bar / turnover, plus 1%.
-_alpha_bar = _worst['econ_margin']  # cost 0 -> margin == alpha per bar
-_kill_bps = (_alpha_bar / _worst['turnover']) * 10000 * 1.01
 _ec_cfg = copy.deepcopy(CFG)
-_ec_cfg['promotion']['econ_cost_bps'] = _kill_bps
-_gated = bt_mod.promote(survivors_a, ROLL, ledger_a, _ec_cfg)
-check("economics: a cost rate above alpha/turnover rejects the churner",
-      _worst['candidate'].hash not in {p['candidate'].hash for p in _gated}
-      and all(p['econ_margin'] > 0 for p in _gated),
-      f"(base {len(_base)} -> {len(_gated)} at {_kill_bps:.1f}bps)")
-# Fail-open: NaN turnover prices the cost at zero, never blocks.
+# The planted synthetic edge is huge (~thousands of bp per bet), so the
+# unambiguous kill-cost is absurd on purpose.
+_ec_cfg['promotion']['econ_cost_bps'] = 1e6
+check("economics: a round-trip cost above any measured edge rejects all",
+      bt_mod.promote(survivors_a, ROLL, ledger_a, _ec_cfg) == [],
+      f"(base {len(_base)} -> 0 at 1e6bps)")
+check("economics: promotions carry a positive net rate at cost 0",
+      all(p['econ_margin'] > 0 for p in _base))
 _no_tv = [{**s, 'turnover': float('nan')} for s in survivors_a]
-_openq = bt_mod.promote(_no_tv, ROLL, ledger_a, _ec_cfg)
-check("economics: fails open when turnover is unknown (NaN)",
-      len(_openq) >= len(_base),
+_openq = bt_mod.promote(_no_tv, ROLL, ledger_a, CFG)
+check("economics: NaN turnover never blocks (capture fails open)",
+      len(_openq) == len(_base),
       f"({len(_openq)} promoted with NaN turnover vs {len(_base)} baseline)")
 
 # survivor carry-over: the next roll is seeded with this roll's survivors,
