@@ -51,7 +51,6 @@ def check(name, cond, detail=""):
 
 def test_cfg():
     cfg = copy.deepcopy(get('discovery'))
-    cfg['horizon_lags_bars'] = [6]
     cfg['target_lag_bars'] = 6
     cfg['embargo_bars'] = 6
     cfg['min_assets_per_timestamp'] = 10
@@ -134,37 +133,43 @@ ROLL = data_mod.Roll(
 # ---------------------------------------------------------------------------
 # 1. Evaluator calibration: recovers a planted IC / reports ~0 on noise
 # ---------------------------------------------------------------------------
-print("--- 1. evaluator calibration ---")
-n_stamps, n_assets = 360, 40
-cal_ts = np.repeat(pd.date_range('2024-01-01', periods=n_stamps, freq='1h'),
-                   n_assets)
-cal_sym = np.tile([f'A{i}' for i in range(n_assets)], n_stamps)
+print("--- 1. evaluator calibration (response curve) ---")
+n_stamps, n_assets = 720, 40
+cal_ts = pd.date_range('2024-01-01', periods=n_stamps, freq='10min')
+cal_sym = [f'A{i}' for i in range(n_assets)]
 
-for rho in (0.3, 0.0):
-    sig_vals = rng.normal(size=n_stamps * n_assets)
-    tgt = rho * sig_vals + np.sqrt(1 - rho ** 2) * rng.normal(
-        size=n_stamps * n_assets)
-    sig_df = pd.DataFrame({'timestamp': cal_ts, 'symbol': cal_sym,
-                           'signal': sig_vals})
-    win = pd.DataFrame({'timestamp': cal_ts, 'symbol': cal_sym,
-                        'fwd_6b': tgt, 'is_liquid': True})
-    m = search_mod.evaluate_window(sig_df, win, 'fwd_6b', lag_bars=1,
-                                   min_assets=10)
-    # Spearman of a bivariate normal: (6/pi) * asin(rho/2)
-    expected = 6.0 / np.pi * np.arcsin(rho / 2.0)
-    if rho > 0:
-        check(f"calibration: planted rho={rho} recovered (rank IC diagnostic)",
-              abs(m['rank_ic_mean'] - expected) < 0.03,
-              f"(ic {m['rank_ic_mean']:.4f} vs expected {expected:.4f})")
-        check("calibration: alpha (per-bet return) positive and significant",
-              m['alpha_mean'] > 0 and m['alpha_tstat'] > 5,
-              f"($/bet {m['alpha_mean']:+.5f}, t {m['alpha_tstat']:.1f})")
+for plant_c in (0.2, 0.0):
+    sig_mat = rng.normal(size=(n_stamps, n_assets))
+    # Residual return one bar AFTER the signal: r[t] = plant * sig[t-1] + eps
+    r_mat = rng.normal(size=(n_stamps, n_assets))
+    r_mat[1:] += plant_c * sig_mat[:-1]
+    sig_df = pd.DataFrame({'timestamp': np.repeat(cal_ts, n_assets),
+                           'symbol': np.tile(cal_sym, n_stamps),
+                           'signal': sig_mat.ravel()})
+    res_wide = pd.DataFrame(r_mat, index=cal_ts, columns=cal_sym)
+    rc = search_mod.response_curve(sig_df, res_wide, horizon_bars=12,
+                                   entry_stride=2, min_assets=10,
+                                   sample_ks=[1, 2, 3, 6, 12])
+    # Error bar at k=1 (the bar the effect lives on), overlap-deflated -
+    # the smoothed PEAK of a one-bar effect sits on the noise plateau, so
+    # significance is judged where the effect is, not where noise tops out.
+    _v1 = np.asarray(rc['per_entry_at'][1], dtype=float)
+    se1 = float(np.std(_v1[np.isfinite(_v1)], ddof=1)
+                / np.sqrt(max(rc['n_eff'], 1.0)))
+    # Expected one-bar book return: plant * E[(sig - mean) . sig] / E[gross]
+    # = plant * (n-1)/(n * E|N(0,1)|) ~ plant * 1.22 for n = 40.
+    expected = plant_c * (n_assets - 1) / (n_assets * np.sqrt(2 / np.pi))
+    if plant_c > 0:
+        check(f"calibration: planted effect {plant_c} recovered at k=1",
+              abs(rc['A'][0] - expected) < 0.3 * expected,
+              f"(A(1) {rc['A'][0]:+.4f} vs expected {expected:+.4f})")
+        check("calibration: planted edge positive and significant",
+              rc['A'][0] > 0 and rc['A'][0] / se1 > 5,
+              f"(A(1) {rc['A'][0]:+.4f}, t {rc['A'][0] / se1:.1f})")
     else:
-        check("calibration: zero-signal panel reads ~0 alpha",
-              abs(m['alpha_tstat']) < 3.5,
-              f"($/bet {m['alpha_mean']:+.6f}, t {m['alpha_tstat']:.2f})")
-        check("calibration: zero-signal rank IC ~0",
-              abs(m['rank_ic_mean']) < 0.02, f"(ic {m['rank_ic_mean']:.4f})")
+        check("calibration: zero-signal panel reads ~0 edge",
+              abs(rc['A'][0]) < 4 * se1,
+              f"(A(1) {rc['A'][0]:+.5f}, se {se1:.5f})")
 
 # ---------------------------------------------------------------------------
 # 2. Operator causality: truncation test over the WHOLE registry
@@ -374,15 +379,15 @@ check("directional: sign-reversed hold-out signal is NOT promoted",
 # a 0.1/bar churner with 1,440 bars of persistence instead of 10).
 _ep = search_mod.effective_persistence_bars
 check("persistence: full-churn signal (turnover 1) -> 1 bar",
-      _ep(2016.0, 144, 1.0) == 1.0)
+      _ep(2016.0, 1.0) == 1.0)
 check("persistence: slow churn (0.04/bar) -> 25 bars, beats half-life 96",
-      _ep(96.0, 144, 0.04) == 25.0)
+      _ep(96.0, 0.04) == 25.0)
 check("persistence: half-life binds when churn is slower still",
-      _ep(96.0, 144, 0.005) == 96.0)
+      _ep(96.0, 0.005) == 96.0)
 check("persistence: missing turnover -> half-life alone",
-      _ep(288.0, 72, float('nan')) == 288.0 and _ep(288.0, 72, None) == 288.0)
+      _ep(288.0, float('nan')) == 288.0 and _ep(288.0, None) == 288.0)
 check("persistence: hyperactive turnover clipped at 2 -> 0.5 bars",
-      _ep(2016.0, 144, 5.0) == 0.5)
+      _ep(2016.0, 5.0) == 0.5)
 # Turnover diagnostic: a property of the signal alone (0 = never retrades,
 # 1 = fully replaced each bar). Ledger-only; never touches reward, promotion,
 # or the walk-forward.
@@ -484,7 +489,6 @@ print(f"(end-to-end block: {time.perf_counter() - t0:,.1f}s)")
 # ---------------------------------------------------------------------------
 print("--- 5b. response curve finds each effect's true horizon ---")
 CFG_ML = test_cfg()
-CFG_ML['horizon_lags_bars'] = [6, 36]
 CFG_ML['curve'] = {**CFG_ML['curve'], 'horizon_bars': 36,
                    'sample_ks': [1, 2, 3, 6, 12, 24, 36]}
 CFG_ML['search'] = {**CFG_ML['search'], 'n_generations': 0}  # seeds only
@@ -620,30 +624,11 @@ check("coverage: dense candidate unaffected",
       dense_probe.hash in _cov_hashes)
 
 # ---------------------------------------------------------------------------
-# 5d. Unit checks: day-equivalent t, half-life fit, persistence weight,
-#     analytic flip, Student-t p-values, half-alpha gate.
+# 5d. Unit checks: persistence weight, reward, capture floor.
+#     (Curve fitting - a0/half-life/peak/reversal - is unit-checked in
+#     tests/curve_checks.py.)
 # ---------------------------------------------------------------------------
-print("--- 5d. profile/persistence unit checks ---")
-
-# day-equivalent t: the same raw t is worth sqrt(24) less at lag 6 (24
-# stamps/day) than at lag 144 (1 stamp/day) - the anti-pinning-bias scale.
-t6 = search_mod.day_equivalent_tstat({'alpha_tstat': 10.0}, 6)
-t144 = search_mod.day_equivalent_tstat({'alpha_tstat': 10.0}, 144)
-check("day-equivalent t: lag-6 discounted by sqrt(24)",
-      abs(t6 - 10.0 / np.sqrt(24)) < 1e-9 and abs(t144 - 10.0) < 1e-9,
-      f"(t6 {t6:.2f}, t144 {t144:.2f})")
-
-# half-life fit: a flat cumulative profile (all alpha in the first bars) is
-# FAST; a linearly growing one (constant per-bar alpha) is SLOW.
-hl_fast = search_mod.fit_half_life({6: 1.0, 36: 1.0, 72: 1.0, 144: 1.0})
-hl_slow = search_mod.fit_half_life({6: 6.0, 36: 36.0, 72: 72.0, 144: 144.0})
-check("half-life fit: flat profile -> fast, linear profile -> slow",
-      hl_fast <= 12 and hl_slow >= 720,
-      f"(fast {hl_fast:.0f}, slow {hl_slow:.0f} bars)")
-check("half-life fit: degenerate profile priced as fastest, never free",
-      search_mod.fit_half_life({}) == search_mod.HALF_LIFE_GRID[0]
-      and search_mod.fit_half_life({6: -1.0, 36: -2.0})
-      == search_mod.HALF_LIFE_GRID[0])
+print("--- 5d. reward/persistence unit checks ---")
 
 # persistence weight 1/(1 + phi/rate): matches the closed form at any rate,
 # monotone in persistence, and crushes alpha much faster than the fill rate.
@@ -672,18 +657,7 @@ check("reward: better net rate scores higher, similarity lowers the reward",
 check("reward: non-finite net rate floored to zero, never NaN",
       search_mod.reward_terms(float('nan'), 0.0)['net_rate'] == 0.0)
 
-# analytic flip mirrors IC metrics exactly
-m0 = {'alpha_mean': 0.0002, 'alpha_tstat': 3.0, 'alpha_ir': 0.4,
-      'liquid_alpha_ratio': 0.7, 'rank_ic_mean': 0.02, 'rank_ic_tstat': 2.0,
-      'target_dispersion': 0.01, 'n_cross_sections': 100, 'n_days': 10}
-mf = search_mod.flip_metrics(m0)
-check("flip: alpha/t/ir + rank IC negate; ratio/dispersion/counts unchanged",
-      mf['alpha_mean'] == -0.0002 and mf['alpha_tstat'] == -3.0
-      and mf['alpha_ir'] == -0.4 and mf['liquid_alpha_ratio'] == 0.7
-      and mf['rank_ic_mean'] == -0.02
-      and mf['target_dispersion'] == 0.01 and mf['n_days'] == 10)
-
-# capture floor: with min_capture above the single-lag fit's capture,
+# capture floor: with min_capture above the fast fit's capture,
 # nothing may promote (the gate that replaced the PnL scoreboard).
 cap_cfg = copy.deepcopy(CFG)
 cap_cfg['promotion']['min_capture'] = 0.99

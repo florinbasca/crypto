@@ -39,10 +39,10 @@ Usage:
     rolls already completed (the ledger flushes per roll, so on-disk rolls
     are complete), picking up at the first missing roll.
 
-NO PINNING: every candidate is evaluated at every lag in
-discovery.horizon_lags_bars (train AND select) - the per-lag profile is its
-alpha term structure, and its fitted half-life sets the capture weight in
-the reward here and the persistence discount in the walk-forward.
+Every candidate is measured by its day RESPONSE CURVE (bar-by-bar book
+return, discovery.curve) on train (reward, direction) and test (verdict);
+the fitted half-life, capped at the curve's peak, sets the persistence
+discount in the walk-forward.
 """
 
 import sys

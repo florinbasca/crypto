@@ -442,33 +442,13 @@ config = {
         # bars of TRAIN before SELECT and of SELECT before OOS so no forward
         # target leaks across a boundary.
         'embargo_bars': 12,
-        # Forward target lags (bars): the grid the panel builds targets for.
-        # NO PINNING: every candidate keeps its full IC profile across this
-        # grid (train + select, per lag) - the profile IS the signal's alpha
-        # term structure, and its fitted half-life drives the persistence
-        # discount at the portfolio layer.
-        # 432 (3d) was REMOVED on ledger evidence: across every candidate
-        # measured at it, directed select follow-through was 23% (worse than
-        # a coin flip; other lags 35-41%), median |select t| 0.16, train t
-        # correlated only 0.11 with the 1d lag (noise, not a distinct term
-        # structure), and the slow families it existed for measured BETTER
-        # at 1d. It also cost every horizon ~2 days of train/select data per
-        # window via the purge (max lag + embargo). Multi-day theses for
-        # unlocks/dev/listing belong to research/signals/event_study.py.
+        # Holding-period grid (1h/6h/12h/1d) for walk_forward_analysis's
+        # per-horizon slice-IC view. Scoring/selection use the response
+        # curve; nothing in discovery reads this anymore.
         'horizon_lags_bars': [6, 36, 72, 144],
-        # Per-family horizon restriction: each family is scored/promoted only
-        # at its natural horizons (intersected with horizon_lags_bars;
-        # 'default' covers families not listed). Slow fundamental families
-        # (unlocks / dev activity / listing age) are measured at 1d only -
-        # concentrating their evidence at one lag instead of spreading it
-        # across sub-day horizons they can't plausibly own.
-        'family_horizon_lags': {
-            'default': [6, 36, 72, 144],
-            'unlocks': [144],
-            'dev_activity': [144],
-            'listing': [144],
-        },
-        # Reference lag for the proposer's compressed diagnostics only.
+        # Reference lag for the proposer's compressed diagnostics only (the
+        # decile nonlinearity view needs one fixed forward horizon to bin
+        # against; scoring/selection use the response curve, never this).
         'target_lag_bars': 36,
         'min_assets_per_timestamp': 10,
         # Response curves (the verdict instrument): on each formula's 5-month

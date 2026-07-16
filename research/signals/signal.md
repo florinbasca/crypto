@@ -66,8 +66,8 @@ Two windows per roll, advancing one month at a time (5 + 5 + 1):
   twice per candidate with the same code: on the **train** window (feeds
   the reward and the direction) and on the **test** window (the verdict,
   read once at promotion) — train and test are never compared in
-  different units. Rows without curves (old ledgers) fall back to the
-  legacy 4-lag verdict.
+  different units. A row without a curve has no verdict and cannot
+  promote (the legacy per-lag machinery is gone).
 - Windows slide monthly, so every month gets a fresh verdict and a fresh
   OOS month; consecutive test windows overlap 4 of 5 months (each verdict
   is still strictly causal for its own OOS month).
@@ -86,11 +86,11 @@ round trip. This is the IDENTICAL number promotion ranks by, measured with
 the identical code on the train window, so the search breeds for exactly
 what gets judged (one instrument everywhere; the reward's copy never
 touches the test window).
-**Rank IC is recorded as a diagnostic only and selects nothing**: this
-system's first full run proved a signal can order names correctly for a day
-(rank IC t≈15) while the large moves run against its positions (negative
-returns). Ordering and returns are different quantities; the reward uses
-returns.
+**Rank IC selects nothing and is no longer computed**: this system's first
+full run proved a signal can order names correctly for a day (rank IC
+t≈15) while the large moves run against its positions (negative returns).
+Ordering and returns are different quantities; everything here is measured
+in returns.
 
 ```
 reward = Σ wₖ · termₖ / scaleₖ

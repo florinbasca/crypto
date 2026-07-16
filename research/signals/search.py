@@ -24,11 +24,9 @@ loop that decides what gets tried next.
   negative direction analytically negates the curve (_flip_curve). Both
   curves travel to promotion in profile_json; the portfolio layer consumes
   half-life capped at the peak.
-- evaluate_window()/fit_half_life()/day_equivalent_tstat(): legacy per-lag
-  instruments, kept for pre-curve ledger rows and diagnostics only.
 - DiscoveryLedger: one row per (roll, candidate) evaluation - the debug
-  surface, the dedup index, and the memory behind the N-consecutive-rolls
-  persistence gate.
+  surface, the dedup index, and the train-history store behind the pooled
+  direction.
 - run_search(): the per-roll evolutionary loop with a UCB bandit over
   candidate families.
 """
@@ -44,9 +42,7 @@ from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from config import BARS_PER_DAY, get
-from research.lib.signal_eval import _nw_tstat, rank_ic_per_timestamp
-from research.signals.data import (Roll, book_returns, purge_bars,
-                                         slice_window, strided_stamps,
+from research.signals.data import (Roll, purge_bars, slice_window,
                                          target_col)
 from research.signals.generation import (_to_list, candidate_subtrees,
                                                Candidate, Proposer,
@@ -62,118 +58,9 @@ DAYS_PER_YEAR = 365
 # =============================================================================
 
 def empty_metrics() -> dict:
-    return {
-        'alpha_mean': np.nan, 'alpha_tstat': 0.0, 'alpha_ir': np.nan,
-        'liquid_alpha_ratio': np.nan, 'rank_ic_mean': np.nan,
-        'rank_ic_tstat': 0.0, 'target_dispersion': np.nan,
-        'n_cross_sections': 0, 'n_days': 0,
-    }
-
-
-def evaluate_window(signal: pd.DataFrame, window_panel: pd.DataFrame,
-                    tcol: str, lag_bars: int,
-                    min_assets: Optional[int] = None) -> dict:
-    """Score one compiled signal on one window in RETURN UNITS.
-
-    alpha_mean is the mean per-bet return of the gross-1 dollar-neutral book
-    built from the signal and held for the horizon - money per bet, not a
-    correlation. Rank IC is kept as a DIAGNOSTIC only: a signal can order
-    names correctly (high rank IC) while the large moves run against its
-    positions (negative alpha) - rank IC never selects anything.
-    liquid_alpha_ratio is the liquid-half alpha vs the full cross-section
-    (a capacity read).
-
-    signal: [timestamp, symbol, signal] (from compile_candidate)
-    window_panel: the window's slice of the roll panel (must contain tcol;
-                  is_liquid optional). The inner join does the slicing.
-    """
-    cfg = get('discovery', {})
-    if min_assets is None:
-        min_assets = int(cfg['min_assets_per_timestamp'])
-
-    cols = ['timestamp', 'symbol', tcol]
-    if 'is_liquid' in window_panel.columns:
-        cols.append('is_liquid')
-    df = signal.merge(window_panel[cols], on=['timestamp', 'symbol'],
-                      how='inner')
-    if df.empty:
-        return empty_metrics()
-
-    stamps = strided_stamps(df['timestamp'], lag_bars)
-    df = df[df['timestamp'].isin(stamps)]
-    if df.empty:
-        return empty_metrics()
-
-    bets = book_returns(df, tcol, min_assets)
-    if bets.empty:
-        return empty_metrics()
-    alpha_mean = float(bets.mean())
-    alpha_std = float(bets.std())
-    daily_alpha = bets.groupby(lambda ts: ts.normalize()).mean()
-
-    if 'is_liquid' in df.columns:
-        liq = book_returns(df[df['is_liquid']], tcol,
-                            max(3, min_assets // 2))
-        liq_alpha = float(liq.mean()) if not liq.empty else np.nan
-    else:
-        liq_alpha = np.nan
-    # Signed ratio capped at 1: same-sign liquid alpha of at least equal
-    # magnitude scores 1; opposite sign goes negative (capacity red flag).
-    if np.isfinite(liq_alpha) and abs(alpha_mean) > 1e-12:
-        liquid_alpha_ratio = float(np.clip(liq_alpha / alpha_mean, -1.0, 1.0))
-    else:
-        liquid_alpha_ratio = np.nan
-
-    # Diagnostic rank IC (ordering quality; never selects).
-    ics = rank_ic_per_timestamp(df[['timestamp', 'signal', tcol]], tcol,
-                                min_assets=min_assets)
-    if not ics.empty:
-        daily_ic = ics.set_index('timestamp')['ic'].groupby(
-            lambda ts: ts.normalize()).mean()
-        rank_ic_mean = float(ics['ic'].mean())
-        rank_ic_tstat = float(_nw_tstat(daily_ic.values, 'auto'))
-    else:
-        rank_ic_mean, rank_ic_tstat = np.nan, 0.0
-
-    disp = float(df.groupby('timestamp')[tcol].std().mean())
-
-    return {
-        'alpha_mean': alpha_mean,
-        'alpha_tstat': float(_nw_tstat(daily_alpha.values, 'auto')),
-        'alpha_ir': alpha_mean / alpha_std if alpha_std > 0 else 0.0,
-        'liquid_alpha_ratio': liquid_alpha_ratio,
-        'rank_ic_mean': rank_ic_mean,
-        'rank_ic_tstat': rank_ic_tstat,
-        'target_dispersion': disp,
-        'n_cross_sections': int(len(bets)),
-        'n_days': int(len(daily_alpha)),
-    }
-
-
-def flip_metrics(m: dict) -> dict:
-    """Metrics of the sign-flipped signal, analytically: the per-bet return is
-    exactly antisymmetric under negation (alpha/tstat/ir and rank IC flip
-    sign; liquid_alpha_ratio is a ratio of two flipped alphas, unchanged;
-    dispersion/counts unchanged)."""
-    out = dict(m)
-    for k in ('alpha_mean', 'alpha_tstat', 'alpha_ir',
-              'rank_ic_mean', 'rank_ic_tstat'):
-        v = out.get(k)
-        if v is not None and np.isfinite(v):
-            out[k] = -v
-    return out
-
-
-def day_equivalent_tstat(m: dict, lag_bars: int) -> float:
-    """Cross-lag-FAIR strength: t / sqrt(stamps per day). A raw t-stat grows
-    ~sqrt(number of bets), handing 1h signals a mechanical ~sqrt(24) edge
-    over 24h ones for the SAME per-bet alpha; dividing by sqrt(stamps/day)
-    puts every horizon on one bets-per-day-free scale."""
-    t = m.get('alpha_tstat', 0.0)
-    if t is None or not np.isfinite(t):
-        return 0.0
-    stamps_per_day = max(BARS_PER_DAY // max(int(lag_bars), 1), 1)
-    return float(t) / math.sqrt(stamps_per_day)
+    """The ledger's flat metric columns when nothing is measurable: per-bet
+    edge (curve a0), its t (a0/se), entry days."""
+    return {'alpha_mean': np.nan, 'alpha_tstat': 0.0, 'n_days': 0}
 
 
 def pooled_train_direction(months: List[dict]) -> int:
@@ -244,18 +131,6 @@ def signal_turnover(sig: pd.DataFrame) -> float:
     return float(dw.mean()) if len(dw) else float('nan')
 
 
-def alpha_term_structure(m_by_lag: Dict[int, dict]) -> Dict[int, float]:
-    """Cumulative alpha per bet at each horizon: A(L) = alpha_mean(L),
-    measured directly in return units (the book's held return per bet - no
-    IC x dispersion proxy)."""
-    out = {}
-    for lag, m in m_by_lag.items():
-        a = m.get('alpha_mean')
-        if a is not None and np.isfinite(a):
-            out[int(lag)] = float(a)
-    return out
-
-
 def trade_rate_per_bar(cfg: Optional[dict] = None) -> float:
     """The portfolio layer's per-bar fill rate toward the aim - the SAME
     cost-responsive Garleanu-Pedersen rate walk_forward trades at:
@@ -274,7 +149,7 @@ def trade_rate_per_bar(cfg: Optional[dict] = None) -> float:
     return rate
 
 
-def effective_persistence_bars(half_life_bars: float, lag_bars: int,
+def effective_persistence_bars(half_life_bars: float,
                                turnover: Optional[float]) -> float:
     """Persistence the capture weight prices: min(alpha half-life,
     turnover-implied position life). Turnover is PER BAR (fraction of the
@@ -282,8 +157,7 @@ def effective_persistence_bars(half_life_bars: float, lag_bars: int,
     how long until the signal has fully reshuffled itself. The half-life says
     how long the ALPHA lives; 1/turnover says how long the POSITIONS live;
     the discount honors the shorter. Turnover clipped to [1e-4, 2];
-    missing/NaN turnover falls back to the half-life alone. (lag_bars kept
-    for call-site stability; unused.)"""
+    missing/NaN turnover falls back to the half-life alone."""
     hl = max(float(half_life_bars), 1e-9)
     if turnover is None or not np.isfinite(turnover) or turnover <= 0:
         return hl
@@ -326,9 +200,9 @@ def response_curve(sig: pd.DataFrame, res_wide: pd.DataFrame,
                 must use this, adjacent paths share almost all their bars,
        'per_entry_at': {k: (n,) array of per-entry A_e(k)} at sparse ks}
 
-    None when no entry has a full path (window too short) - callers fall
-    back to the 4-lag verdict. Missing residuals along a path (delistings)
-    contribute zero (the book stops earning on names that vanish)."""
+    None when no entry has a full path (window too short) - the candidate
+    is skipped. Missing residuals along a path (delistings) contribute
+    zero (the book stops earning on names that vanish)."""
     if sig is None or sig.empty:
         return None
     w = sig.pivot_table(index='timestamp', columns='symbol',
@@ -423,39 +297,8 @@ def fit_response_curve(A: np.ndarray, n_eff: float,
             'median_peak': median_peak}
 
 
-# Candidate alpha half-lives (bars) for the deterministic grid fit below.
+# Candidate alpha half-lives (bars) for the deterministic grid fit above.
 HALF_LIFE_GRID = [3, 6, 12, 24, 48, 96, 144, 288, 432, 720, 1008, 2016]
-
-
-def fit_half_life(profile: Dict[int, float]) -> float:
-    """Alpha half-life (bars) from the cumulative term structure A(L).
-
-    Model: per-bar alpha a(t) = a0 * exp(-phi t), so A(L) = a0 (1 - e^{-phi
-    L}) / phi. Fit by least squares over a fixed half-life grid (a0 solved
-    analytically per grid point) - deterministic, 4 data points, no
-    optimizer. Degenerate profiles (empty / non-positive everywhere) fall
-    back to the SHORTEST grid half-life: unmeasurable persistence is priced
-    as fast decay, never as free persistence."""
-    lags = sorted(L for L, a in profile.items() if np.isfinite(a))
-    if not lags or max(profile[L] for L in lags) <= 0:
-        return float(HALF_LIFE_GRID[0])
-    A = np.array([profile[L] for L in lags], dtype=float)
-    Ls = np.array(lags, dtype=float)
-
-    best_hl, best_sse = HALF_LIFE_GRID[0], np.inf
-    for hl in HALF_LIFE_GRID:
-        phi = math.log(2.0) / hl
-        shape = (1.0 - np.exp(-phi * Ls)) / phi
-        denom = float((shape ** 2).sum())
-        if denom <= 0:
-            continue
-        a0 = float((A * shape).sum()) / denom
-        if a0 <= 0:
-            continue
-        sse = float(((A - a0 * shape) ** 2).sum())
-        if sse < best_sse:
-            best_hl, best_sse = hl, sse
-    return float(best_hl)
 
 
 def signal_correlation(sig_a: pd.DataFrame, sig_b: pd.DataFrame) -> float:
@@ -550,11 +393,11 @@ class DiscoveryLedger:
                profile_json: Optional[str] = None,
                half_life_bars: Optional[float] = None,
                turnover: Optional[float] = None) -> None:
-        """target_lag = the BEST PER-BET train lag (display/sorting only -
-        the signal is not pinned to it); profile_json = the full per-lag
-        train+select metrics; half_life_bars = fitted alpha half-life;
-        turnover = mean per-bar book turnover of the train signal (DIAGNOSTIC
-        ONLY - ledger column, never read by the walk-forward). Rows written by
+        """target_lag = the train curve's peak bar (display/sorting only);
+        profile_json = {'curve': test curve, 'curve_train': train curve};
+        half_life_bars = the train curve's fitted half-life; turnover =
+        mean per-bar book turnover of the train signal (DIAGNOSTIC ONLY -
+        ledger column, never read by the walk-forward). Rows written by
         older code simply carry NaN here, so a resumed run mixes cleanly."""
         row = {
             'roll_id': int(roll_id),
@@ -645,15 +488,13 @@ class DiscoveryLedger:
             rid -= 1
         return count
 
-    def train_history(self, cand_hash: str, lag: Optional[int] = None,
+    def train_history(self, cand_hash: str,
                       up_to_roll: Optional[int] = None) -> List[dict]:
-        """RAW-SIGN train measurements of cand_hash, one per roll it was
-        evaluated in. Preferred source: the stored TRAIN curve (a0 at its
-        peak, its error bar, its entry days); legacy per-lag rows fall back
-        to the train metrics at `lag` (or the row's own best lag). Stored
-        values are directed by that roll's fitted direction, so entries are
-        un-flipped here. Feeds pooled_train_direction - train-only, the
-        test window stays unspent."""
+        """RAW-SIGN train-curve measurements of cand_hash (a0 at its peak,
+        its error bar, its entry days), one per roll it was evaluated in.
+        Stored values are directed by that roll's fitted direction, so
+        entries are un-flipped here. Feeds pooled_train_direction -
+        train-only, the test window stays unspent."""
         out = []
         for r in self._rows:
             if r['cand_hash'] != cand_hash:
@@ -669,25 +510,15 @@ class DiscoveryLedger:
                 continue
             d = int(r.get('direction', 1) or 1)
             c = prof.get('curve_train')
-            if c and c.get('a0') is not None:
-                a0 = float(c['a0'])
-                se = c.get('se_peak')
-                t = (a0 / float(se)) if se and np.isfinite(se) and se > 0 \
-                    else 0.0
-                out.append({'roll_id': int(r['roll_id']),
-                            'alpha_mean': d * a0, 'alpha_tstat': d * t,
-                            'n_days': int(c.get('entry_days', 0) or 0)})
+            if not c or c.get('a0') is None:
                 continue
-            key = str(int(lag)) if lag else str(int(r.get('target_lag')
-                                                    or 0))
-            m = (prof.get(key) or {}).get('train')
-            if not m or m.get('alpha_tstat') is None:
-                continue
+            a0 = float(c['a0'])
+            se = c.get('se_peak')
+            t = (a0 / float(se)) if se and np.isfinite(se) and se > 0 \
+                else 0.0
             out.append({'roll_id': int(r['roll_id']),
-                        'alpha_mean': (None if m.get('alpha_mean') is None
-                                       else d * float(m['alpha_mean'])),
-                        'alpha_tstat': d * float(m['alpha_tstat']),
-                        'n_days': int(m.get('n_days', 0) or 0)})
+                        'alpha_mean': d * a0, 'alpha_tstat': d * t,
+                        'n_days': int(c.get('entry_days', 0) or 0)})
         return sorted(out, key=lambda x: x['roll_id'])
 
     def to_frame(self) -> pd.DataFrame:
@@ -925,8 +756,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         # Traded sign: pooled train-curve evidence - this window's a0 plus
         # every prior roll's (train-only; the test is never consulted).
         direction = pooled_train_direction(
-            ledger.train_history(cand.hash, 0,
-                                 up_to_roll=roll.roll_id - 1)
+            ledger.train_history(cand.hash, up_to_roll=roll.roll_id - 1)
             + [_curve_metrics(curve_train_raw)])
         if direction < 0:
             sig = sig.assign(signal=-sig['signal'])

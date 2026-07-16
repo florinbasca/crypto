@@ -8,8 +8,7 @@ curve_verdict path). No database required.
 2. fit_response_curve - pure decay recovered (a0, half-life); hump gets its
    peak and reversal fraction; the 4-lag method would have missed the hump.
 3. CHOOSE on curves - median gate, activity gate, net-rate economics, peak
-   caps the promoted half-life (the walk-forward's holding input), lag
-   fallback still works for curve-less rows.
+   caps the promoted half-life (the walk-forward's holding input).
 
 Run: uv run tests/curve_checks.py
 """
@@ -96,7 +95,7 @@ rc_nan = search_mod.response_curve(sig, res_nan, horizon_bars=H,
 check("curve: NaN residuals along a path contribute zero, no NaN output",
       rc_nan is not None and np.isfinite(rc_nan['A']).all())
 
-check("curve: window too short for one full path -> None (lag fallback)",
+check("curve: window too short for one full path -> None (candidate skipped)",
       search_mod.response_curve(sig[sig['timestamp'] < ts[30]],
                                 res_wide.iloc[:30], horizon_bars=H,
                                 entry_stride=6, min_assets=4) is None)
@@ -212,14 +211,12 @@ b3 = bt_mod.promote([thin, fat], ROLL, search_mod.DiscoveryLedger(None),
 check("choose: curve that can't cover a round trip is rejected",
       [p['candidate'].name for p in b3] == ['c10'])
 
-# curve-less rows still promote via the lag fallback
+# a curve-less row has no verdict: never promoted, never crashes
 legacy = make_curved(11, 0.0030)
 legacy['curve'] = None
-legacy['profile_select'][LAG]['alpha_tstat'] = 2.0
-legacy['profile_select'][LAG]['n_days'] = 140
 b4 = bt_mod.promote([legacy], ROLL, search_mod.DiscoveryLedger(None), TCFG)
-check("choose: pre-curve ledger rows fall back to the lag verdict",
-      len(b4) == 1 and b4[0]['select_lag'] == LAG)
+check("choose: a row without a curve has no verdict and never promotes",
+      b4 == [])
 
 # ---------------------------------------------------------------------------
 print()

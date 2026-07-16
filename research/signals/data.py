@@ -79,38 +79,12 @@ def make_rolls(cfg: Optional[dict] = None) -> List[Roll]:
 
 def purge_bars(cfg: Optional[dict] = None) -> int:
     """Bars dropped at the end of TRAIN and SELECT: the longest forward look
-    (response-curve horizon or legacy target lag) + embargo, so nothing
-    computed inside a window can peek across its boundary."""
+    (response-curve horizon or the diagnostic target lag) + embargo, so
+    nothing computed inside a window can peek across its boundary."""
     cfg = cfg or get('discovery', {})
     horizon = int((cfg.get('curve') or {}).get('horizon_bars', 0) or 0)
-    return max(int(max(cfg['horizon_lags_bars'])), horizon) \
+    return max(int(cfg['target_lag_bars']), horizon) \
         + int(cfg['embargo_bars'])
-
-
-def resolve_search_lags(cfg: Optional[dict] = None) -> List[int]:
-    """Lags the search scores candidates at: the full horizon_lags_bars grid.
-    Each candidate is evaluated at every lag (train AND select) - the
-    per-lag profile is its alpha term structure; nothing is pinned."""
-    cfg = cfg or get('discovery', {})
-    return [int(x) for x in cfg['horizon_lags_bars']]
-
-
-def family_lags(family: str, cfg: Optional[dict] = None) -> List[int]:
-    """The horizons a family is scored and promoted at: its
-    family_horizon_lags entry ('default' for unlisted families) intersected
-    with horizon_lags_bars. Restricting each family to its natural horizons
-    keeps promotion's look count (survivors x lags) from being inflated by
-    horizons the family can't plausibly own. Falls back to the full grid
-    when the config section is absent or the intersection is empty."""
-    cfg = cfg or get('discovery', {})
-    grid = [int(x) for x in cfg['horizon_lags_bars']]
-    fam_map = cfg.get('family_horizon_lags') or {}
-    allowed = fam_map.get(family, fam_map.get('default'))
-    if not allowed:
-        return grid
-    allowed = {int(x) for x in allowed}
-    out = [l for l in grid if l in allowed]
-    return out or grid
 
 
 def slice_window(panel: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,

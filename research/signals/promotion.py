@@ -34,33 +34,17 @@ the book breathes with how much quality exists; never a fixed count.
 
 import logging
 import math
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 
-from config import BARS_PER_DAY, get
-from research.signals.data import Roll, family_lags
+from config import get
+from research.signals.data import Roll
 from research.signals.search import (DiscoveryLedger,
-                                           day_equivalent_tstat,
                                            effective_persistence_bars,
                                            max_signal_correlation,
                                            persistence_weight,
                                            trade_rate_per_bar)
-
-
-def econ_margin_per_bar(alpha_mean: float, lag_bars: int,
-                        turnover: Optional[float],
-                        cost_rate: float) -> float:
-    """Filter 3's economics: per-bar expected profit minus per-bar trading
-    cost. alpha_mean is the per-BET return over lag_bars (returns scale
-    linearly with holding time -> per-bar = alpha/lag); the trading cost is
-    the signal's own churn (fraction of gross replaced per bar) times the
-    per-side cost rate. Missing/NaN turnover prices the cost at zero (fails
-    open - never block on a missing diagnostic)."""
-    a = float(alpha_mean) / max(int(lag_bars), 1)
-    to = (float(turnover)
-          if turnover is not None and np.isfinite(turnover) else 0.0)
-    return a - to * float(cost_rate)
 
 
 def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
@@ -85,9 +69,6 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
     median_gate = bool(curve_cfg.get('median_gate', False))
     rt_cost = float(curve_cfg.get('roundtrip_mult', 2.0)) * cost_rate
 
-    def sel(s, lag):
-        return s['profile_select'].get(lag, s['metrics_select'])
-
     def capture(s, peak_k: Optional[int] = None,
                 half_life: Optional[float] = None) -> float:
         hl = (half_life if half_life
@@ -97,8 +78,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
         # book could "use" past the peak is worthless.
         if peak_k:
             hl = min(float(hl), float(peak_k))
-        p_eff = effective_persistence_bars(hl, int(s.get('target_lag') or 6),
-                                           s.get('turnover'))
+        p_eff = effective_persistence_bars(hl, s.get('turnover'))
         return persistence_weight(p_eff, rate)
 
     def curve_verdict(s) -> Optional[dict]:
@@ -110,7 +90,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
         3 economics   - best net RATE over the sampled curve,
                         max_k (A(k) - roundtrip)/k, must be positive: the
                         formula judged at its own optimal holding.
-        Returns None if the row carries no curve (old ledgers -> lag path)."""
+        Returns None when the row has no curve or fails filters 1-2."""
         c = s.get('curve')
         if not c or not c.get('ks'):
             return None
@@ -134,43 +114,9 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
                 'peak_k': int(c.get('peak_k') or 0),
                 'half_life': float(c.get('half_life') or 0.0) or None}
 
-    # Verdict per formula: at each of its family's horizons, filters 1+2
-    # per lag (net positive, enough active days - calendar-adjusted for
-    # multi-day lags); best qualifying lag by day-equivalent t. Ranking
-    # score = that t x capture: per-bet-fair across horizons, and holdable
-    # evidence outranks equally-strong unholdable evidence.
-    verdicts: List[Optional[dict]] = []
-    for s in survivors:
-        # Preferred: the fitted response curve (judged at its own optimal
-        # holding, ranked by net economic rate).
-        v = curve_verdict(s)
-        if v is None and not s.get('curve'):
-            # Fallback for rows without curves (pre-curve ledgers): the
-            # 4-lag verdict, exactly as before.
-            fam = family_lags(s['candidate'].family, cfg)
-            lags = ([l for l in fam if l in s['profile_select']]
-                    or sorted(s['profile_select']))
-            best = None
-            for lag in lags:
-                m = sel(s, lag)
-                t = float(m.get('alpha_tstat', 0.0) or 0.0)
-                days = int(round(int(m.get('n_days', 0) or 0)
-                                 * max(1.0, lag / BARS_PER_DAY)))
-                if t <= 0.0 or days < min_days:
-                    continue                  # filters 1 + 2 at this lag
-                fair = day_equivalent_tstat({'alpha_tstat': t}, lag)
-                if best is None or fair > best['fair_t']:
-                    best = {'lag': int(lag), 'fair_t': fair, 'tstat': t,
-                            'days': days,
-                            'alpha': float(m.get('alpha_mean', 0.0) or 0.0)}
-            if best is not None:
-                best['margin'] = econ_margin_per_bar(
-                    best['alpha'], best['lag'], s.get('turnover'), cost_rate)
-                best['score'] = best['fair_t'] * capture(s)
-                best['peak_k'] = None
-                best['half_life'] = None
-            v = best
-        verdicts.append(v)
+    # Verdict per formula: the test response curve, judged at its own
+    # optimal holding, ranked by net economic rate.
+    verdicts: List[Optional[dict]] = [curve_verdict(s) for s in survivors]
 
     # Filters over whole formulas: 1+2 (inside the verdict), 3 (pays for
     # itself + holdable, with holding capped at the measured peak).
