@@ -137,16 +137,14 @@ def main():
     print(f"PROMOTED BOOK ({len(promos)} signals)")
     print("=" * 76)
     if promos.empty:
-        print("(nothing promoted yet - the book takes the top "
-              f"{get('discovery.promotion.book_size')} survivors by pooled "
-              "select evidence; an empty book means the sanity floors "
-              "rejected everything)")
+        print("(nothing promoted yet - promotion takes the best "
+              f"{get('discovery.promotion.book_frac'):.0%} of formulas "
+              "passing the four filters on their 5-month test; an empty "
+              "book means nothing passed)")
     else:
         cols = ['roll_id', 'name', 'family', 'direction', 'select_lag',
                 'half_life_bars', 'capture', 'turnover',
-                'select_alpha_tstat', 'pooled_select_tstat',
-                'pooled_select_months', 'pooled_sign_frac',
-                'posterior_sharpe', 'promotion_score', 'reward',
+                'select_alpha_tstat', 'test_days', 'econ_margin', 'reward',
                 'n_trials_at_promotion']
         print(promos[[c for c in cols if c in promos.columns]]
               .to_string(index=False))

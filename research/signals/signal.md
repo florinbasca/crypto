@@ -3,7 +3,7 @@
 What do I mean by signals: formulas that rank the universe each bar by expected residual return. The ranking is cross-sectional or scored against each other. Promoted signals are used in the walk-forward backtest, which sizes a dollar and factor-neutral book. The walk-forward is the only
 place P&L is judged; discovery is purely statistical, refers to residuals and can't be traded directly.
 
-The formula space is infinite and naive search overfits. Three controls: a bounded expression, an LLM proposing candidates, and promotion on held-out evidence — the POOLED directed alpha across every select month a candidate was ever measured on, never a single month (a lone month has no power against real-but-modest alpha). Scoring and selection are deterministic.
+The formula space is infinite and naive search overfits. Three controls: a bounded expression, an LLM proposing candidates, and promotion on a held-out **5-month test window** (~150 days the formula never saw — long enough for a single verdict to mean something; one month was a coin flip). Scoring and selection are deterministic.
 
 "Agentic" describes the loop, not the model. Each LLM call is one stateless
 prompt → JSON completion: no tools, no memory, no data access, no control over
@@ -41,23 +41,27 @@ The 32 slots are split across families by an upper-confidence-bound rule: a fami
 
 ## Validation
 
-Two windows per roll, advancing one month at a time:
+Two windows per roll, advancing one month at a time (5 + 5 + 1):
 
 ```
-| TRAIN 5mo | SELECT 1mo |   (OOS 1mo = the promotion's valid_from date)
-  search happens here    tested once, at promotion
+| TRAIN 5mo | TEST 5mo  |   (OOS 1mo = the promotion's valid_from date)
+  search happens here     the VERDICT: ~150 held-out days, read at promotion
 ```
 
-- **Train**: the entire search — scoring, reward, breeding, half-life fits.
-- **Select**: held out. Promotion is its first and only read, so a select score
-  is a clean measurement, not the max of a search on itself.
-- A purge + embargo gap (max horizon + embargo bars) is dropped at the boundary
-  so forward targets can't leak across it.
-- Membership never carries over (`min_rolls_survived = 1`): a signal trades an
-  OOS month only by re-qualifying on the 6 months ending just before it. What
-  DOES accumulate across rolls is *evidence*: each roll's select month is a
-  distinct, never-searched measurement, and promotion pools all of them
-  (see Promotion).
+- **Train**: the entire search — scoring, reward, breeding, half-life fits,
+  and the traded direction (committed here, from pooled train evidence
+  across the formula's rolls — never from the test).
+- **Test**: held out. A formula's verdict is its most recent 5-month test
+  window — one verdict per formula per roll, **no cross-roll pooling**: the
+  long window IS the evidence. New formulas wait for their window to fill.
+- Windows slide monthly, so every month gets a fresh verdict and a fresh
+  OOS month; consecutive test windows overlap 4 of 5 months (each verdict
+  is still strictly causal for its own OOS month).
+- A purge + embargo gap (max horizon + embargo bars) is dropped at the
+  boundary so forward targets can't leak across it.
+- A per-roll **feature coverage check** runs upstream of the LLM: features
+  with ≤ `min_feature_nonnan` non-NaN values over the roll's window are
+  dropped for that roll — never prompted, never compiled, never scored.
 
 ## Reward (train only)
 
@@ -83,9 +87,9 @@ search can silently optimize the wrong thing: an earlier six-term reward's
 absolute-units instability penalty single-handedly culled a candidate with
 train t 5.7 (and select t 6.6) at reward −1.9 while smooth near-zero-alpha
 candidates survived — the search was optimizing for stable mediocrity.
-Stability pressure now lives where it is measured honestly: promotion's
-cross-roll pooling — a signal that is noisy across months never accumulates
-pooled t.
+Stability pressure now lives where it is measured honestly: the 5-month
+held-out verdict — a noisy formula rarely posts a clean positive verdict
+over ~150 fresh days, and must re-earn one every roll.
 
 Each candidate is scored at every horizon its FAMILY owns
 (`discovery.family_horizon_lags`, intersected with `horizon_lags_bars`:
@@ -138,74 +142,42 @@ are one signal. (A structural AST-overlap check used to double this; output
 correlation subsumes what mattered.) The most over-used building blocks each
 roll are still fed back to the LLM as a "vary away from these" hint.
 
-## Promotion
+## Promotion (CHOOSE)
 
-Once per roll. All statistical tests are on the **per-bet return**, not rank
-IC, and the evidence is **pooled across months**: each roll re-evaluates
-carried-over survivors on a fresh, never-searched select month, and promotion
-combines every month a candidate was ever measured on (fixed-effect
-meta-analysis over the ledger: per month se = mean/t, pooled t =
-inverse-variance-weighted mean × √(Σ1/se²)). Prior months were directed by
-that roll's own train fit, so they are sign-aligned to the *current*
-direction first — a month measured trading the other way counts against.
+Once per roll. A formula's **verdict** is its most recent 5-month test
+window (per-bet return, not rank IC; directed by the sign committed on
+train). Four filters, then the quintile — no significance gates, no fixed
+counts:
 
-Why pooling: one select month (~30 daily obs) gives a true Sharpe-2 signal
-an expected t of only ~0.58 — a 3+ single-month bar selects luck, not skill
-(the first run's gate stack demanded ~3.5 and promoted nothing, which
-carried no information either way). Pooling k months scales expected t by
-√k: *persistence across rolls*, not one lucky month, is what confirms.
+1. **Made money** — the verdict is net positive in the committed direction.
+   A sign, not a bar. (~150 test days give a true Sharpe-2 formula a ~90%
+   pass rate, Sharpe-1 ~74%, noise 50% — the filter removes the backwards
+   half of noise; the quintile does the actual selecting.) Directed, never
+   |t|: a formula whose test ran backwards is rejected, not flipped —
+   re-signing after seeing the test is how noise gets promoted.
+2. **Enough activity** (`min_select_days`) — fired on enough real days
+   within the test window. Dense formulas pass trivially; a tight gate on
+   dense features (active 4 days/month) does not get a trusted verdict
+   until it has accumulated enough firings.
+3. **Pays for itself** — expected per-bar profit (verdict alpha / holding
+   bars) exceeds the formula's own per-bar trading cost (churn ×
+   `econ_cost_bps`, defaulting to the portfolio layer's cost model), AND
+   the alpha is holdable at the book's measured fill rate
+   (`min_capture`). Churn is priced, never capped.
+4. **Not a duplicate** (`max_book_corr`) — signal correlation vs formulas
+   already chosen this roll, greedy best-first.
 
-The mechanism is **rank + K slots + sanity floors** — no significance gates:
+Then promote the **best quintile of the passers**: ceil(`book_frac` ×
+n_passers), bounded by `book_min`/`book_max`, ranked by day-equivalent
+verdict t × capture. Proportional — the book breathes with how much quality
+exists; a rich roll promotes more, a barren one less.
 
-- **Rank**: **posterior Sharpe × capture** at the best of the candidate's
-  family horizons. Posterior Sharpe is the observed pooled annualized Sharpe
-  shrunk by the evidence behind it:
-
-  ```
-  SR_observed = pooled_t / √n_days × √365
-  posterior   = SR_observed · n / (n + 365/τ²)      τ = prior_sharpe_std
-  ```
-
-  One number, one interpretable constant (τ = the spread of true Sharpes we
-  believe the pool can contain), combining the three things that matter:
-  **effect size** (Sharpe — at equal evidence, the bigger edge ranks
-  higher), **statistical evidence** (t and observation count — a t of 2 in
-  one month is an observed Sharpe of ~7, almost certainly luck, and the
-  shrinkage prices that; a modest Sharpe sustained a year keeps ~half its
-  value), and **stability** (inconsistent months cancel inside the pooled t
-  before this formula ever sees them). Daily Sharpe is bets-per-day-fair by
-  construction, and capture prices whether the book can trade at the
-  signal's speed — the product ranks the *tradable* expected Sharpe. Never
-  the search reward — the first run measured reward and select alpha as
-  ~uncorrelated; ranking by reward would supply stable mediocrity.
-- **K slots** (`book_size`): the top K ranked survivors promote. A quota
-  substitutes for a significance gate **only because the ranking metric is a
-  sufficient measure of quality** — the quota caps how MANY promote, the
-  metric decides WHO, and the walk-forward re-judges the book every month.
-  (An earlier stack of BY-FDR × deflation × min-t compounded into an
-  accidental one-month bar of t≈3.5 and promoted nothing — which carried no
-  information.) A roll that promoted nothing would give the walk-forward —
-  the only money judge — nothing to measure; a fixed K keeps it fed.
-- **Sanity floors** reject only the *actively bad*, never enforce
-  significance:
-  - Pooled directed t > 0: the held-out months must not net-run against the
-    traded direction. Directed, not |t| — a sign-reversed signal is
-    rejected, never admitted on magnitude.
-  - Minimum pooled observation days (`min_select_days`).
-  - Sign agreement: the train profile mostly shares the traded sign.
-  - Capture floor: effective persistence long enough for the book to hold.
-  - Turnover ceiling (`max_turnover = 0.10`/bar): extremes backstop above
-    the capture floor (which already binds at ~0.07/bar). Fails open when
-    turnover is unknown.
-  - Orthogonality to signals already promoted this roll (`max_book_corr`).
-
-Promotions are written with the evidence lag, half-life, turnover, direction
-and the evidence (`pooled_select_tstat`, `pooled_select_months`,
-`pooled_sign_frac`, `posterior_sharpe`, `promotion_score`), plus a
-provenance stamp (`run_id`, `config_hash`, `data_hash`, `git_sha`) so every
-row is attributable to the exact run/config/data that produced it — a table
-mixing runs after a config change is detectable, never silently blended.
-Promotion neither trades nor sizes.
+Promotions are written with the verdict lag, half-life, turnover, direction
+and the economics (`select_alpha_tstat`, `test_days`, `econ_margin`), plus
+a provenance stamp (`run_id`, `config_hash`, `data_hash`, `git_sha`) so
+every row is attributable to the exact run/config/data that produced it — a
+table mixing runs after a config change is detectable, never silently
+blended. Promotion neither trades nor sizes.
 
 The walk-forward consumes each roll's promotions at that roll's **evidence
 lag** and **fitted direction** (never the registry's deduped defaults), and
@@ -215,48 +187,31 @@ converts per-bet alpha to per-bar linearly (returns scale with time; the
 books that the real book must clearly beat; control results are printed
 but never persisted.
 
-### Power: what happens to a true Sharpe-2 signal
+### Power: why a 5-month test window
 
-A Sharpe-2 signal is far too valuable to lose to a threshold, and the design
-is built so it never faces one. Its expected monthly select t is
-2/√12 ≈ 0.58 — invisible in any single month, which is why no single-month
-significance bar exists anywhere. What it faces instead is accumulation
-(τ = 1, ~30 obs days/month):
+One held-out month gives a true Sharpe-2 formula an expected t of ~0.58 —
+statistically indistinguishable from noise, which is why the original
+1-month-verdict design promoted junk or nothing. Five months (~150 days)
+give the same formula E[t] ≈ 1.28, and the pass rates through filter 1
+(net positive, directed) separate cleanly:
 
-| pooled months k          | 1    | 4    | 9    | 16   |
-|--------------------------|------|------|------|------|
-| E[pooled t] = 0.58·√k    | 0.58 | 1.15 | 1.73 | 2.31 |
-| P(directed floor, t > 0) | 72%  | 88%  | 96%  | 99%  |
-| E[posterior Sharpe]      | 0.15 | 0.49 | 0.85 | 1.14 |
+| true Sharpe        | 0 (noise) | 1   | 2   | 3   |
+|--------------------|-----------|-----|-----|-----|
+| P(pass filter 1)   | 50%       | 74% | 90% | 97% |
 
-Meanwhile a noise candidate's pooled t random-walks around zero — half fail
-the directed floor outright each roll — and it must re-win the train-side
-survivor cut every month just to keep being measured. Real signals compound
-evidence; noise churns. Three design choices serve this directly:
+The filter halves the noise; the **quintile** then does the real selection
+among passers, and re-qualification every roll (windows slide monthly) is
+what noise cannot sustain. Supporting choices:
 
-- **Non-overlapping select months** (select 1mo, step 1mo): every roll adds
-  an *independent* month to the pool. Longer select windows with monthly
-  steps would share months across rolls and double-count them in the
-  pooling — the current split is the one where fixed-effect pooling is
-  honest.
-- **Retention** (`reseed_promoted_rolls`): candidates promoted in the last
-  N rolls are re-seeded into the search even after missing a survivor cut.
-  Every seed is re-measured and ledger-recorded whether or not it
-  re-survives, so one noisy train month never discards an accumulated
-  evidence stream — the signal re-enters the book when it re-earns
-  survival.
-- **Pooled direction fitting**: a single 5-month train window fits the
-  wrong traded sign Φ(−SR·√years) of the time — ~26% for a Sharpe-1
-  signal, and consecutive windows overlap so the error persists. The sign
-  is therefore fitted from the candidate's pooled *train* evidence across
-  every roll it was measured in (train-only — select stays unspent), so
-  direction error falls with candidate age exactly as the select evidence
-  grows. A candidate whose current window disagrees with its history keeps
-  the historical sign and pays for the disagreement in this roll's
-  directed reward.
-- **Family horizons**: each candidate is only ever measured where its
-  family's alpha can live, so its evidence concentrates instead of
-  spreading across implausible lags.
+- **Pooled direction fitting** (train-only): the traded sign comes from the
+  formula's pooled *train* evidence across its rolls, so direction error
+  falls with age; the test window is never consulted for the sign.
+- **Retention** (`reseed_promoted_rolls`): recently promoted formulas are
+  re-seeded even after missing a survivor cut, so book members keep
+  receiving fresh verdicts.
+- **Family horizons**: each formula is measured only where its family's
+  alpha can live, so verdicts concentrate instead of spreading across
+  implausible lags.
 
 ## What the LLM sees
 
@@ -307,7 +262,8 @@ are traded in that roll's OOS month only. All knobs live under `discovery.*` in
 
 ## Cost and run time
 
-A full run is ~40 rolls (windows) × 16 generations. The default model is
+A full run is ~36 rolls (windows; each spans 5+5+1 months, sliding monthly)
+× 16 generations. The default model is
 Gemini 3.1-flash-lite ($0.25 / $1.50 per million input / output tokens),
 measuring ~$1/roll — order $40 for the full run. Cheaper providers are one
 config switch away (`discovery.llm.provider` + the key in `.env`):

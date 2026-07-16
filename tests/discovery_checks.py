@@ -66,9 +66,13 @@ def test_cfg():
     # shortest grid value, which the production capture floor would block.
     # Pooling/ranking specifics are covered by
     # tests/promotion_pooling_checks.py.
-    cfg['promotion'].update({'min_rolls_survived': 1, 'book_size': 10,
-                             'min_select_days': 0, 'min_capture': 0.0,
-                             'max_turnover': None})
+    # book_frac 0 -> fixed book_size (deterministic small-sample tests);
+    # econ_cost_bps 0 -> filter 3's cost side off (synthetic alphas are
+    # tiny; the sign/activity/duplicate filters are what these checks
+    # exercise). Quintile/econ specifics live in tests/choose_checks.py.
+    cfg['promotion'].update({'book_frac': 0.0, 'book_size': 10,
+                             'econ_cost_bps': 0.0,
+                             'min_select_days': 0, 'min_capture': 0.0})
     return cfg
 
 
@@ -275,8 +279,8 @@ check("noise: promotions capped at book_size",
       len(noise_promoted) <= CFG['promotion']['book_size'],
       f"({len(noise_promoted)} promoted, "
       f"{time.perf_counter() - t0:,.1f}s)")
-check("noise: every promotion has POSITIVE directed pooled evidence",
-      all(p['pooled_select_tstat'] > 0 for p in noise_promoted))
+check("noise: every promotion made money on its test (directed)",
+      all(p['select_alpha_tstat'] > 0 for p in noise_promoted))
 
 # ---------------------------------------------------------------------------
 # 5. End-to-end: planted effect found, ledger complete, reproducible,
@@ -322,14 +326,12 @@ check("e2e: planted effect promoted through the gates", len(promoted) >= 1,
 check("e2e: ledger promoted flags set",
       len(ledger_a.to_frame().query('promoted')) == len(promoted))
 
-# Directional floor (regression): promotion ranks the DIRECTED pooled t, not
-# |t|. Every promotion must be positive in the traded direction; a signal
-# that REVERSES sign out-of-sample must be rejected, not admitted on
-# magnitude. (an earlier gate once used abs(ic_tstat) - two prod signals
-# promoted while trading the WRONG way on the hold-out month, at directed t
-# of -5.2 and -3.8.)
-check("directional: every promotion has positive directed pooled t",
-      all(p['pooled_select_tstat'] > 0 for p in promoted),
+# Directional filter (regression): the verdict is DIRECTED, never |t|. A
+# formula whose test ran backwards is rejected, not flipped. (an earlier
+# gate once used abs(ic_tstat) - two prod signals promoted while trading
+# the WRONG way on the hold-out window, at directed t of -5.2 and -3.8.)
+check("directional: every promotion made money in its committed direction",
+      all(p['select_alpha_tstat'] > 0 for p in promoted),
       f"({len(promoted)} promoted)")
 
 # Flip the winner's select profile: same magnitude, opposite sign - abs()
@@ -398,25 +400,27 @@ check("turnover: recorded in the ledger for every evaluated candidate",
 check("turnover: survivors carry it in-memory too",
       all('turnover' in s and np.isfinite(s['turnover']) for s in survivors_a))
 
-# Turnover CEILING gate (promotion.max_turnover): OFF by default; when set,
-# rejects high-churn survivors; fails OPEN on missing turnover.
+# PAYS-FOR-ITSELF (filter 3): churn is priced, not capped. With a cost rate
+# high enough that the churniest promotee's cost exceeds its per-bar alpha,
+# it must drop out; with cost 0 (test default) economics never rejects.
 _base = bt_mod.promote(survivors_a, ROLL, ledger_a, CFG)
 assert _base, "e2e produced no promotions to gate"
-# Cap just below the churniest PROMOTED signal: it must now be excluded, and
-# every survivor still promoted must respect the cap.
-_cap = max(p['turnover'] for p in _base) - 1e-6
-_tv_cfg = copy.deepcopy(CFG)
-_tv_cfg['promotion']['max_turnover'] = _cap
-_gated = bt_mod.promote(survivors_a, ROLL, ledger_a, _tv_cfg)
-check("turnover gate: None promotes; a ceiling bites and is respected",
-      any(p['turnover'] > _cap for p in _base)          # the cap actually bit
-      and all(p['turnover'] <= _cap for p in _gated),   # gate respected
-      f"(base {len(_base)} -> gated {len(_gated)} at cap {_cap:.3f})")
-# Fail-open: a survivor with no/NaN turnover is not blocked by the gate.
+_worst = max(_base, key=lambda p: p['turnover'])
+# Cost that exactly kills the churniest: alpha_per_bar / turnover, plus 1%.
+_alpha_bar = _worst['econ_margin']  # cost 0 -> margin == alpha per bar
+_kill_bps = (_alpha_bar / _worst['turnover']) * 10000 * 1.01
+_ec_cfg = copy.deepcopy(CFG)
+_ec_cfg['promotion']['econ_cost_bps'] = _kill_bps
+_gated = bt_mod.promote(survivors_a, ROLL, ledger_a, _ec_cfg)
+check("economics: a cost rate above alpha/turnover rejects the churner",
+      _worst['candidate'].hash not in {p['candidate'].hash for p in _gated}
+      and all(p['econ_margin'] > 0 for p in _gated),
+      f"(base {len(_base)} -> {len(_gated)} at {_kill_bps:.1f}bps)")
+# Fail-open: NaN turnover prices the cost at zero, never blocks.
 _no_tv = [{**s, 'turnover': float('nan')} for s in survivors_a]
-_openq = bt_mod.promote(_no_tv, ROLL, ledger_a, _tv_cfg)
-check("turnover gate: fails open when turnover is unknown (NaN)",
-      len(_openq) == len(_base),
+_openq = bt_mod.promote(_no_tv, ROLL, ledger_a, _ec_cfg)
+check("economics: fails open when turnover is unknown (NaN)",
+      len(_openq) >= len(_base),
       f"({len(_openq)} promoted with NaN turnover vs {len(_base)} baseline)")
 
 # survivor carry-over: the next roll is seeded with this roll's survivors,
@@ -443,15 +447,6 @@ check("carry-over: seeded survivors re-survive the next roll",
 check("carry-over: seeds recorded in the ledger (generation -1)",
       (ledger_a.to_frame().query('roll_id == 1 and generation == -1')
        ['cand_hash'].nunique()) >= len(carried))
-persist_cfg = copy.deepcopy(CFG)
-persist_cfg['promotion']['min_rolls_survived'] = 2
-promoted_r1 = bt_mod.promote(survivors_roll1, ROLL_B, ledger_a,
-                             persist_cfg)
-check("carry-over: 2-roll persistence gate now passes",
-      len(promoted_r1) >= 1
-      and all(ledger_a.consecutive_survivals(p['candidate'].hash, 1) >= 2
-              for p in promoted_r1),
-      f"({len(promoted_r1)} promoted with 2-roll persistence)")
 check("carry-over: ledger survivor_candidates round-trips",
       {c.hash for c in ledger_a.survivor_candidates(0)}
       == {s['candidate'].hash for s in survivors_a})
@@ -460,15 +455,15 @@ check("carry-over: ledger survivor_candidates round-trips",
 # walk-forward (the only money judge) needs to trade them.
 if promoted:
     p0 = promoted[0]
-    check("e2e: promotion carries evidence lag + half-life + capture + "
-          "pooled stats",
+    check("e2e: promotion carries verdict lag + half-life + capture + "
+          "economics",
           'half_life_bars' in p0 and 'capture' in p0
-          and 'select_lag' in p0 and 'pooled_select_tstat' in p0
-          and p0['pooled_select_months'] >= 1
+          and 'select_lag' in p0 and 'test_days' in p0
+          and 'econ_margin' in p0
           and 0.0 < p0['capture'] <= 1.0,
           f"(hl {p0['half_life_bars']:.0f}b, capture {p0['capture']:.2f}, "
-          f"lag {p0['select_lag']}, pooled t "
-          f"{p0['pooled_select_tstat']:.1f})")
+          f"lag {p0['select_lag']}, test days {p0['test_days']}, "
+          f"margin {p0['econ_margin']:.2e})")
 print(f"(end-to-end block: {time.perf_counter() - t0:,.1f}s)")
 
 # ---------------------------------------------------------------------------

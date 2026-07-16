@@ -430,8 +430,12 @@ config = {
         # (factor betas, rolling features, residual history).
         'start_date': '2022-08-01',
         'end_date': '2026-06-01',        # No roll's OOS end may exceed this
-        'train_months': 5,               # Candidates generated/fit here
-        'select_months': 1,              # Held out from the search; promotion tests it ONCE
+        'train_months': 5,               # INVENT: candidates generated/fit here
+        # MEASURE: the 5-month held-out test window. A formula's verdict is
+        # its most recent test window - one verdict per formula per roll, no
+        # cross-roll pooling. ~150 days per verdict is what makes a single
+        # window decisive (1 month was a coin flip - the zero-promotion era).
+        'select_months': 5,
         'oos_months': 1,                 # Promoted book traded here (never searched)
         'roll_step_months': 1,
         # Purge at window boundaries: drop the last (max target lag + embargo)
@@ -467,6 +471,14 @@ config = {
         # Reference lag for the proposer's compressed diagnostics only.
         'target_lag_bars': 36,
         'min_assets_per_timestamp': 10,
+        # Feature coverage check (upstream of the LLM, per roll): a feature
+        # with at most this many non-NaN values over the roll's train+test
+        # window is dropped for that roll - not shown to the proposer, not
+        # compiled, not scored. Prevention over cure: dead inputs (unstarted
+        # macro series, unmapped dev data) never produce candidates at all.
+        # Formula-level activity is still checked at promotion (a tight GATE
+        # on a dense feature is invisible here).
+        'min_feature_nonnan': 20,
         'liquidity_window_bars': 144,    # trailing $vol window for the liquid-half flag
         # Input space: feature columns are resolved by matching these
         # per-family prefix patterns against the features table (bounded input
@@ -588,83 +600,47 @@ config = {
             'weights': {'alpha_tstat': 1.0, 'similarity': -0.5},
             'scales': {'alpha_tstat': 2.0, 'similarity': 0.5},
         },
-        # Promotion: RANK + K SLOTS + SANITY FLOORS. No significance gates.
-        # Evidence is the POOLED directed select t across every month the
-        # candidate was ever measured on (each roll re-evaluates carried-over
-        # survivors on a fresh, never-searched select month; prior months'
-        # alphas are sign-aligned to the current traded direction). Survivors
-        # are ranked by capture-weighted day-equivalent pooled t at their
-        # family's horizons and the top book_size promote. With a FIXED
-        # promotion count, FDR/deflation-style significance gates add nothing
-        # the quota does not already do - the first run stacked three of them
-        # into an accidental one-month bar of t~3.5 (a true Sharpe-2 signal's
-        # expected monthly t is ~0.58) and promoted nothing, which carried no
-        # information. The walk-forward is the only money judge; the floors
-        # below reject only candidates that are ACTIVELY bad, never enforce
-        # significance.
+        # CHOOSE (the agreed 5+5+1 spec): a formula's verdict is its most
+        # recent 5-month test window - per roll, no cross-roll pooling.
+        # Four filters, then promote the BEST QUINTILE of everything that
+        # passed. Never a fixed count, never a significance bar (nothing
+        # resembling the old one-month t>=3.5 exists anywhere).
         'promotion': {
-            # Promoted per roll (the book re-forms every roll): ~top quintile
-            # of the 12 search survivors. Fixed count = fixed look budget.
-            'book_size': 3,
-            # Ranking prior: the cross-sectional std (annualized) of TRUE
-            # Sharpes we believe the candidate pool can contain. The ranking
-            # metric is posterior Sharpe x capture, where posterior Sharpe
-            # shrinks the observed pooled annualized Sharpe by
-            # n / (n + 365/tau^2) - one interpretable constant combining
-            # effect size (Sharpe), evidence (t, obs count) and cross-month
-            # stability (inconsistent months cancel inside the pooled t).
-            # POWER (tau = 1.0, true Sharpe-2 signal, ~30 obs days/month):
-            #   pooled months k:        1     4     9     16
-            #   E[pooled t] 0.57*rt(k): 0.57  1.14  1.71  2.27
-            #   P(directed floor, t>0): 71%   87%   96%   99%
-            #   E[posterior Sharpe]:    0.15  0.49  0.85  1.13
-            # while a noise candidate's pooled t random-walks around 0 (half
-            # fail the directed floor outright) AND it must re-win the
-            # train-side survivor cut every roll to keep being measured.
-            # Real Sharpe-2 signals rise; they are never discarded by a
-            # threshold.
-            'prior_sharpe_std': 1.0,
-            # RETENTION: candidates promoted within the last N rolls are
-            # re-seeded into the search even if they missed the previous
-            # roll's survivor cut. Every seed is re-measured on the new
-            # windows and recorded in the ledger whether or not it
-            # re-survives, so its pooled select evidence keeps accumulating
-            # and it re-enters the book when it re-earns survival. Without
-            # this, ONE noisy train month would discard a real signal's
-            # entire evidence stream. 0 disables.
-            'reseed_promoted_rolls': 6,
-            # Floors. Pooled directed t > 0 is built in: a signal whose
-            # held-out months net-ran AGAINST its traded direction never
-            # promotes, regardless of rank.
-            # Minimum CALENDAR days of pooled select evidence (multi-day
-            # horizons bet once per lag/1d days, so their obs counts are
-            # converted to calendar coverage first - a 3d signal's 9
-            # bets/month = 27 calendar days and passes in its first roll,
-            # same as every other horizon).
+            # Filter 1 - MADE MONEY: the test verdict must be net positive
+            # in the direction committed during training. Not a bar, a sign.
+            # (Directed, never |t|: a formula whose test ran backwards is
+            # rejected, not flipped - flipping after seeing the test is how
+            # noise gets promoted.)
+            # Filter 2 - ENOUGH ACTIVITY: minimum days the formula actually
+            # fired within its ~150-day test window. Dense formulas pass
+            # trivially; tight-gated ones need enough real firings for the
+            # verdict to mean anything. (USER KNOB)
             'min_select_days': 20,
-            # Fraction of profile lags whose train alpha agrees in sign with
-            # the traded direction: a genuine alpha term structure has one
-            # sign across horizons; a mixed profile is a red flag.
-            'min_profile_sign_agreement': 0.75,
-            'max_book_corr': 0.5,            # signal corr vs already-promoted book
-            # Consecutive-roll survival required before promotion. 1 =
-            # OFF: each month stands alone (pooling still accumulates the
-            # months that exist; this floor only demands they exist).
-            'min_rolls_survived': 1,
-            # Capture floor: minimum persistence weight 1/(1 + phi/kappa) a
-            # candidate needs to promote. phi uses EFFECTIVE persistence
-            # min(alpha half-life, position life 1/turnover_per_bar); kappa is
-            # the GP fill rate the walk-forward trades at (~0.048/bar). 0.5 =
-            # effective persistence >= ~15 bars, i.e. per-bar turnover <=
-            # ~0.07 - this floor is the graded churn gate. 0 disables.
-            # Duration-based, never a cost model.
+            # Filter 3 - PAYS FOR ITSELF: expected per-bar profit from the
+            # test window must exceed the formula's own per-bar trading cost
+            # (its churn x cost rate). Cost rate: None = the portfolio
+            # layer's cost_bps (one cost model everywhere); a number here
+            # overrides (tests / sensitivity runs).
+            'econ_cost_bps': None,
+            # ... and HOLDABLE: capture 1/(1 + phi/kappa) at least this -
+            # alpha faster than the book's measured fill rate can't be
+            # monetized. Derived from measured quantities. 0 disables.
             'min_capture': 0.5,
-            # Turnover CEILING (backstop above the capture floor, which
-            # already binds at ~0.07/bar): rejects a signal whose per-bar
-            # churn (0.5*sum|dw| on the gross-1 signal) exceeds the cap.
-            # 0.10 is a fails-open extremes backstop; the capture floor does
-            # the graded work. None disables.
-            'max_turnover': 0.10,
+            # Filter 4 - NOT A DUPLICATE: max signal correlation vs formulas
+            # already chosen this roll. (USER KNOB)
+            'max_book_corr': 0.5,
+            # THE QUINTILE: promote ceil(book_frac x n_passers), bounded by
+            # book_min/book_max. Proportional - the book breathes with how
+            # much quality exists. book_frac 0 falls back to fixed
+            # book_size (tests only). (USER KNOBS)
+            'book_frac': 0.20,
+            'book_min': 5,
+            'book_max': 50,
+            'book_size': 10,
+            # RETENTION: formulas promoted within the last N rolls are
+            # re-seeded into the search even after missing a survivor cut,
+            # so book members keep getting fresh verdicts. 0 disables.
+            'reseed_promoted_rolls': 6,
         },
         # Event studies for the SLOW families (research/signals/event_study.py):
         # unlocks / listings / dev activity produce a handful of events per

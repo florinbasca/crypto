@@ -569,36 +569,6 @@ class DiscoveryLedger:
                         'n_days': int(m.get('n_days', 0) or 0)})
         return sorted(out, key=lambda x: x['roll_id'])
 
-    def select_history(self, cand_hash: str, lag: int,
-                       up_to_roll: Optional[int] = None) -> List[dict]:
-        """Every select-month measurement of cand_hash at `lag`, one per roll
-        it was evaluated in (rolls advance monthly, so each roll's select
-        window is a DISTINCT, never-searched month - independent evidence).
-        Metrics are directed by THAT roll's train-fitted direction, which is
-        returned alongside so the caller can sign-align them before pooling.
-        Rows without a parseable profile (pre-profile runs) are skipped."""
-        out = []
-        for r in self._rows:
-            if r['cand_hash'] != cand_hash:
-                continue
-            if up_to_roll is not None and r['roll_id'] > up_to_roll:
-                continue
-            pj = r.get('profile_json')
-            if not isinstance(pj, str) or not pj:
-                continue
-            try:
-                m = (json.loads(pj).get(str(int(lag))) or {}).get('select')
-            except (ValueError, TypeError):
-                continue
-            if not m or m.get('alpha_tstat') is None:
-                continue
-            out.append({'roll_id': int(r['roll_id']),
-                        'direction': int(r.get('direction', 1) or 1),
-                        'alpha_mean': m.get('alpha_mean'),
-                        'alpha_tstat': float(m['alpha_tstat']),
-                        'n_days': int(m.get('n_days', 0) or 0)})
-        return sorted(out, key=lambda x: x['roll_id'])
-
     def to_frame(self) -> pd.DataFrame:
         return pd.DataFrame(self._rows)
 
@@ -698,6 +668,25 @@ def run_search(panel: pd.DataFrame, roll: Roll,
 
     from research.signals.data import (all_family_columns,
                                              build_diagnostics)
+    # Feature coverage (the upstream junk check): a feature with at most
+    # min_feature_nonnan non-NaN values over THIS roll's window is dropped
+    # for the roll - never shown to the LLM, never compiled, never scored.
+    # Dead inputs (unstarted series, unmapped names) produce no candidates.
+    min_nonnan = int(cfg.get('min_feature_nonnan', 0) or 0)
+    if min_nonnan > 0:
+        present = [c for c in all_family_columns(family_columns)
+                   if c in roll_panel.columns]
+        counts = roll_panel[present].notna().sum()
+        dead = set(counts[counts <= min_nonnan].index)
+        dead |= {c for c in all_family_columns(family_columns)
+                 if c not in roll_panel.columns}
+        if dead:
+            family_columns = {f: [c for c in cols if c not in dead]
+                              for f, cols in family_columns.items()}
+            logging.info(
+                f"roll {roll.roll_id}: {len(dead)} features dropped for "
+                f"coverage <= {min_nonnan} this window "
+                f"({', '.join(sorted(dead)[:6])}{'...' if len(dead) > 6 else ''})")
     allowed_cols = all_family_columns(family_columns)
     diagnostics = build_diagnostics(train, family_columns, diag_tcol,
                                     diag_lag, cfg)

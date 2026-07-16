@@ -15,12 +15,12 @@ OOS month exists only as the promotion's valid_from date):
      select window. The reward's alpha term is the candidate's
      PER-BET RETURN (not rank IC), CAPTURE-WEIGHTED (x 1/(1 + phi/kappa)), so
      persistent signals outscore equally-strong fast ones.
-  3. PROMOTE the top book_size survivors by POOLED select evidence (this
-     roll's held-out month + every prior month the candidate was measured
-     on, sign-aligned to the current direction), subject to sanity floors
-     (directed t > 0, sign agreement, capture, turnover, orthogonality).
-     Rank + K slots + floors - no significance gates; the walk-forward is
-     the judge.
+  3. CHOOSE: four filters on each formula's 5-month test verdict (net
+     positive in its committed direction; enough active days; pays for
+     itself after its own trading cost and holdable at the book's fill
+     rate; not a duplicate), then promote the BEST QUINTILE of the passers
+     (book_frac, bounded). No significance gates, no fixed counts; the
+     walk-forward is the judge.
   4. roll forward. Output: the promotions table, consumed by the
      walk-forward via research/lib/discovered.py.
 
@@ -204,7 +204,10 @@ def main():
     usage_rows = []
     seeds = []         # previous roll's survivors, re-tested each new roll
 
-    for roll in rolls:
+    from tqdm.auto import tqdm
+    # Outer progress over the whole run: rolls done / total, elapsed, ETA
+    # (the inner per-roll bars track generations/scoring within a roll).
+    for roll in tqdm(rolls, desc='rolls', unit='roll'):
         print(f"\n=== roll {roll.roll_id}: "
               f"train {roll.train_start.date()}..{roll.select_start.date()} "
               f"| select ..{roll.oos_start.date()} "
@@ -271,33 +274,21 @@ def main():
                 'capture': float(p.get('capture', 0) or 0),
                 'turnover': float(p.get('turnover', float('nan'))),
                 'candidate_json': c.to_json(),
-                # This roll's select t at the evidence lag, plus the POOLED
-                # directed evidence across every select month the candidate
-                # was measured on (the promotion currency).
+                # The verdict: this roll's 5-month test at the promoted lag,
+                # plus the economics (per-bar profit minus per-bar cost).
                 'select_alpha_tstat': p.get('select_alpha_tstat',
                                             p['metrics_select']['alpha_tstat']),
-                'pooled_select_tstat': float(p.get('pooled_select_tstat',
-                                                   float('nan'))),
-                'pooled_select_months': int(p.get('pooled_select_months', 1)),
-                'pooled_sign_frac': float(p.get('pooled_sign_frac',
-                                                float('nan'))),
-                # The ranking currency: shrunk expected annualized Sharpe,
-                # and the slot score (posterior Sharpe x capture).
-                'posterior_sharpe': float(p.get('posterior_sharpe',
-                                                float('nan'))),
-                'promotion_score': float(p.get('promotion_score',
-                                               float('nan'))),
+                'test_days': int(p.get('test_days', 0) or 0),
+                'econ_margin': float(p.get('econ_margin', float('nan'))),
                 'reward': p['reward'],
                 'n_trials_at_promotion': p['n_trials_at_promotion'],
                 **stamp,
             })
             print(f"  + {c.name} ({c.family}) "
-                  f"posterior SR={roll_promo_rows[-1]['posterior_sharpe']:.2f} "
-                  f"(pooled $t={roll_promo_rows[-1]['pooled_select_tstat']:.2f} "
-                  f"over {roll_promo_rows[-1]['pooled_select_months']}mo, "
-                  f"this roll t={roll_promo_rows[-1]['select_alpha_tstat']:.2f}) "
+                  f"test $t={roll_promo_rows[-1]['select_alpha_tstat']:.2f} "
+                  f"over {roll_promo_rows[-1]['test_days']}d "
                   f"@ lag {p.get('select_lag', p.get('target_lag'))} "
-                  f"half-life {p.get('half_life_bars', 0):,.0f} bars "
+                  f"margin {roll_promo_rows[-1]['econ_margin'] * 1e4:.2f}bp/bar "
                   f"(capture {p.get('capture', 0):.2f}, "
                   f"turnover {p.get('turnover', float('nan')):.3f}/bar)")
         promo_rows.extend(roll_promo_rows)
