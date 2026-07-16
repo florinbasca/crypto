@@ -757,7 +757,6 @@ class WalkForwardPortfolio:
         smooth_alpha = gp_trade_rate(PORT['cost_bps'], gp,
                                      PORT['weight_smoothing_halflife'])
         cov_window = pd.Timedelta(days=PORT['cov_window_days'])
-        vol_window = pd.Timedelta(days=PORT['residual_vol_window_days'])
         impl_lag = int(WF.get('implementation_lag_bars', 1))
         # Survivorship sensitivity gate (walk_forward.min_listing_age_days):
         # names whose first data bar is younger than this at the test day are
@@ -971,9 +970,6 @@ class WalkForwardPortfolio:
                     old_enough = fb.notna() & (fb <= day - min_age)
                     cov_assets = cov_assets[old_enough.to_numpy()]
                 betas = self.ctx.betas_for_day(day)
-                vol_hist = self.ctx.res_wide[(self.ctx.res_wide.index < day) &
-                                             (self.ctx.res_wide.index >= day - vol_window)]
-                sigma = vol_hist.std()
                 # Trailing per-name ADV ($ volume) -> liquidity multipliers.
                 # Strictly-past window (< day), so the multipliers are causal.
                 if liq_on:
@@ -1014,13 +1010,25 @@ class WalkForwardPortfolio:
                 got_signal = False
                 for h, score in held_scores.items():
                     z = score.reindex(assets)
-                    if z.notna().sum() < PORT['min_assets']:
+                    # Signal breadth, not universe size: a bucket needs only
+                    # as many scored names as discovery measured it on - the
+                    # full investable set (>= min_assets) provides the hedge.
+                    if z.notna().sum() < PORT.get('min_signal_assets',
+                                                  PORT['min_assets']):
                         continue
                     zf = z.fillna(0.0)
-                    sig_z = sigma.reindex(assets) * zf
-                    alpha = alpha.add(ic_scale[h] * sig_z, fill_value=0.0)
+                    # bucket_ic is a RETURN (the gross-1 demeaned-z book's
+                    # per-bet a0 from the response curve), NOT a correlation,
+                    # so per-name expected return is c * z_i with the book
+                    # identity A = c * (sum z^2 / sum |z|) = c / E|z| per
+                    # bet: c = per-bar alpha * E|N(0,1)| = * sqrt(2/pi).
+                    # The old Grinold sigma_i * z_i form belongs to IC
+                    # (correlation) units - applied to a return it shrank
+                    # every alpha ~sigma (300x) and the MVO sized nothing.
+                    exp_r = zf * float(np.sqrt(2.0 / np.pi))
+                    alpha = alpha.add(ic_scale[h] * exp_r, fill_value=0.0)
                     alpha_h = alpha_h.add(
-                        ic_scale_raw[h] * sig_z * hold_bars[h],
+                        ic_scale_raw[h] * exp_r * hold_bars[h],
                         fill_value=0.0)
                     got_signal = True
                 if not got_signal or alpha.abs().sum() < 1e-15:

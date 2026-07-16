@@ -58,8 +58,13 @@ def test_cfg():
         'residual_shape': ['res_'],
         'volatility_regime': ['vol_'],
     }
+    # max_survivors_per_column off: the synthetic panel has ONE planted
+    # feature, so every real candidate must use res_zscore and the
+    # idea-concentration cap would squeeze the pool to nothing. The cap
+    # itself is unit-checked in section 5e.
     cfg['search'].update({'seed': 7, 'n_generations': 2, 'batch_size': 8,
-                          'survivors': 6, 'diversity_max_corr': 0.9})
+                          'survivors': 6, 'diversity_max_corr': 0.9,
+                          'max_survivors_per_column': 0})
     # min_select_days 0: the synthetic select window is only ~6 days long.
     # min_capture 0: a single-lag test grid fits every half-life to the
     # shortest grid value, which the production capture floor would block.
@@ -711,6 +716,44 @@ check("select_survivors: output-correlated clone dropped, best reward wins",
       _A.hash in kept_hashes and _C.hash not in kept_hashes
       and _D.hash in kept_hashes)
 
+# candidate_columns: expression AND gate columns are collected
+_G = gen.Candidate('g', 'f', ('mul', ('col', 'res_zscore'),
+                              ('cs_rank', ('col', 'res_mom'))),
+                   conditions=(('abs_gt', ('col', 'vol_ratio'), 1.0),))
+check("columns: expression + gate columns collected",
+      gen.candidate_columns(_G) == {'res_zscore', 'res_mom', 'vol_ratio'})
+
+# per-column survivor cap: three UNCORRELATED formulas leaning on the same
+# column are one idea in different costumes - with the cap at 2 the third
+# is skipped and a different-column candidate takes the slot.
+_E1 = gen.Candidate('e1', 'f', ('cs_rank', ('col', 'res_zscore')))
+_E2 = gen.Candidate('e2', 'f', ('square', ('col', 'res_zscore')))
+_E3 = gen.Candidate('e3', 'f', ('tanh', ('col', 'res_zscore')))
+_E4 = gen.Candidate('e4', 'f', ('cs_rank', ('col', 'res_mom')))
+pop_cap = [{'candidate': c, 'reward': rw,
+            'signal_train': _sig_panel(rng_s.normal(size=120))}
+           for c, rw in [(_E1, 4.0), (_E2, 3.0), (_E3, 2.0), (_E4, 1.0)]]
+kept_cap = {s['candidate'].hash for s in
+            search_mod.select_survivors(pop_cap, 3, 0.8, max_per_column=2)}
+check("column cap: third same-column formula skipped, new idea kept",
+      kept_cap == {_E1.hash, _E2.hash, _E4.hash})
+check("column cap: 0 disables (back-compat)",
+      len(search_mod.select_survivors(pop_cap, 4, 0.8, max_per_column=0))
+      == 4)
+
+# within-train thirds consistency: profit spread across the window passes
+# (either sign); a one-burst fit (all profit in the first third) fails;
+# unmeasurable input fails open.
+_steady = np.tile([0.002, 0.001, 0.003], 30)
+_burst = np.concatenate([np.full(30, 0.02), np.full(60, -0.001)])
+check("thirds: whole-window edge passes, one-burst fit fails",
+      search_mod.thirds_sign_consistent(_steady)
+      and search_mod.thirds_sign_consistent(-_steady)
+      and not search_mod.thirds_sign_consistent(_burst))
+check("thirds: unmeasurable input fails open",
+      search_mod.thirds_sign_consistent([])
+      and search_mod.thirds_sign_consistent([0.1, np.nan]))
+
 # ---------------------------------------------------------------------------
 # 6. Proposer providers + cost tracking (no API calls: clients are lazy)
 # ---------------------------------------------------------------------------
@@ -743,13 +786,17 @@ _payload = _json.loads(_pp._prompt(
     {'residual_shape': ['res_zscore']},
     parent_scores={_pa.hash: {'reward': 2.1, 'alpha_tstat': 4.3, 'half_life_bars': 288},
                    _pb.hash: {'reward': 0.1, 'alpha_tstat': 0.4, 'half_life_bars': 6}},
-    failures=[{'expression': ['col', 'res_mom'], 'conditions': [], 'reward': -0.5}]))
+    failures=[{'expression': ['col', 'res_mom'], 'conditions': [], 'reward': -0.5}],
+    overused_columns=['un_next_pct', 'un_days_to_next']))
 check("prompt: parents carry scores, ranked best-first",
       _payload['current_parents'][0]['score']['reward'] == 2.1
       and _payload['current_parents'][1]['score']['reward'] == 0.1)
 check("prompt: failure memory reaches avoid_these",
       _payload['avoid_these'] == [{'expression': ['col', 'res_mom'],
                                    'conditions': [], 'reward': -0.5}])
+check("prompt: over-used columns reach the idea-concentration hint",
+      _payload['overused_columns'] == ['un_next_pct', 'un_days_to_next']
+      and 'overused_columns' in _payload['notes'])
 check("prompt: columns carry descriptions (data dictionary)",
       _payload['columns'].get('res_zscore', '') != '')
 

@@ -44,7 +44,8 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from config import BARS_PER_DAY, get
 from research.signals.data import (Roll, purge_bars, slice_window,
                                          target_col)
-from research.signals.generation import (_to_list, candidate_subtrees,
+from research.signals.generation import (_to_list, candidate_columns,
+                                               candidate_subtrees,
                                                Candidate, Proposer,
                                                ValidationError,
                                                compile_candidate,
@@ -299,6 +300,24 @@ def fit_response_curve(A: np.ndarray, n_eff: float,
 
 # Candidate alpha half-lives (bars) for the deterministic grid fit above.
 HALF_LIFE_GRID = [3, 6, 12, 24, 48, 96, 144, 288, 432, 720, 1008, 2016]
+
+
+def thirds_sign_consistent(per_entry_vals) -> bool:
+    """Whole-window robustness (train-only, no test contact): split the
+    chronological per-entry outcomes at the curve's peak into thirds and
+    require every third's mean to carry the SAME sign. A formula whose
+    entire train profit is one burst (train t 17, test ~0 - the classic
+    overfit shape) fails; a formula that worked across the whole window
+    passes with either sign (the direction flip handles which). Fails OPEN
+    on unmeasurable input - never block on a missing diagnostic."""
+    vals = np.asarray(per_entry_vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) < 3:
+        return True
+    means = [float(t.mean()) for t in np.array_split(vals, 3) if len(t)]
+    if len(means) < 3:
+        return True
+    return all(m > 0 for m in means) or all(m < 0 for m in means)
 
 
 def signal_correlation(sig_a: pd.DataFrame, sig_b: pd.DataFrame) -> float:
@@ -561,22 +580,35 @@ def allocate_batch(bandit: Dict[str, dict], families: List[str],
     return alloc
 
 
-def select_survivors(population: List[dict], k: int,
-                     max_corr: float) -> List[dict]:
+def select_survivors(population: List[dict], k: int, max_corr: float,
+                     max_per_column: int = 0) -> List[dict]:
     """Best-first greedy de-duplication: keep the highest-reward candidates
     whose OUTPUT (train signal correlation) stays <= max_corr vs every
     already-kept one. What a signal outputs is what the book trades - two
     builds that rank the coins the same way are one signal. Train only -
-    select stays unseen until promotion."""
+    select stays unseen until promotion.
+
+    max_per_column (0 = off): at most this many survivors may lean on the
+    same feature column (expression or gate). Gated variants of one idea
+    fire on different days, so their outputs decorrelate and slip past the
+    correlation guard - but they are still one mechanism, and a survivor
+    pool of unlock-signals-in-different-costumes fakes diversity."""
+    from collections import Counter
     ranked = sorted(population, key=lambda s: -s['reward'])
     kept: List[dict] = []
+    col_counts: "Counter" = Counter()
     for cand in ranked:
         if len(kept) >= k:
             break
+        cols = candidate_columns(cand['candidate'])
+        if max_per_column and any(col_counts[c] >= max_per_column
+                                  for c in cols):
+            continue
         if max_signal_correlation(
                 cand['signal_train'],
                 [x['signal_train'] for x in kept]) <= max_corr:
             kept.append(cand)
+            col_counts.update(cols)
     return kept
 
 
@@ -677,9 +709,17 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             return None
         fit = fit_response_curve(rc['A'], rc['n_eff'], rc['per_entry_at'])
         ks = [int(k) for k in (sample_ks or []) if int(k) <= len(rc['A'])]
+        # Whole-window robustness at (nearest sampled k to) the peak; sign-
+        # agnostic, so it survives the direction flip unchanged.
+        consistent = True
+        if rc['per_entry_at']:
+            k_near = min(rc['per_entry_at'],
+                         key=lambda k: abs(k - fit['peak_k']))
+            consistent = thirds_sign_consistent(rc['per_entry_at'][k_near])
         return {**fit, 'entries': rc['entries'],
                 'entry_days': rc['entry_days'],
                 'n_eff': round(float(rc['n_eff']), 2), 'ks': ks,
+                'thirds_consistent': bool(consistent),
                 'A': [round(float(rc['A'][k - 1]), 8) for k in ks]}
 
     def _flip_curve(c: dict) -> dict:
@@ -836,6 +876,9 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         } for s in pop}
 
     n_overused = int(search_cfg.get('overused_subtrees_shown', 6))
+    overused_col_share = float(search_cfg.get('overused_column_share', 0.34))
+    max_per_column = int(search_cfg.get('max_survivors_per_column', 0) or 0)
+    require_thirds = bool(search_cfg.get('train_sign_thirds', True))
     # API proposal calls within a generation are independent (same
     # parents/diagnostics snapshot), so they run CONCURRENTLY - the LLM
     # round-trips are the roll's wall-clock, not the scoring. Sequential for
@@ -846,10 +889,10 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                   if getattr(proposer, 'provider', '') else 1)
 
     def propose_generation(alloc, parents, parent_scores, fail_hint,
-                           overused) -> List:
+                           overused, overused_cols) -> List:
         funded = [f for f in families if alloc[f] > 0]
         kw = dict(parent_scores=parent_scores, failures=fail_hint,
-                  overused=overused)
+                  overused=overused, overused_columns=overused_cols)
         if n_parallel > 1 and len(funded) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(
@@ -884,15 +927,30 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             # Over-mined structural building blocks: tell the LLM to vary away.
             overused = [_to_list(st)
                         for st, _ in subtree_counts.most_common(n_overused)]
+            # Idea-concentration hint: columns a large share of the current
+            # survivor pool already leans on (expression + gates).
+            col_counts = Counter()
+            for s in population:
+                col_counts.update(candidate_columns(s['candidate']))
+            overused_cols = [c for c, cnt in col_counts.most_common()
+                             if cnt / max(len(population), 1)
+                             >= overused_col_share]
             batch = propose_generation(alloc, parents, parent_scores,
-                                       fail_hint, overused)
+                                       fail_hint, overused, overused_cols)
             for _, cand in tqdm(batch, desc='  score', unit='cand',
                                 leave=False):
                 try_candidate(cand, gen)
             pre_cull = population
-            population = select_survivors(population,
+            # Within-train consistency cut (train-only): a formula whose
+            # train profit lived in one burst never enters the survivor
+            # pool - it breeds nothing and promotion never sees it.
+            eligible = ([s for s in population
+                         if s['curve_train'].get('thirds_consistent', True)]
+                        if require_thirds else population)
+            population = select_survivors(eligible,
                                           int(search_cfg['survivors']),
-                                          float(search_cfg['diversity_max_corr']))
+                                          float(search_cfg['diversity_max_corr']),
+                                          max_per_column)
             # Whatever was tried this gen but did not survive is a failure to
             # remember (low reward first is selected at prompt time).
             kept = {s['candidate'].hash for s in population}

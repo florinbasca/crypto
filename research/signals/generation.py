@@ -271,6 +271,26 @@ def candidate_subtrees(cand: Candidate, min_depth: int = 2) -> set:
     return {n for n in nodes if _depth(n) >= min_depth}
 
 
+def candidate_columns(cand: Candidate) -> set:
+    """Every feature column a candidate touches (expression AND gates) -
+    the idea-concentration currency: two formulas leaning on the same
+    column are usually one mechanism in different costumes, even when
+    their outputs decorrelate (gates firing on different days defeat the
+    output-correlation guard)."""
+    def walk(node, out):
+        if isinstance(node, tuple):
+            if len(node) == 2 and node[0] == 'col':
+                out.add(node[1])
+            else:
+                for x in node[1:]:
+                    walk(x, out)
+    out: set = set()
+    walk(cand.expression, out)
+    for cond in cand.conditions:
+        walk(cond[1], out)
+    return out
+
+
 # =============================================================================
 # Validation (boundedness): only allowed columns, ops, windows, and size caps
 # =============================================================================
@@ -485,17 +505,22 @@ class Proposer(ABC):
                 rng: np.random.Generator,
                 parent_scores: Optional[dict] = None,
                 failures: Optional[list] = None,
-                overused: Optional[list] = None) -> list:
+                overused: Optional[list] = None,
+                overused_columns: Optional[list] = None) -> list:
         """Return up to n candidates for one family. Invalid programs are fine
         to return - the harness validates and drops them.
 
-        parent_scores: {candidate_hash: {reward, ic_tstat, half_life_bars}} so
-          an API proposer can see HOW WELL each parent did, not just its form.
+        parent_scores: {candidate_hash: {reward, a0_per_bet, peak_bars,
+          half_life_bars}} so an API proposer can see HOW WELL each parent
+          did, not just its form.
         failures: [{expression, conditions, reward}] of recently-culled
           low-scoring candidates - things to avoid re-proposing.
         overused: over-mined structural building blocks (sub-expressions) to
-          vary away from - the frequent-subtree-avoidance hint. All three are
-          hints for API proposers; the random baseline ignores them."""
+          vary away from - the frequent-subtree-avoidance hint.
+        overused_columns: feature columns a large share of the current
+          survivors already lean on - the idea-concentration hint: propose
+          mechanisms NOT built on these. All four are hints for API
+          proposers; the random baseline ignores them."""
 
     def usage_snapshot(self) -> dict:
         """Cumulative API usage. Zero for non-API proposers; API proposers
@@ -633,9 +658,10 @@ class RandomProposer(Proposer):
                 rng: np.random.Generator,
                 parent_scores: Optional[dict] = None,
                 failures: Optional[list] = None,
-                overused: Optional[list] = None) -> list:
+                overused: Optional[list] = None,
+                overused_columns: Optional[list] = None) -> list:
         # The random baseline mutates the grammar blindly; scores/failures/
-        # overused are hints only an LLM can use.
+        # overused hints are only usable by an LLM.
         cols = list(family_columns.get(family) or [])
         if not cols:
             return []
@@ -715,7 +741,8 @@ class _ApiProposer(Proposer):
             return dict(self.usage)
 
     def _prompt(self, n, family, diagnostics, parents, family_columns,
-                parent_scores=None, failures=None, overused=None) -> str:
+                parent_scores=None, failures=None, overused=None,
+                overused_columns=None) -> str:
         from research.signals.data import describe_column
         # name -> what it measures, so the LLM reasons about the mechanism
         # rather than guessing from the abbreviation.
@@ -759,7 +786,12 @@ class _ApiProposer(Proposer):
                       "them or trivial variants. overused_building_blocks are "
                       "sub-expressions the search has already tried heavily — "
                       "reach for a DIFFERENT structure/mechanism, not another "
-                      "formula built on them."),
+                      "formula built on them. overused_columns are features "
+                      "a large share of the current survivors ALREADY lean "
+                      "on — the survivor pool is saturated with that "
+                      "mechanism, so candidates built on them will be "
+                      "culled as duplicates: propose mechanisms on "
+                      "DIFFERENT columns."),
             'columns': {c: describe_column(c) for c in allowed},
             'other_columns': {c: describe_column(c) for c in all_cols
                               if c not in allowed},
@@ -774,6 +806,7 @@ class _ApiProposer(Proposer):
             'current_parents': parents_scored,
             'avoid_these': (failures or [])[:6],
             'overused_building_blocks': (overused or [])[:8],
+            'overused_columns': (overused_columns or [])[:8],
         }
         return json.dumps(payload, separators=(',', ':'))
 
@@ -788,11 +821,13 @@ class _ApiProposer(Proposer):
                 rng: np.random.Generator,
                 parent_scores: Optional[dict] = None,
                 failures: Optional[list] = None,
-                overused: Optional[list] = None) -> list:
+                overused: Optional[list] = None,
+                overused_columns: Optional[list] = None) -> list:
         n = min(n, int(self.llm_cfg['candidates_per_call']))
         prompt = self._prompt(n, family, diagnostics, parents, family_columns,
                               parent_scores=parent_scores, failures=failures,
-                              overused=overused)
+                              overused=overused,
+                              overused_columns=overused_columns)
         items = None
         last_err = None
         for attempt in (1, 2):   # one retry: truncation/parse flakes are

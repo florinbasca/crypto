@@ -130,12 +130,28 @@ priced rather than capped.
 An evolutionary search collapses toward one idea: once a family scores well the
 LLM keeps proposing variations of it, and you end up with twenty near-copies of
 the same signal. That is no more useful than one, and it fakes a diversified
-book. One guard keeps survivors distinct: **what they output** — two
-survivors' signal values must correlate ≤ `diversity_max_corr`. What a signal
-outputs is what the book trades; two builds that rank the coins the same way
-are one signal. (A structural AST-overlap check used to double this; output
-correlation subsumes what mattered.) The most over-used building blocks each
-roll are still fed back to the LLM as a "vary away from these" hint.
+book. Three guards:
+
+- **Output correlation** (`diversity_max_corr`): two survivors' signal
+  values must correlate ≤ the ceiling. What a signal outputs is what the
+  book trades; two builds that rank the coins the same way are one signal.
+- **Per-column cap** (`max_survivors_per_column`): at most N survivors may
+  lean on the same feature column (expression or gate). Gated variants of
+  one idea fire on *different days*, so their outputs decorrelate and slip
+  past the correlation guard — a real roll's survivor pool was 58%
+  unlock-feature costumes. Same column ≈ same mechanism.
+- **Within-train consistency** (`search.train_sign_thirds`): the
+  candidate's per-entry outcomes at its curve peak, split into
+  chronological thirds of the train window, must carry the same sign in
+  every third. A formula whose whole train profit was one burst (train t
+  10+, test ~0 — the classic overfit shape) never enters the survivor
+  pool. Train-only; the test window is never touched.
+
+The LLM is also steered away from re-mining: each generation's prompt
+carries the most over-used building blocks AND the columns a large share
+of the current survivors already lean on (`overused_columns`,
+`search.overused_column_share`) with a "propose mechanisms NOT built on
+these" instruction.
 
 ## Promotion (CHOOSE)
 
@@ -226,7 +242,8 @@ Train diagnostics only — never returns or the raw panel:
   nonlinearity, regime spread, and thirds-stability of the curve sign (so
   U-shaped/threshold features aren't hidden by a t-stat-only rank).
 - Current survivors with scores (reward, per-bet a0, peak/half-life),
-  best first; recently-culled ones and over-mined subtrees to avoid.
+  best first; recently-culled ones, over-mined subtrees, and the survivor
+  pool's over-used columns to avoid.
 
 It emits DSL JSON; everything it returns is re-validated and re-scored by code.
 The fixed system prompt (role, DSL rules, output format) is `prompt.md`; the

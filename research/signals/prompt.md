@@ -23,7 +23,7 @@ DSL (JSON S-expressions):
   gate: ["where", condition, expr_if_true, expr_if_false]
   condition: ["gt"|"lt"|"abs_gt"|"abs_lt", expression, threshold_number]
 
-You are shown the current best survivors WITH their scores (reward, per-bet edge, peak and half-life in bars) and a list of candidates that already scored poorly. Learn from both: push further in the directions that scored well, drop the ones that scored near zero, and never re-propose anything in avoid_these.
+You are shown the current best survivors WITH their scores (reward, per-bet edge, peak and half-life in bars) and a list of candidates that already scored poorly. Learn from both: push further in the directions that scored well, drop the ones that scored near zero, and never re-propose anything in avoid_these. When overused_columns is non-empty, the survivor pool is already saturated with mechanisms built on those features — candidates leaning on them will be culled as duplicates, so build on DIFFERENT columns.
 
 Respond with ONLY a JSON array of candidate objects:
   {"family": "...", "expression": [...], "conditions": [[...], ...],

@@ -561,6 +561,24 @@ config = {
             # Frequent-subtree avoidance: how many over-mined building blocks to
             # show the LLM each generation (with a 'vary away' instruction).
             'overused_subtrees_shown': 6,
+            # Idea-concentration guards. Gated variants of one idea fire on
+            # different days, so their outputs decorrelate and slip past
+            # diversity_max_corr while still being one mechanism (a real
+            # roll's survivor pool was 58% unlock-feature costumes).
+            # (a) columns used by at least this share of the current
+            #     survivors are sent to the LLM as overused_columns
+            #     ('propose mechanisms NOT built on these');
+            'overused_column_share': 0.34,
+            # (b) at most this many survivors may lean on the same feature
+            #     column (expression or gate). 0 disables.
+            'max_survivors_per_column': 3,
+            # Within-train robustness cut (train-only, never touches test):
+            # split each candidate's per-entry outcomes at its curve peak
+            # into chronological thirds; every third's mean must carry the
+            # same sign or the candidate never enters the survivor pool.
+            # Kills one-burst train fits (train t 10+, test ~0) before they
+            # waste survivor slots. Fails open on unmeasurable input.
+            'train_sign_thirds': True,
             # Coverage floor: reject candidates whose gates leave fewer than
             # this fraction of the train window's days measurable (at their
             # best lag). Sparse event-gated candidates (active ~4 days/month
@@ -582,25 +600,22 @@ config = {
         # select window - hence the hard train/select split. Scales are FIXED
         # constants (not batch-relative) so rewards are comparable across
         # generations, rolls and resumed runs.
-        # TWO terms, deliberately. alpha_tstat is the CAPTURE-WEIGHTED
-        # day-equivalent train t of the PER-BET RETURN (money, not rank IC;
-        # rank IC is a diagnostic only - a signal can order names correctly
-        # while the large moves run against it) at the candidate's best lag:
-        #   t / sqrt(stamps per day)  x  1/(1 + phi/kappa)
-        # (phi = ln2 / effective persistence, kappa = the GP trade rate).
-        # similarity (max train-signal correlation vs the kept survivors)
-        # de-duplicates the pool. Every additional hand-tuned term is a
-        # place the search can silently optimize the wrong thing: the first
-        # LLM run's absolute-units instability term single-handedly culled a
-        # train-t-5.7 (select-t-6.6) candidate at reward -1.9 while smooth
-        # near-zero-alpha candidates survived. Stability pressure now lives
-        # where it is measured honestly - promotion's cross-roll pooling: a
-        # signal that is noisy across months never accumulates pooled t.
-        # The alpha term is the TRAIN curve's net economic rate at its own
-        # optimal holding - the identical formula promotion ranks by and
-        # the book earns, so the search breeds for exactly what gets
-        # judged. Units: return/bar (typical live values 1e-6..1e-5, hence
-        # the scale).
+        # TWO terms, deliberately. net_rate is the TRAIN response curve's
+        # net economic rate at its own optimal holding,
+        #   max over k of (A(k) - roundtrip) / k
+        # - the IDENTICAL formula promotion ranks by and the book earns, so
+        # the search breeds for exactly what gets judged. Money, not rank
+        # IC (a signal can order names correctly while the large moves run
+        # against it). similarity (max train-signal correlation vs the kept
+        # survivors) de-duplicates the pool. Every additional hand-tuned
+        # term is a place the search can silently optimize the wrong thing:
+        # the first LLM run's absolute-units instability term
+        # single-handedly culled a train-t-5.7 (select-t-6.6) candidate at
+        # reward -1.9 while smooth near-zero-alpha candidates survived.
+        # Stability pressure lives where it is measured honestly: the
+        # train_sign_thirds cut and the 5-month held-out verdict.
+        # net_rate units: return/bar (typical live values 1e-6..1e-5,
+        # hence the scale).
         'reward': {
             'weights': {'net_rate': 1.0, 'similarity': -0.5},
             'scales': {'net_rate': 5e-6, 'similarity': 0.5},
@@ -948,6 +963,15 @@ config = {
             'discount_at_realized_rate': True,
         },
         'min_assets': 30,                    # Leaves room for caps + neutrality constraints
+        # Per-bucket SIGNAL breadth floor: how many names must carry a live
+        # score for a horizon bucket's alpha to enter the MVO. Separate from
+        # min_assets (the OPTIMIZATION universe: covariance + betas, where
+        # neutrality is enforced) - a narrow signal (e.g. unlock-gated,
+        # ~10-15 names with calendar data) contributes alpha on its names
+        # while the full universe provides the hedge, so it needs only the
+        # breadth discovery measured it at (min_assets_per_timestamp = 10),
+        # not the optimizer's 30.
+        'min_signal_assets': 10,
         # Soft cluster-exposure penalty: clusters from trailing residual
         # correlations (same window as the covariance, causal). Motivated by
         # the Marchenko-Pastur diagnostic: stable super-MP structure exists
@@ -989,10 +1013,11 @@ config = {
         },
         # No-trade zone ("lazy trading"):
         # a name whose expected residual return OVER ITS HOLDING HORIZON
-        # (per-bar Grinold alpha * horizon bars) is below no_trade_band_mult *
-        # (per-name per-side cost) cannot pay for a round trip, so its alpha is
-        # zeroed (the optimiser won't allocate fresh risk to it). Compared on the
-        # holding horizon, not per-bar, so units match the round-trip cost.
+        # (per-bar alpha from the bucket's per-bet return, * horizon bars)
+        # is below no_trade_band_mult * (per-name per-side cost) cannot pay
+        # for a round trip, so its alpha is zeroed (the optimiser won't
+        # allocate fresh risk to it). Compared on the holding horizon, not
+        # per-bar, so units match the round-trip cost.
         'no_trade_band_mult': 1.0,
         # Cap on the turnover-implied holding period (bars): everywhere the
         # system asks how long a position lives / how long its alpha persists
