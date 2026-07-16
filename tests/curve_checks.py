@@ -73,6 +73,21 @@ check("curve: per-entry outcomes sampled for robustness stats",
       set(rc['per_entry_at']) == {1, H // 4, H // 2, H}
       and len(rc['per_entry_at'][H]) == rc['entries'])
 
+# sample_ks grid: per-entry outcomes follow the log-spaced curve grid, so
+# the median gate judges a SHORT-peak signal near its own peak (regression:
+# the coarse default judged a 1-hour edge at bar 1).
+rc_g = search_mod.response_curve(sig, res_wide, horizon_bars=H,
+                                 entry_stride=6, min_assets=4,
+                                 sample_ks=[1, 2, 3, 6, 12, 24, 48, 999])
+check("curve: sample_ks grid respected, clipped to the horizon",
+      set(rc_g['per_entry_at']) == {1, 2, 3, 6, 12, 24, 48})
+fit_g = search_mod.fit_response_curve(
+    np.concatenate([0.001 * np.arange(1, 7) / 6, np.full(H - 6, 0.001)]),
+    n_eff=25.0, per_entry_at=rc_g['per_entry_at'])
+check("curve: short-peak median judged at a nearby k, not bar 1",
+      min(rc_g['per_entry_at'],
+          key=lambda k: abs(k - fit_g['peak_k'])) >= 3)
+
 # NaN residuals contribute zero (delisting mid-path must not poison)
 res_nan = res_wide.copy()
 res_nan.iloc[100:, 5] = np.nan          # F vanishes

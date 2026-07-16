@@ -616,9 +616,14 @@ config = {
         # near-zero-alpha candidates survived. Stability pressure now lives
         # where it is measured honestly - promotion's cross-roll pooling: a
         # signal that is noisy across months never accumulates pooled t.
+        # The alpha term is the TRAIN curve's net economic rate at its own
+        # optimal holding - the identical formula promotion ranks by and
+        # the book earns, so the search breeds for exactly what gets
+        # judged. Units: return/bar (typical live values 1e-6..1e-5, hence
+        # the scale).
         'reward': {
-            'weights': {'alpha_tstat': 1.0, 'similarity': -0.5},
-            'scales': {'alpha_tstat': 2.0, 'similarity': 0.5},
+            'weights': {'net_rate': 1.0, 'similarity': -0.5},
+            'scales': {'net_rate': 5e-6, 'similarity': 0.5},
         },
         # CHOOSE (the agreed 5+5+1 spec): a formula's verdict is its most
         # recent 5-month test window - per roll, no cross-roll pooling.

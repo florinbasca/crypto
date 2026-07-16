@@ -158,8 +158,9 @@ def main():
     family_columns = _resolve_columns(cfg)
     feature_cols = data_mod.all_family_columns(family_columns)
 
-    print(f"Building the panel ({len(feature_cols)} features + targets "
-          f"{cfg['horizon_lags_bars']} bars)...")
+    print(f"Building the panel ({len(feature_cols)} features; verdicts are "
+          f"{cfg['curve']['horizon_bars']}-bar response curves, one "
+          f"{cfg['target_lag_bars']}b target column for diagnostics)...")
     t0 = time.perf_counter()
     panel = data_mod.build_panel(feature_cols, cfg)
     print(f"Panel ready: {len(panel):,} rows, "

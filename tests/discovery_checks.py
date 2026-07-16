@@ -73,6 +73,11 @@ def test_cfg():
     cfg['promotion'].update({'book_frac': 0.0, 'book_size': 10,
                              'econ_cost_bps': 0.0,
                              'min_select_days': 0, 'min_capture': 0.0})
+    # Small synthetic windows: short curve horizon (also keeps the purge at
+    # the legacy 12 bars the window-discipline checks pin down).
+    cfg['curve'] = {**cfg['curve'], 'horizon_bars': 6,
+                    'entry_stride_bars': 2,
+                    'sample_ks': [1, 2, 3, 6]}
     return cfg
 
 
@@ -473,14 +478,15 @@ if promoted:
 print(f"(end-to-end block: {time.perf_counter() - t0:,.1f}s)")
 
 # ---------------------------------------------------------------------------
-# 5b. Profile (no pinning): each candidate carries its full per-lag IC
-#     profile; best_lag (day-equivalent t, per-bet-fair) lands on the horizon
-#     where the effect actually lives, and the fitted half-life separates
-#     fast from slow alpha.
+# 5b. The response curve finds each effect's true horizon: a fast impulse
+#     peaks early with a short half-life; a slow impulse (alpha arriving at
+#     bar k=20) ramps until ~k and peaks late. No lag menu anywhere.
 # ---------------------------------------------------------------------------
-print("--- 5b. per-lag profile finds each effect's true horizon ---")
+print("--- 5b. response curve finds each effect's true horizon ---")
 CFG_ML = test_cfg()
 CFG_ML['horizon_lags_bars'] = [6, 36]
+CFG_ML['curve'] = {**CFG_ML['curve'], 'horizon_bars': 36,
+                   'sample_ks': [1, 2, 3, 6, 12, 24, 36]}
 CFG_ML['search'] = {**CFG_ML['search'], 'n_generations': 0}  # seeds only
 
 
@@ -525,11 +531,10 @@ pop_fast = search_mod.run_search(
     gen.RandomProposer(dsl_cfg=CFG_ML['dsl'], mutation_prob=0.6),
     led_fast, CFG_ML, seed_candidates=[wn_seed])
 e_fast = next(s for s in pop_fast if s['candidate'].hash == wn_seed.hash)
-check("profile: fast impulse effect -> best per-bet lag 6",
-      e_fast['target_lag'] == 6,
-      f"(chose {e_fast['target_lag']}, t {e_fast['metrics_select']['alpha_tstat']:.1f})")
-check("profile: fast effect -> short fitted half-life",
-      e_fast['half_life_bars'] <= 24,
+check("curve: fast impulse -> curves measured on train and test",
+      e_fast['curve'] is not None and e_fast['curve_train'] is not None)
+check("curve: fast effect -> short fitted half-life",
+      e_fast['half_life_bars'] <= 12,
       f"(half-life {e_fast['half_life_bars']:.0f} bars)")
 
 slow_panel_ml = make_impulse_panel()
@@ -539,28 +544,25 @@ pop_slow = search_mod.run_search(
     gen.RandomProposer(dsl_cfg=CFG_ML['dsl'], mutation_prob=0.6),
     led_slow, CFG_ML, seed_candidates=[wn_seed])
 e_slow = next(s for s in pop_slow if s['candidate'].hash == wn_seed.hash)
-check("profile: slow impulse effect -> best per-bet lag 36",
-      e_slow['target_lag'] == 36,
-      f"(chose {e_slow['target_lag']}, t {e_slow['metrics_select']['alpha_tstat']:.1f})")
-# dollar t is noisier than the old rank-IC t (heavy-tailed returns); on the
-# ~6-day synthetic select window a real planted effect lands around t~1.5-2.
-check("profile: slow effect is real at its lag",
-      e_slow['metrics_select']['alpha_mean'] > 0
-      and e_slow['metrics_select']['alpha_tstat'] > 1.5,
-      f"(select t {e_slow['metrics_select']['alpha_tstat']:.1f})")
-check("profile: slow effect outlives the fast one",
+# The slow effect's alpha only arrives at bar 20: its curve ramps until
+# ~20+ and its peak sits far beyond the fast effect's.
+check("curve: slow impulse peaks late, fast peaks early",
+      e_slow['curve_train']['peak_k'] >= 15
+      and e_fast['curve_train']['peak_k'] < e_slow['curve_train']['peak_k'],
+      f"(fast peak {e_fast['curve_train']['peak_k']}, "
+      f"slow peak {e_slow['curve_train']['peak_k']})")
+check("curve: slow effect is real on its held-out curve",
+      e_slow['curve']['a0'] > 0
+      and e_slow['metrics_select']['alpha_mean'] > 0,
+      f"(test a0 {e_slow['curve']['a0']:.2e})")
+check("curve: slow effect outlives the fast one",
       e_slow['half_life_bars'] > e_fast['half_life_bars'],
       f"(slow {e_slow['half_life_bars']:.0f} vs fast "
       f"{e_fast['half_life_bars']:.0f} bars)")
-check("profile: ledger records best lag + half-life + profile json",
-      set(led_fast.to_frame()['target_lag']) == {6}
-      and set(led_slow.to_frame()['target_lag']) == {36}
-      and led_slow.to_frame()['half_life_bars'].notna().all()
-      and (led_slow.to_frame()['profile_json'].str.len() > 2).all())
-check("profile: BOTH lags scored on train and select",
-      all(set(e['profile_train']) == {6, 36}
-          and set(e['profile_select']) == {6, 36}
-          for e in (e_fast, e_slow)))
+check("curve: ledger records peak + half-life + both curves in the json",
+      led_slow.to_frame()['half_life_bars'].notna().all()
+      and all('curve_train' in pj and '"curve"' in pj
+              for pj in led_slow.to_frame()['profile_json']))
 
 # ---------------------------------------------------------------------------
 # 5b2. Sign-agnostic capture: a strongly NEGATIVE-IC effect must be found
@@ -583,21 +585,28 @@ check("negative effect: train IC positive after the flip too",
       e_neg['metrics_train']['alpha_mean'] > 0)
 
 # ---------------------------------------------------------------------------
-# 5c. Coverage floor: sparse-gated lottery tickets are recorded with the
-#     penalty reward (bandit + failure memory learn) but never survive.
+# 5c. Coverage floor: a feature alive on only ~2 of the train window's 18
+#     days yields a curve with almost no entry days - a lottery ticket
+#     promotion can never accept. It is recorded with the penalty reward
+#     (bandit + failure memory learn) but never enters the population.
+#     (It has thousands of non-NaN VALUES on its live days, so it passes
+#     the upstream per-roll feature filter - this floor is what catches it.)
 # ---------------------------------------------------------------------------
 print("--- 5c. train coverage floor ---")
 cov_cfg = test_cfg()
 cov_cfg['search'] = {**cov_cfg['search'], 'n_generations': 0}
+sparse_panel = planted_panel.copy()
+sparse_panel['res_sparse'] = sparse_panel['res_zscore'].where(
+    sparse_panel['timestamp'] < pd.Timestamp('2024-01-03'))
+family_cols_cov = data_mod.resolve_family_columns(
+    list(sparse_panel.columns), cov_cfg)
 dense_probe = gen.Candidate(name='dense_probe', family='residual_shape',
                             expression=('col', 'res_zscore'))
 sparse_probe = gen.Candidate(name='sparse_probe', family='residual_shape',
-                             expression=('col', 'res_zscore'),
-                             conditions=(('abs_gt', ('col', 'res_mom'),
-                                          999.0),))
+                             expression=('col', 'res_sparse'))
 led_cov = search_mod.DiscoveryLedger(None)
 pop_cov = search_mod.run_search(
-    planted_panel, ROLL, family_cols,
+    sparse_panel, ROLL, family_cols_cov,
     gen.RandomProposer(dsl_cfg=cov_cfg['dsl'], mutation_prob=0.6),
     led_cov, cov_cfg, seed_candidates=[sparse_probe, dense_probe])
 _cov_hashes = {s['candidate'].hash for s in pop_cov}
@@ -647,28 +656,21 @@ check("persistence weight: closed form, fast crushed, monotone",
       and w_fast < 0.5 * w_slow,
       f"(rate {rate:.4f}/bar: hl 1008 -> {w_slow:.3f}, hl 3 -> {w_fast:.3f})")
 
-# capture-weighted reward: a slow signal outscores an equally-strong fast
-# one; the alpha term is exactly (day-equivalent t) x capture, and the
-# reward has exactly TWO terms (alpha + similarity - anything more is a
-# hand-tuned constant that can silently dominate alpha).
-m_eq = {'alpha_mean': 0.0002, 'alpha_tstat': 5.0, 'alpha_ir': 0.3,
-        'liquid_alpha_ratio': 0.5, 'target_dispersion': 0.01,
-        'n_cross_sections': 100, 'n_days': 20}
-t_fast = search_mod.reward_terms(m_eq, 144, 6, 0.0)
-t_slow = search_mod.reward_terms(m_eq, 144, 288, 0.0)
-check("reward: capture-weighted alpha term (slow beats equally-strong fast)",
-      t_slow['alpha_tstat'] > 2.5 * t_fast['alpha_tstat']
-      and abs(t_slow['alpha_tstat']
-              - 5.0 * search_mod.persistence_weight(288, rate)) < 1e-9,
-      f"(fast {t_fast['alpha_tstat']:.2f} vs slow {t_slow['alpha_tstat']:.2f})")
-check("reward: exactly two terms (alpha_tstat, similarity)",
-      set(t_slow) == {'alpha_tstat', 'similarity'}
-      and set(get('discovery.reward.weights')) == {'alpha_tstat',
-                                                   'similarity'})
-_r_dup, _ = search_mod.compute_reward(m_eq, 144, 288, 1.0)
-_r_new, _ = search_mod.compute_reward(m_eq, 144, 288, 0.0)
-check("reward: similarity to the kept pool lowers the reward",
-      _r_dup < _r_new)
+# net-rate reward: exactly TWO terms (net_rate + similarity - anything more
+# is a hand-tuned constant that can silently dominate alpha); the net rate
+# is the same number promotion ranks by, so a better rate scores higher and
+# similarity to the kept pool lowers the reward.
+t_hi = search_mod.reward_terms(2e-6, 0.0)
+check("reward: exactly two terms (net_rate, similarity)",
+      set(t_hi) == {'net_rate', 'similarity'}
+      and set(get('discovery.reward.weights')) == {'net_rate', 'similarity'})
+_r_hi, _ = search_mod.compute_reward(2e-6, 0.0)
+_r_lo, _ = search_mod.compute_reward(1e-6, 0.0)
+_r_dup, _ = search_mod.compute_reward(2e-6, 1.0)
+check("reward: better net rate scores higher, similarity lowers the reward",
+      _r_hi > _r_lo and _r_dup < _r_hi)
+check("reward: non-finite net rate floored to zero, never NaN",
+      search_mod.reward_terms(float('nan'), 0.0)['net_rate'] == 0.0)
 
 # analytic flip mirrors IC metrics exactly
 m0 = {'alpha_mean': 0.0002, 'alpha_tstat': 3.0, 'alpha_ir': 0.4,

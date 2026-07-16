@@ -78,9 +78,13 @@ def make_rolls(cfg: Optional[dict] = None) -> List[Roll]:
 
 
 def purge_bars(cfg: Optional[dict] = None) -> int:
-    """Bars dropped at the end of TRAIN and SELECT: longest target + embargo."""
+    """Bars dropped at the end of TRAIN and SELECT: the longest forward look
+    (response-curve horizon or legacy target lag) + embargo, so nothing
+    computed inside a window can peek across its boundary."""
     cfg = cfg or get('discovery', {})
-    return int(max(cfg['horizon_lags_bars'])) + int(cfg['embargo_bars'])
+    horizon = int((cfg.get('curve') or {}).get('horizon_bars', 0) or 0)
+    return max(int(max(cfg['horizon_lags_bars'])), horizon) \
+        + int(cfg['embargo_bars'])
 
 
 def resolve_search_lags(cfg: Optional[dict] = None) -> List[int]:
@@ -165,7 +169,6 @@ def build_panel(feature_cols: Sequence[str],
                                            universe_member_mask)
 
     cfg = cfg or get('discovery', {})
-    lags = [int(x) for x in cfg['horizon_lags_bars']]
     start = pd.Timestamp(cfg['start_date'])
     end = pd.Timestamp(cfg['end_date'])
 
@@ -179,7 +182,11 @@ def build_panel(feature_cols: Sequence[str],
     res = res[(res['timestamp'] >= start) & (res['timestamp'] < end)]
     res = res.sort_values(['symbol', 'timestamp']).reset_index(drop=True)
 
-    panel = attach_targets(res, lags)
+    # A single forward target column remains for the proposer diagnostics'
+    # decile/regime views (built here so the whole pipeline shares one
+    # convention); candidate scoring itself uses response curves computed
+    # from residual_return directly - no per-lag target grid.
+    panel = attach_targets(res, [int(cfg['target_lag_bars'])])
 
     features = load_data('features',
                          columns=['timestamp', 'symbol'] + list(feature_cols))
@@ -515,25 +522,35 @@ def book_returns(df: pd.DataFrame, tcol: str, min_assets: int) -> pd.Series:
     return (w * d[tcol]).groupby(d['timestamp']).sum(min_count=1).dropna()
 
 
-def _feature_alpha(df: pd.DataFrame, col: str, tcol: str,
-                   min_assets: int) -> dict:
-    """Per-bet return of the raw column, measured EXACTLY like a candidate:
-    per-stamp z-score + clip +-3 (the compiler pipeline for the identity
-    expression ["col", x]), then demean/gross-1/dot with the target. Same
-    currency as the reward, so the proposer is pointed at what scores."""
-    sub = df[['timestamp', col, tcol]].rename(columns={col: 'signal'}).dropna()
-    if sub.empty:
-        return {'alpha': np.nan, 'tstat': 0.0, 'n': 0}
-    g = sub.groupby('timestamp')['signal']
-    sub['signal'] = ((sub['signal'] - g.transform('mean'))
-                     / (g.transform('std') + 1e-10)).clip(-3, 3)
-    bets = book_returns(sub, tcol, min_assets)
-    if bets.empty:
-        return {'alpha': np.nan, 'tstat': 0.0, 'n': 0}
-    daily = bets.groupby(lambda ts: ts.normalize()).mean()
-    return {'alpha': float(bets.mean()),
-            'tstat': float(_nw_tstat(daily.values, 'auto')),
-            'n': int(len(bets))}
+def _feature_curve(w_vals: np.ndarray, valid_rows: np.ndarray,
+                   r_vals: np.ndarray, entry_mask: np.ndarray,
+                   H: int, stride: int) -> dict:
+    """Day-curve stats of one feature's identity book, restricted to entries
+    where entry_mask holds. w_vals: (bars x symbols) gross-1 demeaned
+    weights (NaN -> 0 already); valid_rows: rows with enough names and a
+    full H-bar path ahead; r_vals: residual matrix aligned to the same
+    rows/columns. Measured EXACTLY like a candidate's verdict - the same
+    currency the reward uses - so the proposer is pointed at what scores.
+    Returns a0 / t / peak / half-life / rev_frac (zeros when no entries)."""
+    from research.signals.search import fit_response_curve
+    rows = np.flatnonzero(valid_rows & entry_mask)[::max(1, stride)]
+    if len(rows) == 0:
+        return {'a0': np.nan, 'tstat': 0.0, 'peak_k': 0,
+                'half_life': None, 'rev_frac': None, 'n': 0}
+    paths = np.empty((len(rows), H))
+    for e, row in enumerate(rows):
+        blk = r_vals[row + 1: row + 1 + H]
+        paths[e] = np.cumsum(blk @ w_vals[row])
+    n_eff = max(1.0, len(rows) * stride / H)
+    fit = fit_response_curve(
+        paths.mean(axis=0), n_eff,
+        per_entry_at={min(H, max(1, fitk)): paths[:, min(H, max(1, fitk)) - 1]
+                      for fitk in (1, H // 4, H // 2, H)})
+    se = fit.get('se_peak')
+    t = (fit['a0'] / se) if se and np.isfinite(se) and se > 0 else 0.0
+    return {'a0': fit['a0'], 'tstat': float(t), 'peak_k': fit['peak_k'],
+            'half_life': fit['half_life'], 'rev_frac': fit['rev_frac'],
+            'n': int(len(rows))}
 
 
 def _binned_curve(df: pd.DataFrame, col: str, tcol: str, n_bins: int) -> list:
@@ -548,29 +565,23 @@ def _binned_curve(df: pd.DataFrame, col: str, tcol: str, n_bins: int) -> list:
     return [round(float(v), 6) for v in curve.reindex(range(n_bins)).values]
 
 
-def _thirds_stability(df: pd.DataFrame, col: str, tcol: str,
-                      min_assets: int) -> int:
-    """How many time-thirds share the pooled alpha sign (0-3)."""
-    stamps = np.sort(df['timestamp'].unique())
-    if len(stamps) < 9:
-        return 0
-    parts = np.array_split(stamps, 3)
-    signs = []
-    for part in parts:
-        sub = df[df['timestamp'].isin(part)]
-        signs.append(np.sign(
-            _feature_alpha(sub, col, tcol, min_assets)['alpha']))
-    pooled = np.sign(_feature_alpha(df, col, tcol, min_assets)['alpha'])
-    return int(sum(1 for s in signs if s == pooled and s != 0))
-
-
 def build_diagnostics(train_panel: pd.DataFrame,
                       family_columns: Dict[str, list],
                       tcol: str, lag_bars: int,
                       cfg: Optional[dict] = None) -> dict:
-    """Compressed per-feature diagnostics on the TRAIN window."""
+    """Compressed per-feature diagnostics on the TRAIN window.
+
+    Each feature's performance is a DAY CURVE - the identity book's
+    bar-by-bar cumulative response (a0 at peak, its t, peak bar, half-life,
+    reversal) - the same instrument candidates are rewarded and judged on.
+    The decile view keeps the single tcol target (a nonlinearity detector
+    needs one fixed horizon to bin against)."""
     cfg = cfg or get('discovery', {})
     diag_cfg = cfg['diagnostics']
+    curve_cfg = cfg.get('curve') or {}
+    H = int(curve_cfg.get('horizon_bars', 144) or 144)
+    # Diagnostics can afford a coarser entry grid than candidate scoring.
+    stride = max(int(curve_cfg.get('entry_stride_bars', 6) or 6) * 2, 12)
     min_assets = int(cfg['min_assets_per_timestamp'])
     n_bins = int(diag_cfg['n_bins'])
     top_k = int(diag_cfg['top_per_family'])
@@ -580,35 +591,81 @@ def build_diagnostics(train_panel: pd.DataFrame,
     stamps = strided_stamps(train_panel['timestamp'], lag_bars)
     df = train_panel[train_panel['timestamp'].isin(stamps)]
 
+    # Shared matrices for the feature curves: residuals wide, plus per-
+    # regime entry masks (a regime splits ENTRY TIMES, not rows - the curve
+    # then answers "how does this feature respond when entered during
+    # high/low regime bars").
+    r_wide = train_panel.pivot_table(index='timestamp', columns='symbol',
+                                     values='residual_return',
+                                     aggfunc='first').sort_index()
+    r_vals = np.nan_to_num(r_wide.to_numpy(copy=False))
+    n_rows = len(r_wide.index)
+    third_masks = [np.zeros(n_rows, dtype=bool) for _ in range(3)]
+    for i, part in enumerate(np.array_split(np.arange(n_rows), 3)):
+        third_masks[i][part] = True
+    regime_masks = {}
+    for rc in regime_cols:
+        per_bar = train_panel.groupby('timestamp')[rc].median()
+        per_bar = per_bar.reindex(r_wide.index)
+        med = per_bar.median()
+        hi = (per_bar >= med).fillna(False).to_numpy()
+        regime_masks[rc] = {'high': hi, 'low': ~hi & per_bar.notna().values}
+    all_mask = np.ones(n_rows, dtype=bool)
+
     features: Dict[str, dict] = {}
     for family, cols in family_columns.items():
         for col in cols:
             if col not in df.columns or col in features:
                 continue
-            base = _feature_alpha(df, col, tcol, min_assets)
+            # identity-candidate weights: per-bar z-score clip +-3, demean,
+            # gross 1 (exactly the compiler pipeline for ["col", x])
+            wv = train_panel.pivot_table(index='timestamp', columns='symbol',
+                                         values=col, aggfunc='first')
+            wv = wv.reindex(index=r_wide.index, columns=r_wide.columns)
+            z = wv.sub(wv.mean(axis=1), axis=0).div(
+                wv.std(axis=1).replace(0, np.nan) + 1e-10, axis=0)
+            z = z.clip(-3, 3)
+            z = z.sub(z.mean(axis=1), axis=0)
+            gross = z.abs().sum(axis=1)
+            z = z.div(gross.where(gross > 0), axis=0)
+            n_names = z.notna().sum(axis=1).to_numpy()
+            w_vals = np.nan_to_num(z.to_numpy(copy=False))
+            valid = np.zeros(n_rows, dtype=bool)
+            valid[:max(0, n_rows - H)] = True
+            valid &= n_names >= min_assets
+
+            base = _feature_curve(w_vals, valid, r_vals, all_mask, H, stride)
+            signs = [np.sign(_feature_curve(w_vals, valid, r_vals, m, H,
+                                            stride * 2)['a0'] or 0)
+                     for m in third_masks]
+            pooled_sign = np.sign(base['a0'] or 0)
             entry = {
                 'family': family,
                 'desc': describe_column(col),
-                'alpha_per_bet': (round(base['alpha'], 6)
-                                  if np.isfinite(base['alpha']) else None),
-                'alpha_tstat': round(base['tstat'], 2),
+                'a0_per_bet': (round(base['a0'], 6)
+                               if np.isfinite(base['a0']) else None),
+                'a0_tstat': round(base['tstat'], 2),
+                'peak_bars': int(base['peak_k']),
+                'half_life_bars': base['half_life'],
+                'rev_frac': (round(base['rev_frac'], 2)
+                             if base['rev_frac'] is not None else None),
                 'binned_fwd': _binned_curve(df, col, tcol, n_bins),
-                'stable_thirds': _thirds_stability(df, col, tcol, min_assets),
-                'regime_alpha': {},
+                'stable_thirds': int(sum(1 for s in signs
+                                         if s == pooled_sign and s != 0)),
+                'regime_a0': {},
             }
             for rc in regime_cols:
                 if rc == col:
                     continue
-                med = df.groupby('timestamp')[rc].transform('median')
-                hi = _feature_alpha(df[df[rc] >= med], col, tcol,
-                                    max(3, min_assets // 2))
-                lo = _feature_alpha(df[df[rc] < med], col, tcol,
-                                    max(3, min_assets // 2))
-                entry['regime_alpha'][rc] = {
-                    'high': (round(hi['alpha'], 6)
-                             if np.isfinite(hi['alpha']) else None),
-                    'low': (round(lo['alpha'], 6)
-                            if np.isfinite(lo['alpha']) else None),
+                hi = _feature_curve(w_vals, valid, r_vals,
+                                    regime_masks[rc]['high'], H, stride * 2)
+                lo = _feature_curve(w_vals, valid, r_vals,
+                                    regime_masks[rc]['low'], H, stride * 2)
+                entry['regime_a0'][rc] = {
+                    'high': (round(hi['a0'], 6)
+                             if np.isfinite(hi['a0']) else None),
+                    'low': (round(lo['a0'], 6)
+                            if np.isfinite(lo['a0']) else None),
                 }
             features[col] = entry
 
@@ -629,10 +686,10 @@ def build_diagnostics(train_panel: pd.DataFrame,
             top[family] = []
             continue
         comps = {
-            'monotonic': {c: abs(features[c]['alpha_tstat']) for c in fam},
+            'monotonic': {c: abs(features[c]['a0_tstat']) for c in fam},
             'nonlinear': {c: _decile_nonlinearity(features[c]['binned_fwd'])
                           for c in fam},
-            'regime': {c: _regime_spread(features[c]['regime_alpha']) for c in fam},
+            'regime': {c: _regime_spread(features[c]['regime_a0']) for c in fam},
             'stability': {c: float(features[c]['stable_thirds']) for c in fam},
         }
         score = {c: 0.0 for c in fam}

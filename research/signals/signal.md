@@ -34,7 +34,7 @@ z-scores, and clips to ±3 (the demean is what makes each bar sum to ~0). Column
 A **roll** is one train/select window pair. Per roll, for 16 generations:
 
 1. The LLM proposes a batch of 32 candidates, its slots split across families by the rule below.
-2. Each candidate is compiled and scored on train by its **per-bet return** (see Reward)
+2. Each candidate is compiled and scored on train by its **response curve's net economic rate** (see Reward)
 3. The best-by-reward survivors are kept, de-duplicated, and seed the next generation.
 
 The 32 slots are split across families by an upper-confidence-bound rule: a family's priority = its mean reward so far + an exploration bonus that decays as it is tried, so more of the batch goes to families that keep producing high-reward candidates, without starving untried ones.
@@ -54,17 +54,20 @@ Two windows per roll, advancing one month at a time (5 + 5 + 1):
 - **Test**: held out. A formula's verdict is its most recent 5-month test
   window — one verdict per formula per roll, **no cross-roll pooling**: the
   long window IS the evidence. New formulas wait for their window to fill.
-- **The verdict instrument is the response curve** (`discovery.curve`): the
-  gross-1 book's cumulative return tracked bar-by-bar for 144 bars after
-  entry, averaged over entries every 6 bars of the test window, then fitted
-  (deterministically) to: **a0** (edge at the curve's peak), **half-life**
-  (real decay — kills the saturated 4-point artifact), **peak_k** (where
-  the response tops out; beyond it the alpha actively reverses) and
-  **rev_frac** (how much is given back). A hump-shaped edge is positive at
-  every legacy lag yet poison to a slow book — only the curve sees it. The
-  curve never feeds the search reward (train-only) — it is read once, at
-  promotion. Rows without curves (old ledgers) fall back to the 4-lag
-  verdict.
+- **The measurement instrument — everywhere — is the response curve**
+  (`discovery.curve`): the gross-1 book's cumulative return tracked
+  bar-by-bar for 144 bars (one day) after entry, averaged over entries
+  every 6 bars of the window, then fitted (deterministically) to: **a0**
+  (edge at the curve's peak), **half-life** (real decay — kills the
+  saturated 4-point artifact), **peak_k** (where the response tops out;
+  beyond it the alpha actively reverses) and **rev_frac** (how much is
+  given back). A hump-shaped edge is positive at every fixed lag yet
+  poison to a slow book — only the curve sees it. The curve is measured
+  twice per candidate with the same code: on the **train** window (feeds
+  the reward and the direction) and on the **test** window (the verdict,
+  read once at promotion) — train and test are never compared in
+  different units. Rows without curves (old ledgers) fall back to the
+  legacy 4-lag verdict.
 - Windows slide monthly, so every month gets a fresh verdict and a fresh
   OOS month; consecutive test windows overlap 4 of 5 months (each verdict
   is still strictly causal for its own OOS month).
@@ -76,10 +79,13 @@ Two windows per roll, advancing one month at a time (5 + 5 + 1):
 
 ## Reward (train only)
 
-The performance metric is the candidate's **per-bet return** ("alpha"):
-build the dollar-neutral, gross-1 long/short book from the signal's
-cross-section, hold it for the horizon, measure what it returned
-(e.g. +3bps per bet).
+The performance metric is the candidate's **train response curve's net
+economic rate**: `max over k of (A(k) − roundtrip) / k` — the money the
+gross-1 book earns per bar at the curve's own optimal holding, net of a
+round trip. This is the IDENTICAL number promotion ranks by, measured with
+the identical code on the train window, so the search breeds for exactly
+what gets judged (one instrument everywhere; the reward's copy never
+touches the test window).
 **Rank IC is recorded as a diagnostic only and selects nothing**: this
 system's first full run proved a signal can order names correctly for a day
 (rank IC t≈15) while the large moves run against its positions (negative
@@ -89,7 +95,7 @@ returns.
 ```
 reward = Σ wₖ · termₖ / scaleₖ
 
-+ alpha_tstat   capture-weighted, day-equivalent t of the per-bet return
++ net_rate      train curve's net rate at its own optimal holding
 − similarity    max correlation to kept survivors
 ```
 
@@ -102,44 +108,22 @@ Stability pressure now lives where it is measured honestly: the 5-month
 held-out verdict — a noisy formula rarely posts a clean positive verdict
 over ~150 fresh days, and must re-earn one every roll.
 
-Each candidate is scored at every horizon its FAMILY owns
-(`discovery.family_horizon_lags`, intersected with `horizon_lags_bars`:
-1h, 6h, 12h, 1d). Its per-horizon alpha profile (the measured return
-term structure) and fitted half-life carry to promotion. The slow families
-(unlocks, dev activity, listing age) are measured at 1d only, concentrating
-their evidence at one lag. A 3d horizon existed for them and was removed on
-ledger evidence: directed select follow-through at 3d was 23% (worse than a
-coin flip), the slow families measured *better* at 1d, and the long purge
-it forced (max lag + embargo) cost every horizon ~2 days of train and
-select data per window. Multi-day event theses belong to
+There is no lag menu and no per-family horizon list anymore — the curve
+covers every holding from 1 bar to a day and the rate picks the optimum
+itself. The old speed corrections are inherent in the units: the rate is
+money per bar, not a t-stat, so a fast signal gains nothing from placing
+more bets; and the round trip is charged against however few bars the
+signal holds, so a fast edge must clear its costs faster or it scores
+below a slower one. Multi-day event theses still belong to
 `event_study.py`, which pools the full history instead.
 
-A fast signal looks better than it really is, for two separate reasons, so the
-alpha term is corrected for both:
-
-- It places more bets, which inflates its t-stat (~√24× for a 1h vs a 1d signal)
-  with no extra skill. **Day-equivalent** t-stat, `t / √(stamps per day)`,
-  cancels that — it scores skill per bet, not bet count.
-- Even when the skill is real, a fast edge decays before the book can trade into
-  it, so only part of it is capturable. **Capture weight**, `1 / (1 + φ/κ)`,
-  scales the alpha down to the tradable fraction. φ = ln2 / *effective
-  persistence* = min(alpha half-life, position life `1/turnover`) — the alpha
-  and the positions must BOTH live long enough (turnover is per bar, so
-  `1/turnover` is the bars until the signal has fully reshuffled itself).
-  κ = the GP fill rate the walk-forward actually trades at (~0.048/bar;
-  per-name fills are further capped at 10% of trailing volume). At the
-  current κ the 0.5 capture floor binds at churn ≈ 0.07/bar. Duration,
-  not fees.
-
-Cost is never a reward term — a signal's real cost depends on the whole
-book, so it is judged only in the walk-forward.
-
-**Turnover** (mean per-bar book churn, `0.5·Σ|Δw|` on the gross-1 signal;
-0 = positions never change, 1 = replaced every bar) is recorded per candidate
-and enters selection twice: through the capture weight (position life
-`1/turnover` caps effective persistence — the graded gate, binding at
-~0.07/bar) and as a hard fails-open backstop `max_turnover = 0.10`/bar for
-extremes. Never a cost term — cost stays in the walk-forward.
+The roundtrip charge is `curve.roundtrip_mult` × the portfolio layer's
+cost rate — a standardized per-entry toll, not the book's real cost:
+a signal's real cost depends on the whole book, so that is judged only in
+the walk-forward. **Turnover** (mean per-bar book churn, `0.5·Σ|Δw|` on
+the gross-1 signal) is recorded per candidate as a diagnostic; churn
+pressure on selection lives in the same net rate (promotion filter 3),
+priced rather than capped.
 
 ## Diversity
 
@@ -225,22 +209,24 @@ what noise cannot sustain. Supporting choices:
 - **Retention** (`reseed_promoted_rolls`): recently promoted formulas are
   re-seeded even after missing a survivor cut, so book members keep
   receiving fresh verdicts.
-- **Family horizons**: each formula is measured only where its family's
-  alpha can live, so verdicts concentrate instead of spreading across
-  implausible lags.
+- **One instrument**: the reward, the verdict and the feature diagnostics
+  are all the same response curve, so what the search breeds for and what
+  promotion judges cannot silently diverge.
 
 ## What the LLM sees
 
 Train diagnostics only — never returns or the raw panel:
 
 - A one-line description of each column.
-- Per-column per-bet return (alpha) with its t-stat, decile curve,
-  regime-split alpha, stability — the same currency the reward uses.
-- The top columns per family, ranked by a blend of monotonic alpha, decile
-  nonlinearity, regime spread, and stability (so U-shaped/threshold features
-  aren't hidden by a t-stat-only rank).
-- Current survivors with scores, best first; recently-culled ones and over-mined
-  subtrees to avoid.
+- Per-column **day response curve** (the feature itself traded as a gross-1
+  book): per-bet edge a0 with its t-stat, peak and half-life in bars,
+  reversal fraction, regime-split a0 — the same currency the reward uses.
+- A decile curve of forward returns (the nonlinearity check).
+- The top columns per family, ranked by a blend of curve t, decile
+  nonlinearity, regime spread, and thirds-stability of the curve sign (so
+  U-shaped/threshold features aren't hidden by a t-stat-only rank).
+- Current survivors with scores (reward, per-bet a0, peak/half-life),
+  best first; recently-culled ones and over-mined subtrees to avoid.
 
 It emits DSL JSON; everything it returns is re-validated and re-scored by code.
 The fixed system prompt (role, DSL rules, output format) is `prompt.md`; the

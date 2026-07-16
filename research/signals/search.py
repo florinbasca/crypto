@@ -2,28 +2,30 @@
 SEARCH: scoring, reward, the candidate ledger, and the budgeted evolutionary
 loop that decides what gets tried next.
 
-- evaluate_window(): compiled signal + window slice -> IC metrics dict,
-  reusing the production math from research/lib/signal_eval.py (vectorized
-  rank IC, Newey-West HAC t-stat on the daily IC series). Non-overlapping
-  stamps (stride = target lag).
-- compute_reward(): TRAIN-only metrics -> one scalar, TWO terms only
-  (capture-weighted day-equivalent per-bet-alpha t, minus similarity to the
-  kept survivors). The search (reward, survival, breeding, direction) NEVER
-  sees the select window - promotion reads select once per survivor per
-  roll, so a select t-stat is a measurement, not the maximum of a directed
-  search on itself. Scales are FIXED config constants, never batch-relative:
-  the same candidate must earn the same reward regardless of its
-  batch-mates, or rewards stop being comparable across
+- response_curve() / fit_response_curve(): the ONE measurement instrument.
+  A compiled signal + a window's residual matrix -> the gross-1 book's mean
+  cumulative return bar-by-bar over a day (144 bars, entries every 6),
+  fitted deterministically to a0 (edge at the peak), half-life, peak_k and
+  rev_frac. try_candidate measures it TWICE per candidate: on the train
+  window (feeds the reward and the direction) and on the test window (the
+  ledger's verdict, read once at promotion). Same instrument everywhere -
+  train and test are only ever compared in the same units.
+- compute_reward(): TRAIN curve -> one scalar, TWO terms only (net economic
+  rate at the curve's own optimal holding, max_k (A(k)-roundtrip)/k - the
+  identical number promotion ranks by - minus similarity to the kept
+  survivors). The search (reward, survival, breeding, direction) NEVER
+  sees the test window. Scales are FIXED config constants, never
+  batch-relative: the same candidate must earn the same reward regardless
+  of its batch-mates, or rewards stop being comparable across
   generations/rolls/resumes.
-- NO PINNING: each candidate is evaluated at EVERY lag its family owns
-  (family_horizon_lags) on train AND select; the per-lag profile is its
-  alpha term structure. best_lag (day-equivalent t, so fast lags get no
-  mechanical sqrt(stamps) advantage) picks the reward term; the traded
-  SIGN is fitted from the candidate's POOLED train evidence across every
-  roll it was measured in (pooled_train_direction - one 5-month window is
-  wrong ~26% of the time for a Sharpe-1 signal). The WHOLE profile travels
-  to promotion and the portfolio layer, where fit_half_life() turns it
-  into the persistence discount.
+- The traded SIGN is fitted from the candidate's POOLED train-curve a0
+  across every roll it was measured in (pooled_train_direction - one
+  5-month window is wrong ~26% of the time for a Sharpe-1 signal); a
+  negative direction analytically negates the curve (_flip_curve). Both
+  curves travel to promotion in profile_json; the portfolio layer consumes
+  half-life capped at the peak.
+- evaluate_window()/fit_half_life()/day_equivalent_tstat(): legacy per-lag
+  instruments, kept for pre-curve ledger rows and diagnostics only.
 - DiscoveryLedger: one row per (roll, candidate) evaluation - the debug
   surface, the dedup index, and the memory behind the N-consecutive-rolls
   persistence gate.
@@ -308,7 +310,8 @@ def persistence_weight(half_life_bars: float, rate_bar: float) -> float:
 
 def response_curve(sig: pd.DataFrame, res_wide: pd.DataFrame,
                    horizon_bars: int, entry_stride: int,
-                   min_assets: int) -> Optional[dict]:
+                   min_assets: int,
+                   sample_ks: Optional[list] = None) -> Optional[dict]:
     """Mean cumulative response curve of the gross-1 dollar-neutral book.
 
     For each entry stamp t on the grid (every entry_stride bars of sig's
@@ -351,14 +354,19 @@ def response_curve(sig: pd.DataFrame, res_wide: pd.DataFrame,
         paths[e] = np.cumsum(np.nan_to_num(blk) @ we)
 
     entry_ts = w.index[entry_rows]
+    # Per-entry outcomes sampled on the SAME log-spaced grid as the stored
+    # curve, so the median/se are always taken close to the true peak - a
+    # coarse grid judged a 1-hour edge (peak ~bar 6) at bar 1, wrongly.
+    ks = sorted({int(k) for k in
+                 (sample_ks or (1, horizon_bars // 4, horizon_bars // 2,
+                                horizon_bars))
+                 if 1 <= int(k) <= horizon_bars})
     return {
         'A': paths.mean(axis=0),
         'entries': int(len(entry_rows)),
         'entry_days': int(pd.DatetimeIndex(entry_ts).normalize().nunique()),
         'n_eff': max(1.0, len(entry_rows) * entry_stride / horizon_bars),
-        'per_entry_at': {int(k): paths[:, int(k) - 1]
-                         for k in (1, horizon_bars // 4, horizon_bars // 2,
-                                   horizon_bars)},
+        'per_entry_at': {k: paths[:, k - 1] for k in ks},
     }
 
 
@@ -475,44 +483,29 @@ def max_signal_correlation(signal: pd.DataFrame, others: list) -> float:
 # Reward
 # =============================================================================
 
-def reward_terms(train_metrics: dict, best_lag: int, half_life_bars: float,
-                 similarity: float,
-                 turnover: Optional[float] = None) -> dict:
+def reward_terms(net_rate: float, similarity: float) -> dict:
     """The raw (unscaled) reward terms - TRAIN window only. All finite.
 
-    TWO terms. alpha_tstat is the CAPTURE-WEIGHTED day-equivalent train t of
-    the candidate's PER-BET RETURN (not rank IC) at its best lag, discounted
-    by the fraction of it a book trading at the portfolio rate can hold long
-    enough to be exposed to (see persistence_weight - duration, never bps).
-    similarity (max train-signal correlation vs the kept survivors)
-    de-duplicates the pool. Anything more is a hand-tuned constant that can
-    silently dominate alpha - the first LLM run's instability term did
-    exactly that; cross-month consistency is now priced at promotion, where
-    it is measured on held-out data instead of modeled on train."""
+    TWO terms. net_rate is the TRAIN response curve's net economic rate at
+    its own optimal holding - max_k (A(k) - roundtrip)/k - the IDENTICAL
+    number promotion ranks by and the book earns, so the search breeds for
+    exactly what gets judged (one instrument everywhere; the reward's copy
+    is computed on the train window only). similarity (max train-signal
+    correlation vs the kept survivors) de-duplicates the pool."""
     def _f(x, default=0.0):
         return float(x) if x is not None and np.isfinite(x) else default
 
-    # Capture prices the persistence the book can actually monetize:
-    # min(alpha half-life, position life lag/turnover) at the GP fill rate.
-    p_eff = effective_persistence_bars(half_life_bars, best_lag, turnover)
-    capture = persistence_weight(p_eff, trade_rate_per_bar())
-    return {
-        'alpha_tstat': day_equivalent_tstat(train_metrics, best_lag) * capture,
-        'similarity': _f(similarity),
-    }
+    return {'net_rate': _f(net_rate), 'similarity': _f(similarity)}
 
 
-def compute_reward(train_metrics: dict, best_lag: int, half_life_bars: float,
-                   similarity: float,
-                   reward_cfg: Optional[dict] = None,
-                   turnover: Optional[float] = None) -> tuple:
+def compute_reward(net_rate: float, similarity: float,
+                   reward_cfg: Optional[dict] = None) -> tuple:
     """reward = sum_k weight_k * term_k / scale_k. TRAIN window only, fixed
     scales from config. Returns (reward, terms)."""
     cfg = reward_cfg or get('discovery.reward', {})
     weights = cfg['weights']
     scales = cfg['scales']
-    terms = reward_terms(train_metrics, best_lag, half_life_bars,
-                         similarity, turnover=turnover)
+    terms = reward_terms(net_rate, similarity)
     total = 0.0
     for key, w in weights.items():
         total += float(w) * terms[key] / float(scales[key])
@@ -652,14 +645,15 @@ class DiscoveryLedger:
             rid -= 1
         return count
 
-    def train_history(self, cand_hash: str, lag: int,
+    def train_history(self, cand_hash: str, lag: Optional[int] = None,
                       up_to_roll: Optional[int] = None) -> List[dict]:
-        """RAW-SIGN train measurements of cand_hash at `lag`, one per roll it
-        was evaluated in. Stored profiles are directed by that roll's fitted
-        direction, so entries are un-flipped here. Feeds
-        pooled_train_direction: the traded sign is fitted from EVERY train
-        window the candidate was ever measured on - train-only, so the
-        select window stays unspent."""
+        """RAW-SIGN train measurements of cand_hash, one per roll it was
+        evaluated in. Preferred source: the stored TRAIN curve (a0 at its
+        peak, its error bar, its entry days); legacy per-lag rows fall back
+        to the train metrics at `lag` (or the row's own best lag). Stored
+        values are directed by that roll's fitted direction, so entries are
+        un-flipped here. Feeds pooled_train_direction - train-only, the
+        test window stays unspent."""
         out = []
         for r in self._rows:
             if r['cand_hash'] != cand_hash:
@@ -670,12 +664,25 @@ class DiscoveryLedger:
             if not isinstance(pj, str) or not pj:
                 continue
             try:
-                m = (json.loads(pj).get(str(int(lag))) or {}).get('train')
+                prof = json.loads(pj)
             except (ValueError, TypeError):
                 continue
+            d = int(r.get('direction', 1) or 1)
+            c = prof.get('curve_train')
+            if c and c.get('a0') is not None:
+                a0 = float(c['a0'])
+                se = c.get('se_peak')
+                t = (a0 / float(se)) if se and np.isfinite(se) and se > 0 \
+                    else 0.0
+                out.append({'roll_id': int(r['roll_id']),
+                            'alpha_mean': d * a0, 'alpha_tstat': d * t,
+                            'n_days': int(c.get('entry_days', 0) or 0)})
+                continue
+            key = str(int(lag)) if lag else str(int(r.get('target_lag')
+                                                    or 0))
+            m = (prof.get(key) or {}).get('train')
             if not m or m.get('alpha_tstat') is None:
                 continue
-            d = int(r.get('direction', 1) or 1)
             out.append({'roll_id': int(r['roll_id']),
                         'alpha_mean': (None if m.get('alpha_mean') is None
                                        else d * float(m['alpha_mean'])),
@@ -760,12 +767,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     cfg = cfg or get('discovery', {})
     search_cfg = cfg['search']
     rng = np.random.default_rng(int(search_cfg['seed']) + roll.roll_id)
-    # NO PINNING: every candidate is evaluated at EVERY lag its FAMILY owns
-    # (family_horizon_lags: slow families at 1d-3d, the rest sub-day-to-1d)
-    # on train and select - the per-lag profile is its alpha term structure.
-    # best_lag (day-equivalent train t) only picks direction and the reward
-    # term. target_lag_bars stays the reference lag for diagnostics only.
-    from research.signals.data import family_lags
+    # target_lag_bars is the reference lag for the binned-forward-return
+    # diagnostic only; every candidate is scored by its response curve.
     diag_lag = int(cfg['target_lag_bars'])
     diag_tcol = target_col(diag_lag)
     min_assets = int(cfg['min_assets_per_timestamp'])
@@ -824,9 +827,65 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     from collections import Counter
     subtree_counts: "Counter" = Counter()
 
+    # Train-side residual matrix ends BEFORE the test window: a train
+    # curve's paths must never read a test bar (the reward would see it).
+    res_wide_train = (res_wide[res_wide.index < roll.select_start]
+                      if res_wide is not None else None)
+    H = int(curve_cfg.get('horizon_bars', 0) or 0)
+    stride = int(curve_cfg.get('entry_stride_bars', 6) or 6)
+    sample_ks = curve_cfg.get('sample_ks')
+    rt_cost = (float(curve_cfg.get('roundtrip_mult', 2.0))
+               * float(get('portfolio.cost_bps')) / 10000.0)
+
+    def _curve_of(sig_part, matrix) -> Optional[dict]:
+        """Compute + fit one response curve; None when the window can't
+        host a full path (callers fall back / reject)."""
+        rc = response_curve(sig_part, matrix, H, stride, min_assets,
+                            sample_ks=sample_ks)
+        if rc is None:
+            return None
+        fit = fit_response_curve(rc['A'], rc['n_eff'], rc['per_entry_at'])
+        ks = [int(k) for k in (sample_ks or []) if int(k) <= len(rc['A'])]
+        return {**fit, 'entries': rc['entries'],
+                'entry_days': rc['entry_days'],
+                'n_eff': round(float(rc['n_eff']), 2), 'ks': ks,
+                'A': [round(float(rc['A'][k - 1]), 8) for k in ks]}
+
+    def _flip_curve(c: dict) -> dict:
+        """A negated signal's curve is exactly the negated curve (the book
+        return is linear in the weights)."""
+        out = dict(c)
+        out['A'] = [None if a is None else -a for a in c['A']]
+        # the flipped curve's peak is the old trough; refit on the flipped
+        # sampled path is overkill - flip a0/median and re-locate the peak
+        # from the flipped samples (deterministic, coarse but honest).
+        flipped = [(-a if a is not None else -np.inf) for a in c['A']]
+        j = int(np.argmax(flipped))
+        out['a0'] = float(flipped[j])
+        out['peak_k'] = int(c['ks'][j]) if c.get('ks') else c.get('peak_k')
+        for key in ('median_peak',):
+            if c.get(key) is not None and np.isfinite(c[key]):
+                out[key] = -c[key]
+        a_end = flipped[-1] if flipped else 0.0
+        out['rev_frac'] = (float(1.0 - a_end / out['a0'])
+                           if out['a0'] > 0 else 0.0)
+        return out
+
+    def _curve_metrics(c: Optional[dict]) -> dict:
+        """Flat ledger columns from a curve (keeps select_*/train_* column
+        names meaningful): mean = a0, t = a0/se, n_days = entry days."""
+        if not c:
+            return empty_metrics()
+        se = c.get('se_peak')
+        t = (c['a0'] / se) if se and np.isfinite(se) and se > 0 else 0.0
+        return {'alpha_mean': c['a0'], 'alpha_tstat': t,
+                'n_days': c.get('entry_days', 0)}
+
     def try_candidate(cand, gen: int) -> None:
-        """Validate, compile, evaluate the FULL train+select profile, reward
-        on train only, record."""
+        """Validate, compile, measure the TRAIN and TEST response curves,
+        reward on the train curve only, record. One instrument everywhere:
+        the same curve that promotion judges is what the search breeds for
+        (train-side copy - the reward never touches the test window)."""
         if cand.hash in seen:
             return
         seen.add(cand.hash)
@@ -840,27 +899,16 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             return
         subtree_counts.update(candidate_subtrees(cand))
 
-        # Train profile across the family's horizon grid. best_lag by the
-        # DAY-EQUIVALENT t (per-bet-fair: no sqrt(stamps/day) advantage for
-        # fast lags) picks direction and the reward term - nothing else.
-        cand_lags = family_lags(cand.family, cfg)
-        m_train_by_lag = {
-            lag_i: evaluate_window(sig, train, target_col(lag_i), lag_i,
-                                   min_assets)
-            for lag_i in cand_lags
-        }
-        best_lag = max(m_train_by_lag,
-                       key=lambda l: abs(day_equivalent_tstat(
-                           m_train_by_lag[l], l)))
+        sig_train = sig[sig['timestamp'] < roll.select_start]
+        curve_train_raw = _curve_of(sig_train, res_wide_train)
+        if curve_train_raw is None:
+            return
 
-        # Coverage floor: a candidate whose gates leave less than
-        # min_train_coverage of the window's days measurable is a lottery
-        # ticket promotion can never accept (min_select_days) - huge t on a
-        # handful of correlated event days. Record it (ledger visibility;
-        # the penalty reward defunds its family in the bandit and feeds the
-        # LLM's failure memory) but never let it into the population.
-        cov = (max((m.get('n_days') or 0) for m in m_train_by_lag.values())
-               / max(train_days_total, 1))
+        # Coverage floor: gates that leave less than min_train_coverage of
+        # the window's days with entries are lottery tickets promotion can
+        # never accept - record with the penalty reward (bandit defunds the
+        # pattern, failure memory warns the LLM), never into the population.
+        cov = curve_train_raw['entry_days'] / max(train_days_total, 1)
         if min_train_coverage > 0 and cov < min_train_coverage:
             sparse = float(search_cfg['sparse_reward'])
             if cand.family in bandit:
@@ -868,85 +916,55 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                 bandit[cand.family]['sum'] += sparse
             failures.append((cand, sparse))
             ledger.record(roll.roll_id, gen, cand, 1,
-                          m_train_by_lag[best_lag], empty_metrics(),
-                          sparse, {}, target_lag=best_lag)
+                          _curve_metrics(curve_train_raw), empty_metrics(),
+                          sparse, {}, target_lag=curve_train_raw['peak_k'])
             logging.debug(f"{cand.name}: train coverage {cov:.0%} < "
                           f"{min_train_coverage:.0%} - rejected as sparse")
             return
-        # Traded sign: fitted from the candidate's POOLED train evidence -
-        # this window plus every prior roll's raw train measurement at this
-        # lag (train-only; see pooled_train_direction). The flip mirrors the
-        # whole profile (the per-bet return is exactly antisymmetric under
-        # signal negation).
+
+        # Traded sign: pooled train-curve evidence - this window's a0 plus
+        # every prior roll's (train-only; the test is never consulted).
         direction = pooled_train_direction(
-            ledger.train_history(cand.hash, best_lag,
+            ledger.train_history(cand.hash, 0,
                                  up_to_roll=roll.roll_id - 1)
-            + [m_train_by_lag[best_lag]])
+            + [_curve_metrics(curve_train_raw)])
         if direction < 0:
             sig = sig.assign(signal=-sig['signal'])
-            m_train_by_lag = {l: flip_metrics(m)
-                              for l, m in m_train_by_lag.items()}
-        m_train = m_train_by_lag[best_lag]
-
-        # Alpha term structure + half-life from TRAIN (drives the
-        # persistence discount at the portfolio layer).
-        half_life = fit_half_life(alpha_term_structure(m_train_by_lag))
-
-        # Select profile: recorded for promotion to test ONCE - it feeds
-        # nothing in this loop (no reward, no survival, no breeding).
-        m_select_by_lag = {
-            lag_i: evaluate_window(sig, select, target_col(lag_i), lag_i,
-                                   min_assets)
-            for lag_i in cand_lags
-        }
-        m_select = m_select_by_lag[best_lag]
+            sig_train = sig[sig['timestamp'] < roll.select_start]
+            curve_train = _flip_curve(curve_train_raw)
+        else:
+            curve_train = curve_train_raw
         sig_select = sig[sig['timestamp'] >= roll.select_start]
-        sig_train = sig[sig['timestamp'] < roll.select_start]
-        # Standalone tradeability diagnostic (train signal): what fraction of
-        # the book this signal churns per bar. Ledger-only, never a reward or
-        # promotion term - real cost belongs to the walk-forward.
+
+        # Standalone tradeability diagnostic (train signal): per-bar churn.
         turnover = signal_turnover(sig_train)
 
-        # Response curve on the TEST window (the verdict instrument): the
-        # book's bar-by-bar cumulative return after entry, fitted to (a0,
-        # half-life, peak, reversal). Train-side reward/half-life below stay
-        # UNTOUCHED by it - the search must never see the test.
-        curve = None
-        if res_wide is not None:
-            rc = response_curve(sig_select, res_wide,
-                                int(curve_cfg['horizon_bars']),
-                                int(curve_cfg['entry_stride_bars']),
-                                min_assets)
-            if rc is not None:
-                fit = fit_response_curve(rc['A'], rc['n_eff'],
-                                         rc['per_entry_at'])
-                ks = [int(k) for k in curve_cfg['sample_ks']
-                      if int(k) <= len(rc['A'])]
-                curve = {**fit, 'entries': rc['entries'],
-                         'entry_days': rc['entry_days'],
-                         'n_eff': round(float(rc['n_eff']), 2), 'ks': ks,
-                         'A': [round(float(rc['A'][k - 1]), 8) for k in ks]}
+        # TEST curve: the verdict. Feeds nothing in this loop.
+        curve = _curve_of(sig_select, res_wide)
 
+        # Reward = the TRAIN curve's net economic rate at its own optimal
+        # holding (the identical formula promotion ranks by) minus
+        # similarity to the kept pool.
+        rates = [(float(a) - rt_cost) / int(k)
+                 for k, a in zip(curve_train['ks'], curve_train['A'])
+                 if a is not None and int(k) > 0]
+        net_rate = max(rates) if rates else float('-inf')
         similarity = max_signal_correlation(
             sig_train, [s['signal_train'] for s in population])
-        rwd, terms = compute_reward(m_train, best_lag, half_life,
-                                    similarity, cfg['reward'],
-                                    turnover=turnover)
-        profile = {
-            str(l): {'train': {k: (None if v is None or not np.isfinite(v)
-                                   else round(float(v), 8))
-                               for k, v in m_train_by_lag[l].items()},
-                     'select': {k: (None if v is None or not np.isfinite(v)
-                                    else round(float(v), 8))
-                                for k, v in m_select_by_lag[l].items()}}
-            for l in cand_lags
-        }
-        if curve is not None:
-            profile['curve'] = {k: (None if isinstance(v, float)
+        rwd, terms = compute_reward(net_rate, similarity, cfg['reward'])
+
+        half_life = float(curve_train['half_life'])
+        m_train = _curve_metrics(curve_train)
+        m_select = _curve_metrics(curve)
+        profile = {}
+        for key, c in (('curve', curve), ('curve_train', curve_train)):
+            if c is not None:
+                profile[key] = {k: (None if isinstance(v, float)
                                     and not np.isfinite(v) else v)
-                                for k, v in curve.items()}
+                                for k, v in c.items()}
         ledger.record(roll.roll_id, gen, cand, direction,
-                      m_train, m_select, rwd, terms, target_lag=best_lag,
+                      m_train, m_select, rwd, terms,
+                      target_lag=curve_train['peak_k'],
                       profile_json=json.dumps(profile),
                       half_life_bars=half_life, turnover=turnover)
         if cand.family in bandit:
@@ -954,11 +972,10 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             bandit[cand.family]['sum'] += rwd
         population.append({
             'candidate': cand, 'direction': direction,
-            'target_lag': int(best_lag),
-            'half_life_bars': float(half_life),
-            'profile_train': m_train_by_lag,
-            'profile_select': m_select_by_lag,
-            'curve': curve,
+            'target_lag': int(curve_train['peak_k']),
+            'half_life_bars': half_life,
+            'profile_train': {}, 'profile_select': {},
+            'curve': curve, 'curve_train': curve_train,
             'reward': rwd, 'metrics_train': m_train,
             'metrics_select': m_select,
             'turnover': turnover,
@@ -982,8 +999,9 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     def _parent_scores(pop) -> Dict[str, dict]:
         return {s['candidate'].hash: {
             'reward': round(float(s['reward']), 3),
-            'alpha_tstat': round(day_equivalent_tstat(s['metrics_train'],
-                                                      s['target_lag']), 2),
+            'a0_per_bet': round(float(
+                s['metrics_train'].get('alpha_mean', 0.0) or 0.0), 6),
+            'peak_bars': int(s.get('target_lag', 0) or 0),
             'half_life_bars': int(s.get('half_life_bars', 0) or 0),
         } for s in pop}
 
