@@ -405,7 +405,11 @@ config = {
         # signal turnover ~2.5-3x while keeping 75-85% of the IC - so matching
         # smoothing to the holding lag roughly doubles gross-per-turnover
         # exactly where turnover matters. [] disables (single global halflife).
-        'lag_smoothing': [[12, 3], [48, 12], [144, 36], [432, 108]],
+        # 144-bucket raised 36 -> 72 (2026-07-18): promoted signals hold
+        # ~144b but reshuffled every ~73b - the measured 13%/yr cost bleed
+        # exceeded the measured ~8%/yr alpha. Precedent in this table: 3->36
+        # cut signal turnover 2.5-3x keeping 75-85% of IC.
+        'lag_smoothing': [[12, 3], [48, 12], [144, 72], [432, 108]],
         'warmup_days': 10,                          # feature warmup before a test window
         'screening_grid': '1h',                     # IC sampled here (computed at full res)
         'min_assets_per_timestamp': 10,
@@ -482,7 +486,7 @@ config = {
         # load per roll (~30s/candidate).
         'enumeration': {
             'enabled': True,
-            'top_n': 50,
+            'top_n': 150,
             'agg_bars': 6,        # screen on an hourly entry/step grid
             'horizon_steps': 24,  # 24 hourly steps = the 1-day curve
         },
@@ -569,8 +573,12 @@ config = {
         # Evolutionary search (per roll). Budget = n_generations * batch_size.
         'search': {
             'seed': 7,
-            'n_generations': 16,
-            'batch_size': 32,
+            # Breadth x3 (2026-07-18, user): 24 gens x 64 = 1,536 proposals
+            # per roll (~1,000+ scored after dedup) vs the old 512. Scoring
+            # wall-clock scales with it; the negative-train-rate screen
+            # keeps the full-measurement cost on the plausible half.
+            'n_generations': 24,
+            'batch_size': 64,
             # 0 = NO COUNT CAP on the survivor pool: everything passing the
             # dedup guards (output corr, per-column cap, train thirds)
             # survives, breeds and gets a verdict. The book is bounded by
@@ -596,8 +604,10 @@ config = {
             #     ('propose mechanisms NOT built on these');
             'overused_column_share': 0.34,
             # (b) at most this many survivors may lean on the same feature
-            #     column (expression or gate). 0 disables.
-            'max_survivors_per_column': 3,
+            #     column (expression or gate). 0 disables. Raised 3 -> 5
+            #     with the 3x trial budget: more trials need more landing
+            #     slots or they just re-compete for the same pool.
+            'max_survivors_per_column': 5,
             # Within-train robustness cut (train-only, never touches test):
             # split each candidate's per-entry outcomes at its curve peak
             # into chronological thirds; every third's mean must carry the
@@ -663,11 +673,10 @@ config = {
             # verdict to mean anything. (USER KNOB)
             'min_select_days': 20,
             # Filter 3 - PAYS FOR ITSELF: expected per-bar profit from the
-            # test window must exceed the formula's own per-bar trading cost
-            # (its churn x cost rate). Cost rate: None = the portfolio
-            # layer's cost_bps (one cost model everywhere); a number here
-            # overrides (tests / sensitivity runs).
-            'econ_cost_bps': None,
+            # test window must exceed the formula's own per-bar trading
+            # cost. ONE cost parameter for the whole system: filter 3, the
+            # search reward/screen, the enumeration sweep and the
+            # walk-forward all price portfolio.cost_bps.
             # ... and HOLDABLE: capture 1/(1 + phi/kappa) at least this -
             # alpha faster than the book's measured fill rate can't be
             # monetized. Derived from measured quantities. 0 disables.
@@ -1045,6 +1054,11 @@ config = {
         # allocate fresh risk to it). Compared on the holding horizon, not
         # per-bar, so units match the round-trip cost.
         'no_trade_band_mult': 1.0,
+        # The HOLD half of the L1-cost no-trade region: an existing position
+        # in a banded name is frozen at its current weight instead of being
+        # unwound by the trade-rate step - exiting pays the same toll
+        # entering did, so a merely-faded edge is held, never churned out.
+        'no_trade_hold': True,
         # Cap on the turnover-implied holding period (bars): everywhere the
         # system asks how long a position lives / how long its alpha persists
         # it uses lag / per-rebalance turnover, capped here (7d).

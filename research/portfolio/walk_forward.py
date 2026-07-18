@@ -160,6 +160,33 @@ def effective_fill_rate() -> Tuple[float, float]:
     return nominal, max(nominal, 1e-9)
 
 
+def curve_fill_discount(ks, A, peak_k, kappa: float):
+    """Fraction of a signal's MEASURED alpha path a book filling at per-bar
+    rate kappa actually captures. Exposure at path bar s is 1-(1-kappa)^s
+    (the GP partial fill); each slice's alpha increment comes from the
+    promotion's stored response curve A(k), capped at the peak (holding
+    past it is already forbidden downstream). Replaces the exponential-
+    decay capture assumption with the measured shape - a hump-shaped
+    signal is discounted by where its alpha actually lives, not by a
+    fitted half-life. None when the curve is unusable (caller falls back
+    to the exponential form)."""
+    if not ks or A is None or len(ks) != len(A) or not (0 < kappa <= 1):
+        return None
+    h = int(peak_k or ks[-1])
+    pts = [(int(k), float(a)) for k, a in zip(ks, A)
+           if a is not None and np.isfinite(a) and int(k) <= h]
+    if not pts:
+        return None
+    prev_k, prev_a, cap = 0, 0.0, 0.0
+    for k, a in pts:
+        mid = max(0.5 * (prev_k + k), 1.0)
+        cap += (1.0 - (1.0 - kappa) ** mid) * (a - prev_a)
+        prev_k, prev_a = k, a
+    if prev_a <= 0:
+        return None
+    return float(np.clip(cap / prev_a, 0.0, 1.0))
+
+
 def edge_gross_multiplier(exp_edge: float, rt_cost: float,
                           edge_mult: float, min_mult: float = 0.0) -> float:
     """Gross scale for the aim book: clip(expected horizon edge per unit gross
@@ -504,12 +531,18 @@ class WalkForwardPortfolio:
             lag = int(r.get('select_lag') or r.get('target_lag') or 0) or 6
             # Train alpha AT the evidence lag (best-lag alpha is the wrong
             # horizon when they differ); fall back to the best-lag value.
+            curve = None
             if isinstance(pj, str) and pj:
                 try:
-                    m = (_json.loads(pj).get(str(lag)) or {}).get('train') or {}
+                    prof = _json.loads(pj)
+                    m = (prof.get(str(lag)) or {}).get('train') or {}
                     a_lag = m.get('alpha_mean')
                     if a_lag is not None and np.isfinite(a_lag):
                         ic = float(a_lag)
+                    c = prof.get('curve')
+                    if c and c.get('ks'):
+                        curve = {'ks': c['ks'], 'A': c['A'],
+                                 'peak_k': c.get('peak_k')}
                 except (ValueError, TypeError):
                     pass
             hl = float(r.get('half_life_bars') or 0) or None
@@ -518,6 +551,7 @@ class WalkForwardPortfolio:
                 'lag': lag,
                 'direction': int(r.get('direction', 1) or 1),
                 'ic': ic, 'half_life': hl, 'turnover': to,
+                'curve': curve,
             })
         n = sum(len(v) for v in out.values())
         logging.info(f"per-month book: {n} promotions across {len(out)} "
@@ -618,10 +652,12 @@ class WalkForwardPortfolio:
         """One OOS month's tradable book from discovery metadata: buckets =
         distinct promoted lags, weights within a bucket proportional to train
         IC. Returns (selected, weights, lag_of, dir_of, bucket_ic, bucket_h,
-        bucket_to, bucket_hl); dir_of is the ROLL's traded direction per
-        signal (may differ from the deduped registry default)."""
+        bucket_to, bucket_hl, bucket_cv); dir_of is the ROLL's traded
+        direction per signal (may differ from the deduped registry default);
+        bucket_cv holds each signal's (weight, response curve) for the
+        curve-aware aim discount."""
         selected, weights, bucket_ic, bucket_h = {}, {}, {}, {}
-        bucket_to, bucket_hl = {}, {}
+        bucket_to, bucket_hl, bucket_cv = {}, {}, {}
         by_lag: Dict[int, List[dict]] = {}
         for m in meta:
             by_lag.setdefault(m['lag'], []).append(m)
@@ -644,10 +680,12 @@ class WalkForwardPortfolio:
             bucket_hl[lab] = (float(sum(wi * h for wi, h in hls)
                                     / max(sum(wi for wi, _ in hls), 1e-12))
                               if hls else None)
+            bucket_cv[lab] = [(float(wi), m.get('curve'))
+                              for m, wi in zip(ms, w)]
         lag_of = {m['name']: m['lag'] for m in meta}
         dir_of = {m['name']: int(m.get('direction', 1) or 1) for m in meta}
         return (selected, weights, lag_of, dir_of, bucket_ic, bucket_h,
-                bucket_to, bucket_hl)
+                bucket_to, bucket_hl, bucket_cv)
 
     # ---------------- one window ----------------
 
@@ -662,7 +700,7 @@ class WalkForwardPortfolio:
         # direction-applied by compute_signal_panel).
         meta = self.month_meta.get(pd.Timestamp(train_end), [])
         (selected, weights, lag_of, dir_of, bucket_ic, bucket_h,
-         bucket_to, bucket_hl) = self.month_book(meta)
+         bucket_to, bucket_hl, bucket_cv) = self.month_book(meta)
 
         res.selected = selected
         res.weights = weights
@@ -690,7 +728,8 @@ class WalkForwardPortfolio:
         self._ensure_context()
         bt_returns = self._backtest_window(composites, bucket_ic, bucket_h,
                                            bucket_to, train_end, test_end,
-                                           bucket_hl=bucket_hl)
+                                           bucket_hl=bucket_hl,
+                                           bucket_cv=bucket_cv)
         if bt_returns is None or bt_returns.empty:
             return res
 
@@ -734,7 +773,8 @@ class WalkForwardPortfolio:
                          bucket_to: Dict[str, float],
                          test_start: pd.Timestamp,
                          test_end: pd.Timestamp,
-                         bucket_hl: Optional[Dict[str, float]] = None
+                         bucket_hl: Optional[Dict[str, float]] = None,
+                         bucket_cv: Optional[Dict[str, list]] = None
                          ) -> Optional[pd.DataFrame]:
         if self.ctx is None:
             self._ensure_context()
@@ -828,7 +868,25 @@ class WalkForwardPortfolio:
                                           bucket_h.get(b, 1.0))
             ic_scale_raw[b] = raw
             p_b = hold_bars[b]
-            ic_scale[b] = raw * (p_b / (p_b + 1.0 / kappa)) if gp_on else raw
+            # Aim discount: preferred form integrates the MEASURED response
+            # curve against the fill path (curve_fill_discount) - a
+            # hump-shaped alpha is discounted by where it actually lives.
+            # Exponential p/(p + 1/kappa) is the fallback for curve-less
+            # promotions.
+            disc = None
+            if gp_on and bucket_cv:
+                ds = [(wi, curve_fill_discount(c['ks'], c['A'],
+                                               c.get('peak_k'), kappa))
+                      for wi, c in bucket_cv.get(b, []) if c]
+                ds = [(wi, d) for wi, d in ds if d is not None]
+                tw = sum(wi for wi, _ in ds)
+                if tw > 0:
+                    disc = sum(wi * d for wi, d in ds) / tw
+            if gp_on:
+                ic_scale[b] = raw * (disc if disc is not None
+                                     else p_b / (p_b + 1.0 / kappa))
+            else:
+                ic_scale[b] = raw
         # Observability: how hard the execution layer scales each bucket.
         if gp_on:
             disc = {b: hold_bars[b] / (hold_bars[b] + 1.0 / kappa)
@@ -845,6 +903,7 @@ class WalkForwardPortfolio:
         # is not worth trading on, so its alpha is zeroed before the MVO. The
         # per-name cost is cost_rate * cost_mult_i (liquidity-aware below).
         no_trade_mult = float(PORT.get('no_trade_band_mult', 0.0))
+        no_trade_hold = bool(PORT.get('no_trade_hold', False))
 
         # Edge-scaled gross (see edge_gross_multiplier / config
         # portfolio.edge_scaled_gross): identity when costs are zero.
@@ -877,11 +936,13 @@ class WalkForwardPortfolio:
 
         rows = []
         grid_bars = max(1, horizon_bars(SCREENING_GRID))
-        cadence = {
-            b: max(grid_bars, int(np.ceil(max(bucket_h.get(b, 1.0), 1.0) /
-                                           grid_bars)) * grid_bars)
-            for b in composites
-        }
+        # Scores refresh every grid step for EVERY bucket: the signal's
+        # slowness lives in its smoothing halflife (lag_smoothing), so the
+        # aim GLIDES with the smoothed scores instead of teleporting once
+        # per holding period and making the book chase the jump all day.
+        # (The old cadence = one refresh per bucket_h re-created the very
+        # turnover the smoothing had paid to remove.)
+        cadence = {b: grid_bars for b in composites}
         held_scores: Dict[str, pd.Series] = {}
         bar_positions = idx.get_indexer(bars)
         fwd_index = self.ctx.fwd_raw_wide.index
@@ -925,6 +986,7 @@ class WalkForwardPortfolio:
         A = pd.DataFrame()
         target_index = pd.Index([])
         target_values = np.array([], dtype=float)
+        hold_values = None
         carry = self._carry
         held_index = carry.index
         held_values = carry.values.astype(float, copy=True)
@@ -1039,13 +1101,18 @@ class WalkForwardPortfolio:
                 # expected horizon edge |alpha_h_i| (no aim discount) can't clear
                 # no_trade_mult * the per-name per-side cost (cost_rate *
                 # cost_mult_i). The MVO then won't allocate fresh risk to names
-                # whose signal can't pay for a round trip; any existing position is
-                # unwound by the trade-rate step.
+                # whose signal can't pay for a round trip. With no_trade_hold
+                # (below), an EXISTING position in a banded name is FROZEN
+                # rather than unwound - the L1-cost no-trade REGION: exiting
+                # costs the same toll as entering, so a position whose edge
+                # merely faded to sub-cost is held, not churned to zero.
+                banded = None
                 if no_trade_mult > 0.0:
                     cm = (cost_mult.reindex(assets).fillna(1.0) if liq_on
                           else pd.Series(1.0, index=assets))
                     band = no_trade_mult * cost_rate * cm
-                    alpha = alpha.where(alpha_h.abs() >= band, 0.0)
+                    banded = alpha_h.abs() < band
+                    alpha = alpha.where(~banded, 0.0)
                     if alpha.abs().sum() < 1e-15:
                         target_valid = False
                         continue
@@ -1121,6 +1188,9 @@ class WalkForwardPortfolio:
                             exp_edge, rt_cost, esg_mult, esg_min)
                 target_index = pd.Index(w_target.index)
                 target_values = w_target.values.astype(float, copy=False)
+                hold_values = (banded.reindex(target_index).fillna(False)
+                               .to_numpy() if no_trade_hold
+                               and banded is not None else None)
                 alpha_values = alpha.reindex(target_index).fillna(0.0).values
                 # Per-factor betas aligned to the held names (for the realized
                 # exposure / neutrality acceptance check below).
@@ -1182,6 +1252,12 @@ class WalkForwardPortfolio:
                                 + a_vec * (target_values - w_prev_values))
             else:
                 w_new_values = (1 - a_eff) * w_prev_values + a_eff * target_values
+            # No-trade REGION: names inside the cost band are HELD, not
+            # unwound - exiting pays the same toll entering did, so a
+            # position whose edge faded below cost is left alone until its
+            # alpha either recovers or turns against it.
+            if hold_values is not None:
+                w_new_values[hold_values] = w_prev_values[hold_values]
             # Volume-participation cap: per-name |trade| <= max_dw this bar.
             # `want` (the trade the GP step asked for) is captured BEFORE the
             # clamp for the binding diagnostics below.

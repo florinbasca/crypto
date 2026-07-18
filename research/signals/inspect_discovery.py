@@ -268,9 +268,7 @@ def main():
 
     promo_cfg = get('discovery.promotion')
     curve_cfg = get('discovery.curve', {})
-    _cb = promo_cfg.get('econ_cost_bps')
-    cost_rate = (float(_cb) if _cb is not None
-                 else float(get('portfolio.cost_bps'))) / 10000.0
+    cost_rate = float(get('portfolio.cost_bps')) / 10000.0
     rt_cost = float(curve_cfg.get('roundtrip_mult', 2.0)) * cost_rate
     rate = trade_rate_per_bar()
 

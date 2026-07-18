@@ -82,9 +82,7 @@ def _verdict_vs_oos(wf, rolls, res_w: pd.DataFrame) -> None:
     sample_ks = [int(k) for k in (curve_cfg.get('sample_ks')
                                   or range(1, H + 1))]
     min_assets = int(get('discovery.min_assets_per_timestamp', 10))
-    _cb = get('discovery.promotion.econ_cost_bps')
-    cost_rate = (float(_cb) if _cb is not None
-                 else float(get('portfolio.cost_bps'))) / 10000.0
+    cost_rate = float(get('portfolio.cost_bps')) / 10000.0
     rt = float(curve_cfg.get('roundtrip_mult', 2.0)) * cost_rate
     bar = pd.Timedelta('10min')
 
@@ -414,9 +412,8 @@ def main():
               f"gross per bar {cost / max(gross_bars, 1e-9) * 1e4:.3f}bp; "
               f"x median holding {hold:.0f} bars = {cycle_bp:.1f}bp/cycle "
               f"vs assumed {assumed:.0f}bp")
-        print(f"-> filter 3's honest econ_cost_bps ~ {cycle_bp / 2:.1f} "
-              f"(one side); currently "
-              f"{get('discovery.promotion.econ_cost_bps') or get('portfolio.cost_bps')}")
+        print(f"-> honest one-side cost_bps ~ {cycle_bp / 2:.1f}; "
+              f"configured portfolio.cost_bps = {get('portfolio.cost_bps')}")
     else:
         print("(no wf_portfolio_returns - run walk_forward.py first)")
 

@@ -68,14 +68,10 @@ def test_cfg():
     # min_select_days 0: the synthetic select window is only ~6 days long.
     # min_capture 0: a single-lag test grid fits every half-life to the
     # shortest grid value, which the production capture floor would block.
-    # Pooling/ranking specifics are covered by
-    # tests/promotion_pooling_checks.py.
-    # book_frac 0 -> fixed book_size (deterministic small-sample tests);
-    # econ_cost_bps 0 -> filter 3's cost side off (synthetic alphas are
-    # tiny; the sign/activity/duplicate filters are what these checks
-    # exercise). Quintile/econ specifics live in tests/choose_checks.py.
+    # book_frac 0 -> fixed book_size (deterministic small-sample tests).
+    # Cost is the ONE global parameter (portfolio.cost_bps); tests that
+    # vary it patch that parameter directly.
     cfg['promotion'].update({'book_frac': 0.0, 'book_size': 10,
-                             'econ_cost_bps': 0.0,
                              'min_select_days': 0, 'min_capture': 0.0})
     # Small synthetic windows: short curve horizon (also keeps the purge at
     # the legacy 12 bars the window-discipline checks pin down).
@@ -431,13 +427,18 @@ check("turnover: survivors carry it in-memory too",
 # curve path (turnover only enters capture, which fails open).
 _base = bt_mod.promote(survivors_a, ROLL, ledger_a, CFG)
 assert _base, "e2e produced no promotions to gate"
-_ec_cfg = copy.deepcopy(CFG)
 # The planted synthetic edge is huge (~thousands of bp per bet), so the
-# unambiguous kill-cost is absurd on purpose.
-_ec_cfg['promotion']['econ_cost_bps'] = 1e6
+# unambiguous kill-cost is absurd on purpose - patched into the ONE global
+# cost parameter, then restored.
+from config import config as _gcfg
+_old_cost = _gcfg['portfolio']['cost_bps']
+_gcfg['portfolio']['cost_bps'] = 1e6
+try:
+    _killed = bt_mod.promote(survivors_a, ROLL, ledger_a, CFG)
+finally:
+    _gcfg['portfolio']['cost_bps'] = _old_cost
 check("economics: a round-trip cost above any measured edge rejects all",
-      bt_mod.promote(survivors_a, ROLL, ledger_a, _ec_cfg) == [],
-      f"(base {len(_base)} -> 0 at 1e6bps)")
+      _killed == [], f"(base {len(_base)} -> 0 at 1e6bps)")
 check("economics: promotions carry a positive net rate at cost 0",
       all(p['econ_margin'] > 0 for p in _base))
 _no_tv = [{**s, 'turnover': float('nan')} for s in survivors_a]

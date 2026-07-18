@@ -508,9 +508,11 @@ def delete_table(table_name: str) -> bool:
         return False
     row_count = count_rows(table_name)
     symbols = get_table_symbols(table_name)
-    symbol_count = len(symbols) if symbols else 1
+    # Per-symbol tables report their symbol partitions; single-file tables
+    # (e.g. portfolio-level series) have no symbol dimension to report.
+    what = f"{len(symbols)} symbols, " if symbols else ""
     _remove_table(table_name)
-    print(f"Deleted table '{table_name}' ({symbol_count} symbols, {row_count:,} rows)")
+    print(f"Deleted table '{table_name}' ({what}{row_count:,} rows)")
     return True
 
 

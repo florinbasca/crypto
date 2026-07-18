@@ -106,8 +106,11 @@ def make_survivor(i, sel_t, sel_alpha=None, n_days=140, direction=1,
                   train_alpha=None):
     """A survivor dict shaped like run_search's population entries: the
     5-month test verdict is a fitted curve (A ramps linearly to a0 at the
-    horizon end). train_alpha attaches a TRAIN curve (the ranking input)."""
-    sel_alpha = sel_alpha if sel_alpha is not None else 0.0005 * sel_t
+    horizon end). train_alpha attaches a TRAIN curve (the ranking input).
+    Default edges are 50bp x t - comfortably above the global 10bp round
+    trip, so filter 3 passes the ladder and the QUINTILE mechanics (what
+    this file tests) are what decide."""
+    sel_alpha = sel_alpha if sel_alpha is not None else 0.005 * sel_t
     ks = [1, 2, 3, 6, 12, 24, 48, 72, 96, 120, 144]
     A = [sel_alpha * k / 144 for k in ks]
     se = abs(sel_alpha / sel_t) if sel_t else 0.001
@@ -136,7 +139,6 @@ def make_survivor(i, sel_t, sel_alpha=None, n_days=140, direction=1,
 TCFG = copy.deepcopy(get('discovery'))
 TCFG['promotion'].update({
     'min_select_days': 20, 'min_capture': 0.0, 'max_book_corr': 0.5,
-    'econ_cost_bps': 0.0,
     'book_frac': 0.20, 'book_min': 1, 'book_max': 50, 'book_size': 10,
 })
 
@@ -187,7 +189,7 @@ check("quintile: frac 0 falls back to fixed book_size",
 # filter 3 holdability: churn prices the capture. Same curve, one churns
 # 0.5/bar (position life 2 bars -> capture collapses), one holds steady.
 e_cfg = copy.deepcopy(TCFG)
-e_cfg['promotion'].update({'econ_cost_bps': 5.0, 'min_capture': 0.5})
+e_cfg['promotion'].update({'min_capture': 0.5})
 churner = make_survivor(30, sel_t=2.0, sel_alpha=0.004, turnover=0.5)
 steady = make_survivor(31, sel_t=2.0, sel_alpha=0.004, turnover=0.001)
 book_e = bt_mod.promote([churner, steady], ROLL,
@@ -201,7 +203,7 @@ check("holdability: churner rejected by the capture floor, steady twin "
 # test / strong train one (ranking on test promoted the luckiest test
 # windows - measured OOS anti-prediction).
 lucky = make_survivor(70, sel_t=2.0, sel_alpha=0.0050, train_alpha=0.0005)
-solid = make_survivor(71, sel_t=2.0, sel_alpha=0.0010, train_alpha=0.0040)
+solid = make_survivor(71, sel_t=2.0, sel_alpha=0.0020, train_alpha=0.0040)
 r_cfg = copy.deepcopy(TCFG)
 r_cfg['promotion'].update({'book_min': 1, 'book_max': 1})
 book_r = bt_mod.promote([lucky, solid], ROLL,

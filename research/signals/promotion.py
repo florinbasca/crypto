@@ -64,9 +64,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
     min_days = int(promo.get('min_select_days', 0))
     min_capture = float(promo.get('min_capture', 0.0))
     max_book_corr = float(promo['max_book_corr'])
-    _cb = promo.get('econ_cost_bps')
-    cost_rate = (float(_cb) if _cb is not None
-                 else float(get('portfolio.cost_bps'))) / 10000.0
+    cost_rate = float(get('portfolio.cost_bps')) / 10000.0
 
     curve_cfg = cfg.get('curve') or {}
     median_gate = bool(curve_cfg.get('median_gate', False))

@@ -171,7 +171,6 @@ def make_curved(i, a0, peak_k=48, entry_days=120, median=None, hl=24.0,
 TCFG = copy.deepcopy(get('discovery'))
 TCFG['promotion'].update({
     'min_select_days': 20, 'min_capture': 0.0, 'max_book_corr': 0.5,
-    'econ_cost_bps': 0.0,
     'book_frac': 0.20, 'book_min': 1, 'book_max': 50, 'book_size': 10,
 })
 
@@ -183,7 +182,8 @@ pool = [make_curved(1, 0.0030), make_curved(2, 0.0020),
 book = bt_mod.promote(pool, ROLL, search_mod.DiscoveryLedger(None), TCFG)
 names = [p['candidate'].name for p in book]
 check("choose: quintile of curve-passers, ranked by net rate",
-      names == ['c1'], f"({names}; 3 passers -> ceil(0.6)=1)")
+      names == ['c1'],
+      f"({names}; c1+c2 clear the 10bp round trip, quintile keeps 1)")
 check("choose: backwards/thin/median-failing rejected",
       not any(n in names for n in ('c4', 'c5', 'c6')))
 check("choose: peak caps the promoted half-life (walk-forward input)",
@@ -191,23 +191,22 @@ check("choose: peak caps the promoted half-life (walk-forward input)",
       and book[0]['peak_bars'] == 48)
 
 # net-rate ranking prefers a fast small edge over a slow bigger one when
-# rates say so: a0 8bp at peak 144 (rate ~0.055bp/bar) vs 4bp at peak 12
-# (rate ~0.33bp/bar)
-fast = make_curved(7, 0.0004, peak_k=12)
-slow = make_curved(8, 0.0008, peak_k=144)
+# rates say so (net of the 10bp round trip): 40bp at peak 12 (+2.5bp/bar)
+# vs 80bp at peak 144 (+0.5bp/bar)
+fast = make_curved(7, 0.0040, peak_k=12)
+slow = make_curved(8, 0.0080, peak_k=144)
 one = copy.deepcopy(TCFG)
 one['promotion'].update({'book_min': 1, 'book_frac': 0.2})
 b2 = bt_mod.promote([slow, fast], ROLL, search_mod.DiscoveryLedger(None), one)
 check("choose: ranking is net RATE at own optimum, not raw size",
       b2[0]['candidate'].name == 'c7')
 
-# economics: a real cost makes the round trip bind
-e_cfg = copy.deepcopy(TCFG)
-e_cfg['promotion']['econ_cost_bps'] = 5.0     # roundtrip 10bp
+# economics: the ONE global cost (portfolio.cost_bps = 5/side) makes the
+# 10bp round trip bind
 thin = make_curved(9, 0.0008)                 # 8bp peak < 10bp round trip
 fat = make_curved(10, 0.0030)                 # 30bp peak > 10bp round trip
 b3 = bt_mod.promote([thin, fat], ROLL, search_mod.DiscoveryLedger(None),
-                    e_cfg)
+                    TCFG)
 check("choose: curve that can't cover a round trip is rejected",
       [p['candidate'].name for p in b3] == ['c10'])
 

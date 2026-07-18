@@ -72,6 +72,33 @@ check("closed form omega/(1+omega) holds",
       abs(r_dear - omega_10 / (1.0 + omega_10)) < 1e-12)
 
 # ---------------------------------------------------------------------------
+# curve_fill_discount: fraction of the MEASURED alpha path captured by a
+# book filling at rate kappa (the curve-aware aim discount).
+from research.portfolio.walk_forward import curve_fill_discount
+
+KS = [1, 2, 3, 6, 12, 24, 48, 72, 96, 120, 144]
+LIN = [k / 144 * 0.001 for k in KS]              # linear ramp, peak at end
+check("curve discount: instant fill captures ~everything",
+      abs(curve_fill_discount(KS, LIN, 144, 1.0) - 1.0) < 1e-9)
+check("curve discount: glacial fill captures ~nothing",
+      curve_fill_discount(KS, LIN, 144, 1e-5) < 0.02)
+d_slow = curve_fill_discount(KS, LIN, 144, 0.01)
+d_fast = curve_fill_discount(KS, LIN, 144, 0.10)
+check("curve discount: monotone in fill rate",
+      0.0 < d_slow < d_fast < 1.0, f"({d_slow:.2f} < {d_fast:.2f})")
+# Peak caps the path: samples beyond the peak (the reversal) are excluded,
+# so a curve truncated at the peak scores identically.
+HUMP = [k / 48 * 0.001 if k <= 48 else 0.001 * (1 - (k - 48) / 400)
+        for k in KS]
+check("curve discount: peak caps the path (reversal never counted)",
+      abs(curve_fill_discount(KS, HUMP, 48, 0.05)
+          - curve_fill_discount(KS[:7], HUMP[:7], 48, 0.05)) < 1e-12)
+check("curve discount: unusable curve -> None (caller falls back)",
+      curve_fill_discount([], [], 144, 0.05) is None
+      and curve_fill_discount(KS, [None] * len(KS), 144, 0.05) is None
+      and curve_fill_discount(KS, [-a for a in LIN], 144, 0.05) is None)
+
+# ---------------------------------------------------------------------------
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURES: {FAILURES}")

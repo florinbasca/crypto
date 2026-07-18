@@ -69,7 +69,7 @@ meta = [
      'half_life': 144.0, 'turnover': 0.01},
 ]
 (selected, weights, lag_of, dir_of, bucket_ic, bucket_h,
- bucket_to, bucket_hl) = WalkForwardPortfolio.month_book(wf, meta)
+ bucket_to, bucket_hl, bucket_cv) = WalkForwardPortfolio.month_book(wf, meta)
 check("month_book: buckets keyed by the promoted (evidence) lag",
       set(selected) == {'36b', '144b'}
       and selected['36b'] == ['disc_a', 'disc_b'])
