@@ -60,6 +60,158 @@ def _slice_ics(comp: pd.DataFrame, fwd: pd.DataFrame, start, end,
     return out
 
 
+def _verdict_vs_oos(wf, rolls, res_w: pd.DataFrame) -> None:
+    """One line per PROMOTION (a signal promoted at a roll): what its
+    5-month test verdict promised vs what the same signal earned in its
+    OOS month, measured with the SAME instrument that produced the verdict
+    (the response curve on the signal's own gross-1 dollar-neutral book -
+    no portfolio sizing, no cost blending). Diagnostic only; separates
+    'the search finds nothing' from 'promotion ranks luck' from 'one
+    family drags everything'."""
+    from research.signals.search import response_curve
+
+    tables = get('discovery.tables')
+    promos = load_data(tables['promotions']) if table_exists(
+        tables['promotions']) else None
+    if promos is None or promos.empty:
+        print("(no promotions - nothing to grade)")
+        return
+    curve_cfg = get('discovery.curve', {})
+    H = int(curve_cfg.get('horizon_bars', 144))
+    stride = int(curve_cfg.get('entry_stride_bars', 6))
+    sample_ks = [int(k) for k in (curve_cfg.get('sample_ks')
+                                  or range(1, H + 1))]
+    min_assets = int(get('discovery.min_assets_per_timestamp', 10))
+    _cb = get('discovery.promotion.econ_cost_bps')
+    cost_rate = (float(_cb) if _cb is not None
+                 else float(get('portfolio.cost_bps'))) / 10000.0
+    rt = float(curve_cfg.get('roundtrip_mult', 2.0)) * cost_rate
+    bar = pd.Timedelta('10min')
+
+    oos_of = {r.roll_id: (pd.Timestamp(r.oos_start), pd.Timestamp(r.oos_end))
+              for r in rolls}
+    seen: dict = {}
+    lines = []
+    for roll_id, grp in promos.sort_values('roll_id').groupby('roll_id',
+                                                              sort=True):
+        if int(roll_id) not in oos_of:
+            continue
+        o_start, o_end = oos_of[int(roll_id)]
+        sel, wts, lag_of, dir_of, metas = {}, {}, {}, {}, []
+        for _, p in grp.iterrows():
+            name = f"disc_{p['family']}_{str(p['cand_hash'])[:10]}"
+            if name not in wf.registry:
+                continue
+            lag = int(p.get('select_lag') or 0) or H
+            sel[name] = [name]
+            wts[name] = {name: 1.0}
+            lag_of[name] = lag
+            dir_of[name] = int(p.get('direction', 1) or 1)
+            metas.append((name, p, lag))
+        if not metas:
+            continue
+        # One bucket per signal -> composite_scores returns each signal's
+        # own traded-orientation panel (roll direction applied), features
+        # loaded once per roll.
+        comps = wf.composite_scores(
+            sel, wts, o_start - pd.Timedelta(days=WARMUP_DAYS),
+            o_start, o_end, lag_of=lag_of, dir_of=dir_of)
+        # Paths of late-month entries may spill up to H bars past o_end -
+        # same convention as holding a position opened on the last day.
+        res_slice = res_w[(res_w.index >= o_start)
+                          & (res_w.index < o_end + H * bar)]
+        for name, p, lag in metas:
+            rep = seen.get(p['cand_hash'], 0) + 1
+            seen[p['cand_hash']] = rep
+            oos_edge, oos_rate = np.nan, np.nan
+            panel = comps.get(name)
+            if panel is not None and not panel.empty:
+                sig = panel.stack().rename('signal').reset_index()
+                sig.columns = ['timestamp', 'symbol', 'signal']
+                rc = response_curve(sig, res_slice, H, stride, min_assets,
+                                    sample_ks=sample_ks)
+                if rc is not None:
+                    A = rc['A']
+                    k_hold = min(lag, len(A))
+                    oos_edge = float(A[k_hold - 1])
+                    rates = [(float(A[k - 1]) - rt) / k
+                             for k in sample_ks if k <= len(A)]
+                    if rates:
+                        oos_rate = max(rates)
+            lines.append({
+                'roll': int(roll_id), 'name': p['name'],
+                'family': p['family'], 'rep': rep,
+                'test_t': float(p.get('select_alpha_tstat', np.nan)),
+                'test_rate': float(p.get('econ_margin', np.nan)),
+                'oos_rate': oos_rate, 'oos_edge': oos_edge,
+                'agree': (bool(oos_edge > 0) if np.isfinite(oos_edge)
+                          else None),
+            })
+
+    d = pd.DataFrame(lines)
+    if d.empty:
+        print("(no gradeable promotions)")
+        return
+
+    print()
+    print("=" * 78)
+    print("VERDICT vs OOS - one line per promotion")
+    print("=" * 78)
+    print("""columns (rates in bp/day on the gross-1 book; edge in bp/bet):
+  test_t     test-curve t (a0/se) that earned the promotion
+  test_rate  the verdict: net economic rate on the 5-month test window
+  oos_rate   the SAME number measured on the OOS month
+  oos_edge   per-bet edge at the promoted holding, OOS month, traded
+             direction - 'agree' = it made money the way it was traded
+  rep        1 = first promotion, 2+ = re-promoted (consecutive verdicts)
+""")
+    show = d.copy()
+    for c in ('test_rate', 'oos_rate'):
+        show[c] = show[c] * BPD_RATE
+    show['oos_edge'] = show['oos_edge'] * 1e4
+    print(show[['roll', 'name', 'family', 'rep', 'test_t', 'test_rate',
+                'oos_rate', 'oos_edge', 'agree']]
+          .to_string(index=False, float_format=lambda x: f'{x:+.2f}'))
+
+    v = d.dropna(subset=['oos_edge'])
+    if len(v) < 3:
+        print("(too few measurable promotions for summary stats)")
+        return
+    agree = float((v['oos_edge'] > 0).mean())
+    spear = float(v['test_rate'].corr(v['oos_rate'], method='spearman'))
+    slope = float(np.polyfit(v['test_rate'], v['oos_rate'], 1)[0]) \
+        if v['test_rate'].std() > 0 else float('nan')
+    print("-" * 78)
+    print(f"headline: n={len(v)}  sign-agreement {agree:.0%} (null 50%)  "
+          f"spearman(test,oos) {spear:+.2f}  slope {slope:+.2f} "
+          f"(1 = verdicts carry, 0 = luck)")
+
+    def _split(label, groups):
+        print(f"\nby {label}:")
+        for key, g in groups:
+            if not len(g):
+                continue
+            print(f"  {str(key):<18} n={len(g):<3d} "
+                  f"agree {float((g['oos_edge'] > 0).mean()):>4.0%}  "
+                  f"mean oos_edge {float(g['oos_edge'].mean()) * 1e4:+.1f}"
+                  f"bp/bet  mean oos_rate "
+                  f"{float(g['oos_rate'].mean()) * BPD_RATE:+.2f}bp/day")
+
+    _split('family', v.groupby('family'))
+    _split('repeat', [('1st promotion', v[v['rep'] == 1]),
+                      ('re-promoted (2+)', v[v['rep'] >= 2])])
+    if v['test_t'].notna().sum() >= 6 and v['test_t'].nunique() > 3:
+        try:
+            terc = pd.qcut(v['test_t'], 3,
+                           labels=['weak t', 'mid t', 'strong t'])
+            _split('test-t tercile', v.groupby(terc, observed=True))
+        except ValueError:
+            pass
+
+
+BPD_RATE = 144 * 1e4   # per-bar rate -> bp per day
+
+
 def main():
     wf = WalkForwardPortfolio()
     from research.signals.data import make_rolls
@@ -236,6 +388,39 @@ def main():
               "more than its alpha earns; the improvement must come from "
               "signals whose RANKING changes more slowly (lower churn), "
               "not from execution")
+
+    # ------- realized toll: what a holding cycle ACTUALLY costs ---------------
+    # Filter 3 charges every candidate an ASSUMED round trip
+    # (roundtrip_mult x cost_bps). The traded book pays cost per unit
+    # TRADED, with GP laziness and cross-signal netting included - the
+    # honest toll is what it paid per unit gross per holding cycle.
+    print()
+    print("=" * 78)
+    print("REALIZED TOLL (per holding cycle, per unit gross)")
+    print("=" * 78)
+    if table_exists('wf_portfolio_returns'):
+        ret = load_data('wf_portfolio_returns')
+        traded = ret[ret['gross_exposure'] > 1e-6]
+        cost = float((traded['gross_return'] - traded['net_return']
+                      + traded['funding_pnl']).sum())
+        gross_bars = float(traded['gross_exposure'].sum())
+        promos_t = load_data(get('discovery.tables')['promotions'])
+        hold = float(promos_t['select_lag'].median()) if promos_t is not None \
+            and not promos_t.empty else 144.0
+        cycle_bp = cost / max(gross_bars, 1e-9) * hold * 1e4
+        assumed = (get('discovery.curve.roundtrip_mult', 2.0)
+                   * get('portfolio.cost_bps'))
+        print(f"paid {cost:.4f} over {len(traded):,} traded bars; per unit "
+              f"gross per bar {cost / max(gross_bars, 1e-9) * 1e4:.3f}bp; "
+              f"x median holding {hold:.0f} bars = {cycle_bp:.1f}bp/cycle "
+              f"vs assumed {assumed:.0f}bp")
+        print(f"-> filter 3's honest econ_cost_bps ~ {cycle_bp / 2:.1f} "
+              f"(one side); currently "
+              f"{get('discovery.promotion.econ_cost_bps') or get('portfolio.cost_bps')}")
+    else:
+        print("(no wf_portfolio_returns - run walk_forward.py first)")
+
+    _verdict_vs_oos(wf, rolls, res_w)
 
 
 if __name__ == '__main__':

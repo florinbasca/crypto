@@ -231,6 +231,14 @@ def main():
                     roll.roll_id - reseed_rolls, roll.roll_id - 1)
                 if c.hash not in have]
 
+        # INVENT's deterministic lane: the pair-template sweep seeds the
+        # search alongside the previous roll's survivors (full scoring,
+        # dedup and promotion treat them like any other candidate).
+        from research.signals.enumeration import enumerate_candidates
+        have = {c.hash for c in seeds}
+        seeds = seeds + [c for c in enumerate_candidates(
+            panel, roll, family_columns, cfg) if c.hash not in have]
+
         usage_before = proposer.usage_snapshot()
         survivors = search_mod.run_search(panel, roll, family_columns,
                                           proposer, ledger, cfg,

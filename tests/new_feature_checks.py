@@ -22,7 +22,9 @@ import pandas as pd
 from config import get, BARS_PER_DAY
 from risk_model.features import (FEATURE_CONFIG, SN_FEATURE_NAMES,
                                  calculate_leadlag_features,
+                                 calculate_residual_features,
                                  calculate_seasonality_features,
+                                 calculate_time_features,
                                  leadlag_feature_names)
 
 FAILURES = []
@@ -153,6 +155,48 @@ check("leader symbol itself -> all NaN",
       all(ll_self[c].isna().all() for c in LL_NAMES))
 check("missing leader series -> all NaN",
       all(ll_none[c].isna().all() for c in LL_NAMES))
+
+# --- cyclical features -------------------------------------------------------
+# sn_fph_res recovers a planted funding-cycle profile (same trailing
+# same-bucket construction as sn_tod_res, bucketed by cycle phase).
+f_hours = FEATURE_CONFIG['funding_hours_utc']
+cycle_h = 24 // len(f_hours)
+phase = (hour - f_hours[0]) % cycle_h
+mu_f = (phase - (cycle_h - 1) / 2) * 1e-4
+sn_f = calculate_seasonality_features(make_df(close), pd.Series(mu_f),
+                                      FEATURE_CONFIG)
+got_f = sn_f['sn_fph_res'].iloc[tail].values
+check("sn_fph_res recovers the funding-cycle profile",
+      np.allclose(got_f, mu_f[tail], atol=1e-12),
+      f"(max err {np.abs(got_f - mu_f[tail]).max():.2e})")
+
+# tm_ funding phase: deterministic from the schedule - dist counts down to
+# the next settlement and the sin/cos repeat exactly every cycle.
+tm = calculate_time_features(make_df(close), FEATURE_CONFIG)
+bars_per_cycle = BARS_PER_DAY // len(f_hours)
+d = tm['tm_funding_dist'].values
+at_settle = phase == 0
+check("tm_funding_dist: full cycle at settlement, counts down to 1",
+      np.allclose(np.asarray(d)[at_settle & (TS.minute == 0)],
+                  bars_per_cycle)
+      and float(np.min(d)) >= 1.0,
+      f"(range {np.min(d):.0f}-{np.max(d):.0f} bars)")
+check("tm_funding_sin/cos: exactly periodic at the cycle length",
+      np.allclose(tm['tm_funding_sin'].values[bars_per_cycle:],
+                  tm['tm_funding_sin'].values[:-bars_per_cycle])
+      and np.allclose(tm['tm_funding_cos'].values[bars_per_cycle:],
+                      tm['tm_funding_cos'].values[:-bars_per_cycle]))
+
+# res_ cycle-scale autocorr: a 24h-periodic residual shows positive AC at
+# the period (lag 144) and negative at the half-period (lag 72).
+wave = pd.Series(np.sin(2 * np.pi * np.arange(N) / BARS_PER_DAY) * 1e-3
+                 + rng.normal(0, 2e-4, N))
+res_f = calculate_residual_features(make_df(close), wave, FEATURE_CONFIG)
+ac144 = float(res_f['res_autocorr_lag144'].iloc[-1])
+ac72 = float(res_f['res_autocorr_lag72'].iloc[-1])
+check("res_autocorr: daily cycle -> positive at 24h lag, negative at 12h",
+      ac144 > 0.5 and ac72 < -0.5,
+      f"(lag144 {ac144:+.2f}, lag72 {ac72:+.2f})")
 
 # --- wiring: discovery families resolve the new prefixes -----------------------
 from research.signals.data import resolve_family_columns

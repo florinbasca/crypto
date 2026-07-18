@@ -102,17 +102,18 @@ def _signal_panel():
 
 
 def make_survivor(i, sel_t, sel_alpha=None, n_days=140, direction=1,
-                  turnover=0.01, family='residual_shape', signal=None):
+                  turnover=0.01, family='residual_shape', signal=None,
+                  train_alpha=None):
     """A survivor dict shaped like run_search's population entries: the
     5-month test verdict is a fitted curve (A ramps linearly to a0 at the
-    horizon end)."""
+    horizon end). train_alpha attaches a TRAIN curve (the ranking input)."""
     sel_alpha = sel_alpha if sel_alpha is not None else 0.0005 * sel_t
     ks = [1, 2, 3, 6, 12, 24, 48, 72, 96, 120, 144]
     A = [sel_alpha * k / 144 for k in ks]
     se = abs(sel_alpha / sel_t) if sel_t else 0.001
     m_sel = {'alpha_mean': sel_alpha, 'alpha_tstat': sel_t, 'n_days': n_days}
     m_trn = {'alpha_mean': 0.001, 'alpha_tstat': 3.0, 'n_days': 140}
-    return {
+    out = {
         'candidate': gen.Candidate(f's{i}', family, ('col', f'feat_{i}')),
         'direction': direction, 'target_lag': 144,
         'half_life_bars': 48.0,
@@ -126,6 +127,10 @@ def make_survivor(i, sel_t, sel_alpha=None, n_days=140, direction=1,
         'signal_train': _signal_panel(),
         'signal_select': signal if signal is not None else _signal_panel(),
     }
+    if train_alpha is not None:
+        out['curve_train'] = {**out['curve'], 'a0': train_alpha,
+                              'A': [train_alpha * k / 144 for k in ks]}
+    return out
 
 
 TCFG = copy.deepcopy(get('discovery'))
@@ -190,6 +195,19 @@ book_e = bt_mod.promote([churner, steady], ROLL,
 check("holdability: churner rejected by the capture floor, steady twin "
       "promoted",
       [p['candidate'].name for p in book_e] == ['s31'])
+
+# ranking: the TEST curve gates, the TRAIN curve orders. A passer with a
+# spectacular test rate but weak train rate must lose the slot to a modest
+# test / strong train one (ranking on test promoted the luckiest test
+# windows - measured OOS anti-prediction).
+lucky = make_survivor(70, sel_t=2.0, sel_alpha=0.0050, train_alpha=0.0005)
+solid = make_survivor(71, sel_t=2.0, sel_alpha=0.0010, train_alpha=0.0040)
+r_cfg = copy.deepcopy(TCFG)
+r_cfg['promotion'].update({'book_min': 1, 'book_max': 1})
+book_r = bt_mod.promote([lucky, solid], ROLL,
+                        search_mod.DiscoveryLedger(None), r_cfg)
+check("ranking: train rate orders the passers, test only gates",
+      [p['candidate'].name for p in book_r] == ['s71'])
 
 # filter 4: a lower-ranked duplicate of a chosen formula is skipped
 top_sig = pool[5]['signal_select']

@@ -586,7 +586,9 @@ def select_survivors(population: List[dict], k: int, max_corr: float,
     whose OUTPUT (train signal correlation) stays <= max_corr vs every
     already-kept one. What a signal outputs is what the book trades - two
     builds that rank the coins the same way are one signal. Train only -
-    select stays unseen until promotion.
+    select stays unseen until promotion. k <= 0 = NO COUNT CAP: everything
+    passing the dedup guards survives (the book breathes with quality;
+    promotion's filters are the judge, not an arbitrary pool size).
 
     max_per_column (0 = off): at most this many survivors may lean on the
     same feature column (expression or gate). Gated variants of one idea
@@ -598,7 +600,7 @@ def select_survivors(population: List[dict], k: int, max_corr: float,
     kept: List[dict] = []
     col_counts: "Counter" = Counter()
     for cand in ranked:
-        if len(kept) >= k:
+        if k > 0 and len(kept) >= k:
             break
         cols = candidate_columns(cand['candidate'])
         if max_per_column and any(col_counts[c] >= max_per_column
@@ -806,12 +808,6 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             curve_train = curve_train_raw
         sig_select = sig[sig['timestamp'] >= roll.select_start]
 
-        # Standalone tradeability diagnostic (train signal): per-bar churn.
-        turnover = signal_turnover(sig_train)
-
-        # TEST curve: the verdict. Feeds nothing in this loop.
-        curve = _curve_of(sig_select, res_wide)
-
         # Reward = the TRAIN curve's net economic rate at its own optimal
         # holding (the identical formula promotion ranks by) minus
         # similarity to the kept pool.
@@ -822,9 +818,35 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         similarity = max_signal_correlation(
             sig_train, [s['signal_train'] for s in population])
         rwd, terms = compute_reward(net_rate, similarity, cfg['reward'])
-
         half_life = float(curve_train['half_life'])
         m_train = _curve_metrics(curve_train)
+
+        # SCREEN: a fresh proposal whose train edge can't cover its own
+        # round trip can never survive or promote - record it (bandit +
+        # failure memory learn from the full train measurement) but don't
+        # spend the test window or the turnover diagnostic on it. Seeds
+        # (gen -1) bypass: retention promises book members a fresh verdict
+        # even after a bad train month.
+        if net_rate <= 0 and gen >= 0:
+            ledger.record(roll.roll_id, gen, cand, direction,
+                          m_train, empty_metrics(), rwd, terms,
+                          target_lag=curve_train['peak_k'],
+                          profile_json=json.dumps({'curve_train': {
+                              k: (None if isinstance(v, float)
+                                  and not np.isfinite(v) else v)
+                              for k, v in curve_train.items()}}),
+                          half_life_bars=half_life)
+            if cand.family in bandit:
+                bandit[cand.family]['n'] += 1
+                bandit[cand.family]['sum'] += rwd
+            failures.append((cand, rwd))
+            return
+
+        # Standalone tradeability diagnostic (train signal): per-bar churn.
+        turnover = signal_turnover(sig_train)
+
+        # TEST curve: the verdict. Feeds nothing in this loop.
+        curve = _curve_of(sig_select, res_wide)
         m_select = _curve_metrics(curve)
         profile = {}
         for key, c in (('curve', curve), ('curve_train', curve_train)):

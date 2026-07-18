@@ -410,10 +410,12 @@ check("turnover: sign-flipping every bar -> ~1 (full replacement)",
       abs(search_mod.signal_turnover(_flip) - 1.0) < 1e-9,
       f"({search_mod.signal_turnover(_flip):.4f})")
 _led_df = ledger_a.to_frame()
-# Coverage-floor rejects are recorded WITHOUT turnover (their evaluation is
-# cut short by design) - the finiteness guarantee applies to fully-evaluated
-# rows only.
-_full = _led_df[_led_df['reward'] != CFG['search']['sparse_reward']]
+# Coverage-floor and negative-train-rate SCREEN rejects are recorded
+# WITHOUT turnover (their evaluation is cut short by design) - the
+# finiteness guarantee applies to fully-evaluated rows only (those with a
+# test-side measurement).
+_full = _led_df[(_led_df['reward'] != CFG['search']['sparse_reward'])
+                & (_led_df['select_n_days'] > 0)]
 check("turnover: recorded in the ledger for every evaluated candidate",
       'turnover' in _full.columns
       and _full['turnover'].notna().all()
@@ -954,7 +956,7 @@ check("parallel: per-family proposals fan out across threads",
       len(par.threads) >= 2, f"({len(par.threads)} threads)")
 check("parallel: both families' candidates evaluated",
       par_ledger.n_trials(0) >= 2
-      and {s['candidate'].family for s in par_pop}
+      and set(par_ledger.to_frame()['family'])
       == {'residual_shape', 'volatility_regime'},
       f"({par_ledger.n_trials(0)} trials)")
 check("parallel: locked usage counters exact under concurrency",

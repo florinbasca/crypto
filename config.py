@@ -357,7 +357,10 @@ config = {
             },
         },
 
-        'residual_autocorr_lags': [1, 6, 36],
+        # 72/144 (12h/24h) are the CYCLE detectors: negative AC at a
+        # half-period + positive at the period marks an oscillating name.
+        # Their rolling window scales with the lag (see features.py).
+        'residual_autocorr_lags': [1, 6, 36, 72, 144],
         'residual_vol_windows': [36, 144],
         'residual_zscore_window': 144,
         'residual_ac1_window': 432,                 # regime AC window (3d)
@@ -471,6 +474,18 @@ config = {
             # Filter 3 round trip = this many one-sided costs (enter + exit).
             'roundtrip_mult': 2.0,
         },
+        # INVENT's deterministic lane (research/signals/enumeration.py):
+        # sweep the pair-product template over every feature pair on a
+        # coarse train-only screen, seed the best top_n into the search for
+        # full measurement. The LLM lane keeps its whole budget for
+        # structures the sweep can't reach. top_n is the extra full-scoring
+        # load per roll (~30s/candidate).
+        'enumeration': {
+            'enabled': True,
+            'top_n': 50,
+            'agg_bars': 6,        # screen on an hourly entry/step grid
+            'horizon_steps': 24,  # 24 hourly steps = the 1-day curve
+        },
         # Feature coverage check (upstream of the LLM, per roll): a feature
         # with at most this many non-NaN values over the roll's train+test
         # window is dropped for that roll - not shown to the proposer, not
@@ -519,7 +534,13 @@ config = {
             # dv_ = Electric Capital dev activity (30d-lagged);
             # ls_ = listing age (true first perp trade date).
             'dev_activity':      ['dv_'],
-            'listing':           ['ls_'],
+            # QUARANTINED 2026-07-18 pending a feature audit: the listing
+            # family measured 36% OOS sign-agreement over 11 promotions
+            # (mean -15.6bp/bet) in the verdict-vs-OOS table - worst family
+            # by far; suspect stale/backfilled listing dates. Removing the
+            # family removes ls_ columns from the whole grammar (gates
+            # included). Restore after the audit clears the features.
+            # 'listing':         ['ls_'],
             'cross_sectional':   ['cs_'],
             'factor_context':    ['fl_', 'mk_'],
             'seasonality':       ['sn_'],
@@ -550,7 +571,12 @@ config = {
             'seed': 7,
             'n_generations': 16,
             'batch_size': 32,
-            'survivors': 12,                 # population carried between generations
+            # 0 = NO COUNT CAP on the survivor pool: everything passing the
+            # dedup guards (output corr, per-column cap, train thirds)
+            # survives, breeds and gets a verdict. The book is bounded by
+            # QUALITY (promotion's filters + quintile), never by an
+            # arbitrary pool size that discards already-measured candidates.
+            'survivors': 0,
             'mutation_prob': 0.6,            # mutate a parent vs sample fresh
             # Survivor de-correlation ceiling on the signal OUTPUT - what a
             # signal outputs is what the book trades, so two builds that rank

@@ -28,8 +28,11 @@ Four filters, then the quintile:
                     most max_book_corr (greedy, best first).
 
 Then promote the BEST QUINTILE of everything that passed
-(ceil(book_frac x passers), bounded by book_min/book_max). Proportional -
-the book breathes with how much quality exists; never a fixed count.
+(ceil(book_frac x passers), bounded by book_min/book_max), RANKED BY THE
+TRAIN curve's net rate - the test window gates, it never ranks (ranking
+on it promoted the luckiest test windows; measured OOS anti-prediction).
+Proportional - the book breathes with how much quality exists; never a
+fixed count.
 """
 
 import logging
@@ -115,8 +118,23 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
                 'half_life': float(c.get('half_life') or 0.0) or None}
 
     # Verdict per formula: the test response curve, judged at its own
-    # optimal holding, ranked by net economic rate.
+    # optimal holding. The verdict GATES; it does not rank.
     verdicts: List[Optional[dict]] = [curve_verdict(s) for s in survivors]
+
+    def rank_score(i: int) -> float:
+        """Order passers by the TRAIN curve's net rate. Ranking by the test
+        rate selected the luckiest test windows (measured: spearman(test,
+        oos) -0.25, slope -0.91 - the biggest verdicts crashed hardest OOS).
+        The train window is already spent by the search, so reusing it to
+        order adds no new bias; the test window stays a pure gate."""
+        c = survivors[i].get('curve_train')
+        if c and c.get('ks'):
+            rates = [(float(a) - rt_cost) / int(k)
+                     for k, a in zip(c['ks'], c['A'])
+                     if a is not None and int(k) > 0]
+            if rates:
+                return max(rates)
+        return verdicts[i]['score']    # rows without a train curve
 
     # Filters over whole formulas: 1+2 (inside the verdict), 3 (pays for
     # itself + holdable, with holding capped at the measured peak).
@@ -139,7 +157,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
 
     n_trials = ledger.n_trials(roll.roll_id)
     promoted: List[dict] = []
-    for i in sorted(passers, key=lambda i: -verdicts[i]['score']):
+    for i in sorted(passers, key=lambda i: -rank_score(i)):
         if len(promoted) >= k:
             break
         s, v = survivors[i], verdicts[i]

@@ -34,10 +34,21 @@ z-scores, and clips to ±3 (the demean is what makes each bar sum to ~0). Column
 A **roll** is one train/select window pair. Per roll, for 16 generations:
 
 1. The LLM proposes a batch of 32 candidates, its slots split across families by the rule below.
-2. Each candidate is compiled and scored on train by its **response curve's net economic rate** (see Reward)
-3. The best-by-reward survivors are kept, de-duplicated, and seed the next generation.
+2. Each candidate is compiled and scored on train by its **response curve's net economic rate** (see Reward). A fresh proposal whose train edge cannot cover its own round trip is recorded (the bandit and failure memory learn from it) but never gets the test-window measurement — the test is spent only on candidates that could actually promote.
+3. **There is no survivor count cap** (`search.survivors = 0`): everything passing the dedup guards survives, breeds, and gets a verdict. The book is bounded by promotion's quality filters, never by an arbitrary pool size.
 
 The 32 slots are split across families by an upper-confidence-bound rule: a family's priority = its mean reward so far + an exploration bonus that decays as it is tried, so more of the batch goes to families that keep producing high-reward candidates, without starving untried ones.
+
+INVENT also has a **deterministic lane** (`discovery.enumeration`,
+`enumeration.py`): every roll, four template families — pair products,
+sums, differences, and singles — are swept over ALL feature pairs (~16k
+each) on a cheap train-only screen (hourly grid; the book response is
+linear in weights, so one batched matrix pass scores every template), and
+the global top `top_n` seed the search for full measurement. The LLM
+samples ~250 formulas from that space and converges to these templates
+anyway — the sweep covers them exhaustively at zero token cost, freeing
+the LLM budget for structures enumeration can't reach (gates,
+conditionals, transforms).
 
 ## Validation
 
@@ -181,10 +192,13 @@ counts:
    already chosen this roll, greedy best-first.
 
 Then promote the **best quintile of the passers**: ceil(`book_frac` ×
-n_passers), bounded by `book_min`/`book_max`, **ranked by net economic
-rate at each formula's own optimal holding** (money-ordered, not
-significance-ordered). Proportional — the book breathes with how much
-quality exists.
+n_passers), bounded by `book_min`/`book_max`, **ranked by the TRAIN
+curve's net economic rate** (money-ordered, not significance-ordered).
+The test window gates and never ranks: ranking on the test rate promoted
+the luckiest test windows — measured on 49 promotions, spearman(test,
+OOS) was −0.25 and the biggest verdicts crashed hardest. The train window
+is already spent by the search, so ordering on it adds no new bias.
+Proportional — the book breathes with how much quality exists.
 
 Promotions are written with the verdict lag (= the curve's peak), peak
 bars, half-life (**capped at the peak** — this is what the walk-forward

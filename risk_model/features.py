@@ -649,12 +649,24 @@ def calculate_time_features(df: pd.DataFrame, config: Dict) -> Dict[str, pd.Seri
         dist = (target - minutes_of_day) % (24 * 60)
         in_window |= (dist > 0) & (dist <= window_bars * bar_minutes)
 
+    # Funding-CYCLE phase: settlements are a KNOWN schedule, so the phase
+    # is causal by construction. dist = bars until the next settlement;
+    # sin/cos = continuous position within the cycle (the scheduled
+    # analogue of the hour-of-day encodings). Assumes equally spaced
+    # settlement hours (0/8/16 -> an 8h cycle).
+    cycle_min = (24 * 60) // max(len(funding_hours), 1)
+    since_min = (minutes_of_day - funding_hours[0] * 60) % cycle_min
+    phase = since_min / cycle_min
+
     return {
         f'{prefix}hour_sin': np.sin(2 * np.pi * frac_day),
         f'{prefix}hour_cos': np.cos(2 * np.pi * frac_day),
         f'{prefix}dow_sin': np.sin(2 * np.pi * dow / 7),
         f'{prefix}dow_cos': np.cos(2 * np.pi * dow / 7),
         f'{prefix}funding_window': in_window.astype(int),
+        f'{prefix}funding_dist': (cycle_min - since_min) / bar_minutes,
+        f'{prefix}funding_sin': np.sin(2 * np.pi * phase),
+        f'{prefix}funding_cos': np.cos(2 * np.pi * phase),
     }
 
 
@@ -779,7 +791,8 @@ def calculate_cap_features(df: pd.DataFrame, mcap_series: Optional[pd.Series],
 # Per-Symbol Seasonality (trailing same-bucket residual stats)
 # ============================================================================
 
-SN_FEATURE_NAMES = ['sn_tod_res', 'sn_tod_vol_ratio', 'sn_dow_res']
+SN_FEATURE_NAMES = ['sn_tod_res', 'sn_tod_vol_ratio', 'sn_dow_res',
+                    'sn_fph_res']
 
 
 def calculate_seasonality_features(df: pd.DataFrame, residual_series: pd.Series,
@@ -799,6 +812,10 @@ def calculate_seasonality_features(df: pd.DataFrame, residual_series: pd.Series,
                        the current day's bars. Completed days only: the
                        same-weekday series is shifted one observation, so the
                        running (partial) current day never feeds its own value.
+      sn_fph_res       trailing mean residual in the same HOUR-of-the-FUNDING-
+                       CYCLE bucket (e.g. "2h after settlement") - this
+                       name's own funding-cycle rhythm. Same trailing
+                       same-bucket construction as sn_tod_res.
 
     All trailing through bar t - causal under the truncation test.
     """
@@ -817,6 +834,18 @@ def calculate_seasonality_features(df: pd.DataFrame, residual_series: pd.Series,
     by_hour = res.groupby(hour)
     features['sn_tod_res'] = by_hour.transform(
         lambda x: x.rolling(tod_w, min_periods=tod_min).mean())
+
+    # Same construction, bucketed by hour-of-the-FUNDING-CYCLE instead of
+    # hour-of-day (an 8h cycle folds each day into 3 same-phase visits, so
+    # the same trailing-days budget holds 3x the observations per bucket).
+    f_hours = FEATURE_CONFIG['funding_hours_utc']
+    cycle_h = 24 // max(len(f_hours), 1)
+    phase_hour = (hour - f_hours[0]) % cycle_h
+    visits_per_day = (24 // cycle_h) * bars_per_hour
+    features['sn_fph_res'] = res.groupby(phase_hour).transform(
+        lambda x: x.rolling(int(sn['tod_days']) * visits_per_day,
+                            min_periods=int(sn['min_days'])
+                            * visits_per_day).mean())
 
     abs_res = res.abs()
     tod_vol = abs_res.groupby(hour).transform(
@@ -1350,6 +1379,7 @@ def calculate_macrobeta_features(df: pd.DataFrame, residual_series: pd.Series,
 
 RES_FEATURE_NAMES = [
     'res_autocorr_lag1', 'res_autocorr_lag6', 'res_autocorr_lag36',
+    'res_autocorr_lag72', 'res_autocorr_lag144',
     'res_vol_short', 'res_vol_long', 'res_zscore', 'res_extreme_flag',
     'res_zscore_momentum_4', 'res_zscore_momentum_8', 'res_zscore_accel',
     'res_cumsum_short', 'res_cumsum_long', 'res_cumsum_xlong',
@@ -1372,7 +1402,10 @@ def calculate_residual_features(df: pd.DataFrame, residual_series: pd.Series,
         return features
 
     for lag in config['residual_autocorr_lags']:
-        features[f'{prefix}autocorr_lag{lag}'] = _rolling_autocorr(res, config['autocorr_window'], lag)
+        # Window scales with the lag so long (cycle-scale) lags keep enough
+        # independent pairs: AC at 12h/24h from a 1-day window is noise.
+        w = max(int(config['autocorr_window']), 4 * int(lag))
+        features[f'{prefix}autocorr_lag{lag}'] = _rolling_autocorr(res, w, lag)
 
     vol_windows = config['residual_vol_windows'][:2]
     features[f'{prefix}vol_short'] = res.rolling(window=vol_windows[0]).std()

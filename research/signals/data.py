@@ -381,6 +381,13 @@ FEATURE_DESCRIPTIONS = {
     'cap_log_mcap': "log market cap (the size characteristic; the book neutralizes size, so best used as a small-vs-large gate)",
     # calendar (cross-sectionally constant — gate only)
     'tm_funding_window': "proximity to a perp funding settlement (identical for all coins at a bar; use ONLY as a gate)",
+    'tm_funding_dist': "bars until the next funding settlement (known schedule; identical for all coins - use ONLY as a gate)",
+    'tm_funding_sin': "sine of the position within the funding cycle (identical for all coins - use ONLY as a gate)",
+    'tm_funding_cos': "cosine of the position within the funding cycle (identical for all coins - use ONLY as a gate)",
+    # cyclicality (per-name)
+    'sn_fph_res': "this coin's trailing mean residual at the SAME phase of the funding cycle (its own funding-cycle rhythm; cross-sectional)",
+    'res_autocorr_lag72': "trailing 12h-lag autocorrelation of residuals (negative = oscillates on a ~24h cycle)",
+    'res_autocorr_lag144': "trailing 24h-lag autocorrelation of residuals (positive = a daily rhythm repeats)",
     # momentum quality
     'mq_momentum_strength': "strength of the current price momentum",
     'mq_momentum_acceleration': "is momentum accelerating or fading",
