@@ -735,7 +735,8 @@ class WalkForwardPortfolio:
 
         res.oos_returns = bt_returns[[
             'gross_return', 'net_return', 'net_return_lag1', 'funding_pnl',
-            'turnover', 'gross_exposure', 'net_exposure',
+            'turnover', 'participation_max', 'participation_mean',
+            'gross_exposure', 'net_exposure',
             'mkt_exposure', 'size_exposure', 'n_positions',
         ] + EXTRA_EXPOSURE_COLS]
         res.oos_weights = self._bt_weights
@@ -972,6 +973,10 @@ class WalkForwardPortfolio:
         vol_ma_values_all = None
         part_rate = book_size = np.nan
         part_window_bars = 0
+        # OVERALL BOOK per-bar turnover cap (fraction of book). Applied on top of
+        # the per-symbol volume-participation cap; None disables. See config.
+        _bt = part_cfg.get('max_book_turnover', None)
+        book_turn_cap = float(_bt) if _bt is not None else None
         if part_on:
             part_rate = float(part_cfg['max_participation'])
             book_size = float(part_cfg['book_size_usd'])
@@ -1303,9 +1308,37 @@ class WalkForwardPortfolio:
                 w_new_values = clamp_to_participation(w_new_values,
                                                       w_prev_values, max_dw)
 
+            # OVERALL BOOK turnover cap: total per-bar turnover (voluntary trades +
+            # the forced closes of names that left the universe) must fit within
+            # book_turn_cap of the book. Scale the voluntary trade vector uniformly
+            # into the budget left after the (unavoidable) closes. The trade vector
+            # is a difference of two neutral books, so shrinking it preserves
+            # dollar/factor neutrality and the gross ceiling, and only tightens each
+            # name's volume-participation trade. If closes alone exceed the cap, no
+            # voluntary trade happens and total turnover = the closes.
+            if book_turn_cap is not None:
+                tv = w_new_values - w_prev_values
+                tot = float(np.abs(tv).sum())
+                budget = max(book_turn_cap - closed_abs_sum, 0.0)
+                if tot > budget:
+                    w_new_values = w_prev_values + tv * (budget / tot if tot > 0 else 0.0)
+
             # Positions in symbols that left the investable set get closed
             traded = np.abs(w_new_values - w_prev_values)
             turnover = float(traded.sum() + closed_abs_sum)
+            # Realized per-name participation = trade as a fraction of THAT name's
+            # bar $ volume: part_i = part_rate * |dw_i| / max_dw_i (since
+            # max_dw_i = part_rate * ADV_i / book_size). Bounded by the cap
+            # (max_participation) once the per-symbol clamp has bound. Persist the
+            # peak and mean across traded names so the notebook can show how hard
+            # the book pushes against the volume cap, before the book-turnover view.
+            participation_max = participation_mean = np.nan
+            if part_on and max_dw is not None:
+                pv = max_dw > 0
+                if pv.any():
+                    part_i = part_rate * traded[pv] / max_dw[pv]
+                    participation_max = float(part_i.max())
+                    participation_mean = float(part_i.mean())
             # Liquidity-aware $ cost: per-name turnover * cost_rate * cost_mult_i
             # (illiquid names cost more per unit traded). Flat when disabled.
             if liq_on:
@@ -1356,6 +1389,8 @@ class WalkForwardPortfolio:
                    'net_return': net_ret, 'net_return_lag1': lag_ret,
                    'funding_pnl': funding_pnl,
                    'turnover': float(turnover), 'trade_cost': trade_cost,
+                   'participation_max': participation_max,
+                   'participation_mean': participation_mean,
                    'exp_alpha': exp_alpha,
                    'gross_exposure': float(np.abs(w_new_values).sum()),
                    'net_exposure': float(w_new_values.sum()),

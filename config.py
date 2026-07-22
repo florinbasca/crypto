@@ -1082,8 +1082,17 @@ config = {
         # converts the $ cap to weight units. No volume history -> cap 0.
         'participation': {
             'book_size_usd': 1_000_000,      # notional gross book for $-based caps
-            'max_participation': 0.10,       # max fraction of avg bar $ volume per bar
+            # PER-SYMBOL cap: a name's per-bar trade may not exceed this fraction
+            # of THAT name's average bar $ volume (0.5% of volume = market-impact
+            # limit). Converted to weight units via book_size_usd.
+            'max_participation': 0.005,
             'volume_window_bars': 10,        # trailing window for the average
+            # OVERALL BOOK cap: total per-bar turnover (sum of |dw| over all names,
+            # plus forced closes of names leaving the universe) may not exceed this
+            # fraction of the book. The whole voluntary trade vector is scaled down
+            # uniformly to fit - neutrality-preserving and only ever tightens each
+            # name's volume-participation trade. None disables (per-symbol only).
+            'max_book_turnover': 0.005,
         },
     },
 
