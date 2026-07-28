@@ -1007,6 +1007,15 @@ config = {
         # breadth discovery measured it at (min_assets_per_timestamp = 10),
         # not the optimizer's 30.
         'min_signal_assets': 10,
+        # PERSISTENCE GATE: a discovered signal is only traded once it has been
+        # promoted in this many CONSECUTIVE discovery rolls (the roll for the OOS
+        # month plus the immediately preceding rolls). The single-window
+        # promotion t-stat does not predict OOS (strong-t and weak-t both ~50%
+        # sign-agreement), but re-promotion does: first promotions run ~42%
+        # agree / -7.9bp/day while re-promoted (2+) signals run ~71% agree /
+        # +3.9bp/day. 1 = trade from first promotion (old behavior); 2 = require
+        # one confirming re-promotion before trading.
+        'min_consecutive_promotions': 2,
         # Soft cluster-exposure penalty: clusters from trailing residual
         # correlations (same window as the covariance, causal). Motivated by
         # the Marchenko-Pastur diagnostic: stable super-MP structure exists

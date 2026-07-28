@@ -520,11 +520,36 @@ class WalkForwardPortfolio:
                     getattr(r, 'profile_json', '') or '')
         oos_by_roll = {r.roll_id: pd.Timestamp(r.oos_start)
                        for r in make_rolls(get('discovery'))}
+        # PERSISTENCE GATE: only trade a candidate once it has been promoted in
+        # >= min_reps CONSECUTIVE rolls. The promotion t-stat does not carry OOS,
+        # but re-promotion does; this drops the losing first-promotion cohort.
+        min_reps = int(PORT.get('min_consecutive_promotions', 1) or 1)
+        promoted_by_roll: Dict[int, set] = {}
+        for _, r in promos.iterrows():
+            promoted_by_roll.setdefault(int(r['roll_id']), set()).add(r['cand_hash'])
+        ordered_rolls = sorted(oos_by_roll, key=lambda rid: oos_by_roll[rid])
+        prev_roll = {rid: (ordered_rolls[i - 1] if i > 0 else None)
+                     for i, rid in enumerate(ordered_rolls)}
+
+        def _consecutive_reps(cand_hash, roll_id: int) -> int:
+            """Consecutive rolls (ending at roll_id, walking back) in which this
+            candidate was promoted. A gap resets the count."""
+            reps, rid = 0, roll_id
+            while rid is not None and cand_hash in promoted_by_roll.get(rid, ()):
+                reps += 1
+                rid = prev_roll.get(rid)
+            return reps
+
         out: Dict[pd.Timestamp, List[dict]] = {}
+        n_gated = 0
         for _, r in promos.iterrows():
             name = f"disc_{r['family']}_{str(r['cand_hash'])[:10]}"
             oos = oos_by_roll.get(int(r['roll_id']))
             if oos is None or name not in self.registry:
+                continue
+            if min_reps > 1 and _consecutive_reps(
+                    r['cand_hash'], int(r['roll_id'])) < min_reps:
+                n_gated += 1
                 continue
             ic, to, pj = led_key.get((int(r['roll_id']), r['cand_hash']),
                                      (np.nan, np.nan, ''))
@@ -554,8 +579,11 @@ class WalkForwardPortfolio:
                 'curve': curve,
             })
         n = sum(len(v) for v in out.values())
+        gate_msg = (f"; persistence gate (>= {min_reps} consecutive promotions) "
+                    f"dropped {n_gated} first/gapped promotions"
+                    if min_reps > 1 else "")
         logging.info(f"per-month book: {n} promotions across {len(out)} "
-                     f"OOS months")
+                     f"OOS months{gate_msg}")
         return out
 
     def _set_context_bounds(self, schedule: List[Tuple[pd.Timestamp,
