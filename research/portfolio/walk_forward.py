@@ -16,7 +16,8 @@ roll's promoted signals; no scoring pipeline, no re-selection.
    portfolio is optimized to be dollar- and factor-neutral within the
    configured bands (portfolio.neutrality_band), per-name cap, gross 1.
 3. BACKTEST on raw forward returns, reported gross AND net of per-side
-   trading costs, participation caps, the turnover budget, and perp funding.
+   trading costs, the per-symbol participation cap (the only hard fill
+   constraint), and perp funding.
 
 Outputs: wf_portfolio_returns, wf_portfolio_windows, wf_portfolio_exposures.
 """
@@ -41,7 +42,8 @@ from config import (config as global_config, get, horizon_col,
                     horizon_bars, BASE_FREQUENCY, BARS_PER_DAY)
 from research.lib.portfolio_opt import (shrunk_covariance, solve_constrained_mvo,
                                               residual_clusters,
-                                              cluster_penalty_matrix)
+                                              cluster_penalty_matrix,
+                                              band_reproject)
 from research.lib.signal_eval import (build_registry, compute_signal_panel,
                                       effective_halflife_for,
                                       signal_feature_columns,
@@ -76,6 +78,24 @@ BACKTEST_TABLES = (PORTFOLIO_RETURNS_TABLE,
 # Retired output tables, cleaned up on reset so they can't go stale.
 LEGACY_BACKTEST_TABLES = ('wf_portfolio_equity', 'wf_portfolio_returns_ew',
                           'wf_portfolio_returns_bench')
+
+
+def _fmt_exposure(x: float) -> str:
+    """Format a realized factor exposure for the acceptance-check printouts.
+
+    A window that never traded has NO exposure (NaN) and must not print
+    '0.0000' - a perfect neutrality score for a book that does not exist. It
+    prints '-', matching how the same window's OOS_SR reports.
+
+    Everything else is 4 decimals, the same scale as portfolio.neutrality_band
+    (market 0.10), so the column reads directly against the limit it is checked
+    against. The acceptance test is |exposure| <= band, NOT ~0: the book is
+    meant to use that slack. A column pinned at 0.0000 means the band is not
+    reaching the realized book (see the neutralize step in _backtest_window).
+    """
+    if x is None or not np.isfinite(x):
+        return '-'
+    return f'{x:.4f}'
 
 
 def apply_signal_control(composites: Dict[str, pd.DataFrame], mode: str,
@@ -300,6 +320,9 @@ class WindowResult:
     net_to_gross: float = np.nan    # realized: sum(net) / sum(gross)
     oos_weights: Optional[pd.DataFrame] = None   # per-bar held weight per name
     oos_risk: Optional[pd.DataFrame] = None       # per-bar predicted risk / cov diagnostics
+    # '' traded | 'held' frozen carried book | 'unwind' liquidating it.
+    # Distinguishes a no-signal month that still carried risk from a flat one.
+    hold_state: str = ''
 
 
 # =============================================================================
@@ -483,6 +506,13 @@ class WalkForwardPortfolio:
         self.windows: List[WindowResult] = []
         # Held book carried across contiguous windows (see _backtest_window).
         self._carry: pd.Series = pd.Series(dtype=float)
+        # Consecutive months whose promotions all failed the persistence gate;
+        # drives hold-vs-unwind on the carried book (see _run_held_window).
+        self._no_promo_streak: int = 0
+        # Filled by _run_levered: one entry per reported leverage multiple,
+        # each from a real extra backtest rather than a rescale of the 1x
+        # return series.
+        self._levered_stats: List[dict] = []
 
     def _build_month_meta(self) -> Dict[pd.Timestamp, List[dict]]:
         """{oos_start -> [{name, lag, direction, ic, half_life, turnover}]}
@@ -507,6 +537,14 @@ class WalkForwardPortfolio:
         if promos is None or promos.empty:
             return {}
         led = load_data(tables['ledger'])
+        # Rolls discovery actually EVALUATED. The ledger flushes one row per
+        # tested candidate at the end of each roll, so a roll present here got a
+        # verdict and a roll absent never ran (an interrupted or --max-rolls
+        # discovery). "No promotions" means opposite things in those two cases -
+        # a real "nothing confirmed" versus no evidence at all - and only the
+        # first may be traded through. run() truncates the schedule to this set.
+        self.evaluated_rolls = (set() if led is None or led.empty
+                                else {int(r) for r in led['roll_id'].unique()})
         led_key = {}
         if led is not None and not led.empty:
             for r in led.itertuples():
@@ -740,9 +778,8 @@ class WalkForwardPortfolio:
                      f"{len(meta)} promoted signals in "
                      f"{len(selected)} lag buckets")
         if not selected:
-            logging.debug(f"W{idx:02d}: no promotions this month - no new book "
-                         f"(carried positions re-target next traded month)")
-            return res
+            return self._run_held_window(res)
+        self._no_promo_streak = 0
 
         feat_start = train_end - pd.Timedelta(days=WARMUP_DAYS)
         composites = self.composite_scores(selected, weights, feat_start,
@@ -760,7 +797,49 @@ class WalkForwardPortfolio:
                                            bucket_cv=bucket_cv)
         if bt_returns is None or bt_returns.empty:
             return res
+        self._record_window(res, bt_returns)
+        return res
 
+    def _run_held_window(self, res: WindowResult) -> WindowResult:
+        """A month whose promotions all failed the persistence gate.
+
+        No confirmed alpha means no new book, but the carried positions are
+        real and are simulated (see _hold_window). Past
+        portfolio.max_hold_months_no_promotion consecutive such months the book
+        is unwound instead, so a discovery layer that goes quiet ends the
+        position rather than parking a stale book on the exchange forever.
+        The unwind trades at the participation cap and so may span several
+        windows; `unwind` stays latched until the book is actually flat.
+        """
+        idx = res.window_idx
+        self._no_promo_streak += 1
+        limit = int(PORT.get('max_hold_months_no_promotion', 0) or 0)
+        if self._carry.empty:
+            logging.debug(f"W{idx:02d}: no confirmed signals, book already flat")
+            return res
+        unwind = self._no_promo_streak > limit
+        res.hold_state = 'unwind' if unwind else 'held'
+        what = ('unwinding (%d consecutive unconfirmed months > limit %d)'
+                % (self._no_promo_streak, limit) if unwind
+                else 'holding (month %d of %d)' % (self._no_promo_streak, limit))
+        logging.info(f"W{idx:02d}: no confirmed signals - {what}, "
+                     f"{len(self._carry)} positions carried")
+        self._ensure_context()
+        bt_returns = self._hold_window(res.train_end, res.test_end, unwind)
+        if bt_returns is None or bt_returns.empty:
+            return res
+        self._record_window(res, bt_returns)
+        return res
+
+    def _record_window(self, res: WindowResult,
+                       bt_returns: pd.DataFrame) -> None:
+        """Fold one window's per-bar frame into its WindowResult diagnostics.
+
+        Shared by the traded path and the held path (a month that confirmed no
+        signals still produces bars: frozen positions earn, funding accrues,
+        names leaving the universe are closed), so a held month lands in the
+        ledger and the equity curve on exactly the same terms as a traded one.
+        """
         res.oos_returns = bt_returns[[
             'gross_return', 'net_return', 'net_return_lag1', 'funding_pnl',
             'turnover', 'participation_max', 'participation_mean',
@@ -791,8 +870,6 @@ class WalkForwardPortfolio:
         if np.isfinite(res.cost_to_alpha):
             logging.debug(f"  half-alpha: cost/exp_alpha={res.cost_to_alpha:.2f} "
                          f"(~0.5 ideal), net/gross={res.net_to_gross:.2f}")
-
-        return res
 
     # ---------------- MVO backtest ----------------
 
@@ -839,8 +916,8 @@ class WalkForwardPortfolio:
         # costs. ic_shrink pulls the noisy realized IC toward 0 (Grinold & Kahn
         #) so IC swings don't whipsaw the book.
         gp_on = bool(gp.get('enabled', False))
-        # Effective fill rate kappa: the GP trade rate capped at what the
-        # turnover budget allows.
+        # Effective fill rate kappa: the GP trade rate (there is no turnover
+        # budget to cap it; per-name fills bind on participation instead).
         _, kappa = effective_fill_rate()
         ic_shrink = float(PORT.get('ic_shrink', 0.0))
         ic_keep = max(0.0, 1.0 - ic_shrink)
@@ -1001,10 +1078,6 @@ class WalkForwardPortfolio:
         vol_ma_values_all = None
         part_rate = book_size = np.nan
         part_window_bars = 0
-        # OVERALL BOOK per-bar turnover cap (fraction of book). Applied on top of
-        # the per-symbol volume-participation cap; None disables. See config.
-        _bt = part_cfg.get('max_book_turnover', None)
-        book_turn_cap = float(_bt) if _bt is not None else None
         if part_on:
             part_rate = float(part_cfg['max_participation'])
             book_size = float(part_cfg['book_size_usd'])
@@ -1028,7 +1101,10 @@ class WalkForwardPortfolio:
         cost_values = np.array([], dtype=float)
         speed_values = np.array([], dtype=float)
         fwd_col_positions = np.array([], dtype=int)
-        neutralizer = None
+        # Constraint matrix + per-column bands for the current aim; None until
+        # the first valid rebalance, which is what gates the neutralize step.
+        Av = None
+        bands_v = np.zeros(0, dtype=float)
         closed_abs_sum = 0.0
         closed_cost_sum = 0.0
 
@@ -1265,10 +1341,18 @@ class WalkForwardPortfolio:
                     closed_cost_sum = 0.0
 
                 Av = A.reindex(target_index).values
-                try:
-                    neutralizer = np.linalg.solve(Av.T @ Av, Av.T)
-                except np.linalg.LinAlgError:
-                    neutralizer = None
+                # The REALIZED book is neutralized EXACTLY (band = 0), even
+                # though the MVO aim above is solved within neutrality_band.
+                # The signals predict RESIDUAL returns, which are orthogonal to
+                # these factors by construction, so factor exposure carries no
+                # expected return - only variance. Measured over the full
+                # backtest: exposure inside the bands earned -1.70%/yr while
+                # contributing 19.8% of book variance, and cost another
+                # -1.70%/yr of residual alpha capture (Sharpe 0.94 -> 0.37).
+                # Bands are the right device when alpha lives partly along a
+                # factor; here it cannot, so the aim may use slack to find a
+                # better interior solution but the book must not keep it.
+                bands_v = np.zeros(Av.shape[1], dtype=float)
                 target_valid = True
             else:
                 w_prev_values = held_values
@@ -1310,13 +1394,23 @@ class WalkForwardPortfolio:
                 w_new_values = clamp_to_participation(w_new_values,
                                                       w_prev_values, max_dw)
             cap_w = cap * gross_target * 0.999
-            if neutralizer is not None:
+            if Av is not None:
                 v = w_new_values
                 for _ in range(3):
                     v = np.clip(v, -cap_w, cap_w)
                     if part_on:
                         v = clamp_to_participation(v, w_prev_values, max_dw)
-                    v = v - Av @ (neutralizer @ v)
+                    # Re-impose neutrality WITHIN the band, removing only the
+                    # exposure excess beyond it - the same step the MVO uses to
+                    # build the aim. This used to be a full projection onto
+                    # null(A'), which forced A'w = 0 exactly and silently threw
+                    # away every bit of slack portfolio.neutrality_band grants:
+                    # the aim was banded, the realized book was not, so the
+                    # configured slack could never show up in the position.
+                    # Bands exist to let the book keep alpha and trade less
+                    # instead of fighting the position cap to hit exact zero;
+                    # band = 0 still reproduces the exact projection.
+                    v = band_reproject(Av, v, bands_v)
                 w_new_values = v
             # Gross leverage is a soft CEILING, not a per-bar peg: only ever
             # scaled DOWN if it exceeds the gross target. The book floats below
@@ -1327,7 +1421,7 @@ class WalkForwardPortfolio:
             if g > 1e-12:
                 w_new_values = w_new_values * min(1.0, gross_target / g)
             # Hard guarantee: the participation cap binds AFTER every other
-            # adjustment (neutralize projection and gross scaling can both push
+            # adjustment (the neutralize step and gross scaling can both push
             # a trade back over it). The small neutrality slack this leaves is
             # absorbed by the neutrality bands and self-corrects next bar (the
             # cap re-centers on the newly held book); realized exposures below
@@ -1336,20 +1430,9 @@ class WalkForwardPortfolio:
                 w_new_values = clamp_to_participation(w_new_values,
                                                       w_prev_values, max_dw)
 
-            # OVERALL BOOK turnover cap: total per-bar turnover (voluntary trades +
-            # the forced closes of names that left the universe) must fit within
-            # book_turn_cap of the book. Scale the voluntary trade vector uniformly
-            # into the budget left after the (unavoidable) closes. The trade vector
-            # is a difference of two neutral books, so shrinking it preserves
-            # dollar/factor neutrality and the gross ceiling, and only tightens each
-            # name's volume-participation trade. If closes alone exceed the cap, no
-            # voluntary trade happens and total turnover = the closes.
-            if book_turn_cap is not None:
-                tv = w_new_values - w_prev_values
-                tot = float(np.abs(tv).sum())
-                budget = max(book_turn_cap - closed_abs_sum, 0.0)
-                if tot > budget:
-                    w_new_values = w_prev_values + tv * (budget / tot if tot > 0 else 0.0)
+            # NOTE: no whole-book turnover cap. The per-symbol participation
+            # clamp above is the only hard fill constraint (see config). Trading
+            # is PRICED, via cost_bps and the GP trade rate, not rationed.
 
             # Positions in symbols that left the investable set get closed
             traded = np.abs(w_new_values - w_prev_values)
@@ -1410,7 +1493,9 @@ class WalkForwardPortfolio:
             else:
                 lag_ret = np.nan
 
-            # Realized exposure to every neutralized factor (should be ~0).
+            # Realized exposure to every neutralized factor. The acceptance
+            # check is |exposure| <= portfolio.neutrality_band for that factor,
+            # NOT ~0: the book is deliberately allowed to sit inside the band.
             exposures = {n: float(w_new_values @ bv) for n, bv in beta_values.items()}
 
             row = {'timestamp': ts, 'gross_return': gross_ret,
@@ -1500,6 +1585,211 @@ class WalkForwardPortfolio:
             self._bt_risk = pd.DataFrame(risk_rows)
         return pd.DataFrame(rows).set_index('timestamp')
 
+    # ---------------- held (no-promotion) months ----------------
+
+    def _hold_window(self, test_start: pd.Timestamp, test_end: pd.Timestamp,
+                     unwind: bool) -> Optional[pd.DataFrame]:
+        """Simulate a month that confirmed no signals, on the carried book.
+
+        The persistence gate refusing to confirm anything means "build no NEW
+        book", not "the book you are holding stops existing". So the carried
+        positions are simulated bar by bar exactly as the traded path does:
+        raw PnL on `fwd_raw`, perp funding on held positions, and forced closes
+        for names that leave the universe. What does NOT happen is any
+        re-targeting - there is no alpha, so there is no aim, and the book is
+        FROZEN rather than decayed toward one.
+
+        `unwind=True` liquidates instead: the aim is flat and the book trades
+        toward it at the volume-participation cap, so the exit is priced at a
+        fillable speed rather than as one free instant round trip.
+
+        Two deliberate differences from `_backtest_window`:
+
+        - The hold universe is membership + a live beta row, NOT the optimizer's
+          `cov_assets`. `cov_min_observations` is a requirement for ESTIMATING a
+          book, not for continuing to hold one; force-closing a position because
+          its covariance history thinned would be an artifact, not a trade.
+        - Realized exposures are left to DRIFT, not re-neutralized. Re-projecting
+          would be trading on no alpha. The drift is the honest diagnostic and is
+          what the `|mkt|` column is there to show.
+        """
+        if self.ctx is None:
+            self._ensure_context()
+        self._bt_weights = None
+        self._bt_risk = None
+        idx = self.ctx.res_wide.index
+        bars = idx[(idx >= test_start) & (idx < test_end)]
+        held_index = self._carry.index
+        held_values = self._carry.values.astype(float, copy=True)
+        if len(bars) == 0 or not len(held_index):
+            return None
+
+        # Cost / participation wiring is read exactly as _backtest_window reads
+        # it: a held month must be priced on the same terms as a traded one.
+        cost_rate = PORT['cost_bps'] / 10000.0
+        liq_cfg = PORT.get('liquidity_aware', {})
+        liq_on = bool(liq_cfg.get('enabled')) and self.ctx.dollar_vol_wide is not None
+        adv_window = (pd.Timedelta(days=liq_cfg['adv_window_days'])
+                      if liq_on else None)
+        part_cfg = PORT.get('participation', {})
+        part_on = self.ctx.dollar_vol_wide is not None
+        part_rate = book_size = np.nan
+        part_window_bars = 0
+        if part_on:
+            part_rate = float(part_cfg['max_participation'])
+            book_size = float(part_cfg['book_size_usd'])
+            part_window_bars = int(part_cfg['volume_window_bars'])
+
+        fwd_index = self.ctx.fwd_raw_wide.index
+        fwd_row_positions = fwd_index.get_indexer(bars)
+        fwd_columns = self.ctx.fwd_raw_wide.columns
+        fwd_values_all = self.ctx.fwd_raw_wide.to_numpy(copy=False)
+        fund_on = self.ctx.funding_wide is not None
+        funding_values_all = (
+            self.ctx.funding_wide.reindex(
+                index=bars + pd.Timedelta(BASE_FREQUENCY),
+                columns=fwd_columns).to_numpy()
+            if fund_on else None)
+        # Trailing mean through bar t INCLUSIVE, matching _backtest_window (the
+        # bar is fully known when the trade earning (t, t+1] is decided).
+        vol_ma_values_all = (
+            self.ctx.dollar_vol_wide
+            .rolling(part_window_bars, min_periods=part_window_bars).mean()
+            .reindex(index=bars, columns=fwd_columns).to_numpy()
+            if part_on else None)
+
+        # The held names are fixed for the window (positions only shrink), so
+        # the panel column lookup and the per-name cost multipliers are resolved
+        # once here rather than per bar; betas and holdability refresh daily.
+        col_pos = fwd_columns.get_indexer(held_index)
+        col_valid = col_pos >= 0
+        rows: List[dict] = []
+        weight_rows: List[Tuple[pd.Timestamp, np.ndarray, np.ndarray]] = []
+        day_cache_key = None
+        betas = None
+        holdable = None
+        bvals: Dict[str, np.ndarray] = {}
+        cost_values = np.ones(len(held_index), dtype=float)
+        for i, ts in enumerate(bars):
+            day = ts.normalize()
+            if day_cache_key != day:
+                day_cache_key = day
+                betas = self.ctx.betas_for_day(day)
+                members = self.ctx.members_at(ts)
+                if betas is not None and not betas.empty:
+                    # Names still holdable: in the universe with a live beta
+                    # row. Anything else is closed at this bar, cost paid.
+                    holdable = np.array([(s in members) and (s in betas.index)
+                                         for s in held_index], dtype=bool)
+                    bvals = {
+                        n: betas[f'beta_{n}'].reindex(held_index).fillna(0.0).values
+                        for n in FACTOR_NAMES if f'beta_{n}' in betas.columns}
+                if liq_on:
+                    dv = self.ctx.dollar_vol_wide
+                    dv_hist = dv[(dv.index < day) & (dv.index >= day - adv_window)]
+                    cost_mult, _ = liquidity_multipliers(dv_hist.mean(), liq_cfg)
+                    cost_values = cost_mult.reindex(held_index).fillna(1.0).values
+            if betas is None or betas.empty:
+                continue
+            closed_abs = np.abs(held_values[~holdable])
+            closed_abs_sum = float(closed_abs.sum())
+            if closed_abs_sum > 0 and liq_on:
+                closed_cost_sum = float((closed_abs * cost_values[~holdable]).sum())
+            else:
+                closed_cost_sum = closed_abs_sum
+            w_prev_values = np.where(holdable, held_values, 0.0)
+
+            # Frozen hold, or a participation-capped walk toward flat.
+            w_new_values = np.zeros_like(w_prev_values) if unwind else w_prev_values.copy()
+            max_dw = None
+            if part_on:
+                vols = np.full(len(held_index), np.nan)
+                if col_valid.any():
+                    vols[col_valid] = vol_ma_values_all[i, col_pos[col_valid]]
+                max_dw = participation_caps(vols, part_rate, book_size)
+                w_new_values = clamp_to_participation(w_new_values,
+                                                      w_prev_values, max_dw)
+            # No whole-book turnover cap here either: an unwind is paced by the
+            # per-symbol participation limit alone, same as a traded month.
+
+            traded = np.abs(w_new_values - w_prev_values)
+            turnover = float(traded.sum() + closed_abs_sum)
+            participation_max = participation_mean = np.nan
+            if part_on and max_dw is not None:
+                pv = max_dw > 0
+                if pv.any():
+                    part_i = part_rate * traded[pv] / max_dw[pv]
+                    participation_max = float(part_i.max())
+                    participation_mean = float(part_i.mean())
+            if liq_on:
+                trade_cost = float((traded * cost_values).sum()
+                                   + closed_cost_sum) * cost_rate
+            else:
+                trade_cost = turnover * cost_rate
+
+            fwd_row = int(fwd_row_positions[i])
+            if fwd_row < 0:
+                continue
+            fwd_values = np.zeros(len(held_index), dtype=float)
+            if col_valid.any():
+                fwd_values[col_valid] = np.nan_to_num(
+                    fwd_values_all[fwd_row, col_pos[col_valid]], nan=0.0)
+            fund_values = np.zeros(len(held_index), dtype=float)
+            if fund_on and col_valid.any():
+                fund_values[col_valid] = np.nan_to_num(
+                    funding_values_all[i, col_pos[col_valid]], nan=0.0)
+            gross_ret = float(w_new_values @ fwd_values)
+            funding_pnl = -float(w_new_values @ fund_values)
+            net_ret = gross_ret - trade_cost + funding_pnl
+
+            # Exposures DRIFT here (no re-neutralization on zero alpha); that
+            # drift is the acceptance check for whether holding stayed safe.
+            exposures = {n: float(w_new_values @ bv) for n, bv in bvals.items()}
+
+            row = {'timestamp': ts, 'gross_return': gross_ret,
+                   'net_return': net_ret,
+                   # No decision lag to stress: the book is frozen, so the
+                   # same positions earn this bar however early they were set.
+                   'net_return_lag1': net_ret,
+                   'funding_pnl': funding_pnl,
+                   'turnover': turnover, 'trade_cost': trade_cost,
+                   'participation_max': participation_max,
+                   'participation_mean': participation_mean,
+                   # No aim, so no expected alpha: the half-alpha diagnostic is
+                   # undefined for a held month rather than zero.
+                   'exp_alpha': np.nan,
+                   'gross_exposure': float(np.abs(w_new_values).sum()),
+                   'net_exposure': float(w_new_values.sum()),
+                   'mkt_exposure': exposures.get('market', np.nan),
+                   'size_exposure': exposures.get('size', np.nan),
+                   'n_positions': int((np.abs(w_new_values) > 1e-6).sum())}
+            for n in EXTRA_EXPOSURE_FACTORS:
+                row[f'{n}_exposure'] = exposures.get(n, np.nan)
+            rows.append(row)
+
+            nz = np.abs(w_new_values) > 1e-6
+            if nz.any():
+                weight_rows.append((ts, held_index[nz].to_numpy(),
+                                    w_new_values[nz]))
+            held_values = w_new_values
+
+        # Carry the surviving book (empty after a completed unwind, which is
+        # what stops the next unconfirmed month from re-simulating a dead book).
+        keep = np.abs(held_values) > 1e-6
+        self._carry = pd.Series(held_values[keep], index=held_index[keep])
+        if not rows:
+            return None
+        if weight_rows:
+            counts = [len(s) for _, s, _ in weight_rows]
+            self._bt_weights = pd.DataFrame({
+                'timestamp': np.repeat(
+                    np.array([t for t, _, _ in weight_rows], dtype='datetime64[ns]'),
+                    counts),
+                'symbol': np.concatenate([s for _, s, _ in weight_rows]),
+                'weight': np.concatenate([w for _, _, w in weight_rows]),
+            })
+        return pd.DataFrame(rows).set_index('timestamp')
+
     # ---------------- driver ----------------
 
     def run(self) -> pd.DataFrame:
@@ -1508,8 +1798,30 @@ class WalkForwardPortfolio:
 
         # One window per discovery roll: train on that roll's train window,
         # trade its OOS month with the signals it promoted (out of sample).
+        rolls = list(make_rolls(get('discovery')))
+        # Stop where discovery stopped. A roll it never evaluated has no verdict,
+        # so there is nothing to trade AND nothing to hold against: running past
+        # here would carry the last real book into unexamined months and report
+        # the hold (and its eventual unwind) as a result. That is a missing
+        # discovery run, not a flat stretch of alpha - finish the rolls first.
+        if self.evaluated_rolls:
+            skipped = [r for r in rolls if r.roll_id not in self.evaluated_rolls]
+            rolls = [r for r in rolls if r.roll_id in self.evaluated_rolls]
+            if skipped:
+                logging.warning(
+                    "Discovery has not evaluated rolls %d..%d (%s..%s): "
+                    "stopping the walk-forward at roll %d. Run "
+                    "research/signals/discovery.py --resume to extend it.",
+                    skipped[0].roll_id, skipped[-1].roll_id,
+                    pd.Timestamp(skipped[0].oos_start).date(),
+                    pd.Timestamp(skipped[-1].oos_end).date(),
+                    rolls[-1].roll_id if rolls else -1)
+        if not rolls:
+            raise RuntimeError(
+                "no discovery rolls have been evaluated - run "
+                "research/signals/discovery.py first")
         schedule = [(pd.Timestamp(r.train_start), pd.Timestamp(r.oos_start),
-                     pd.Timestamp(r.oos_end)) for r in make_rolls(get('discovery'))]
+                     pd.Timestamp(r.oos_end)) for r in rolls]
         logging.info(f"Walk-forward: {len(schedule)} monthly windows "
                      f"(mirrors discovery rolls)")
         self._set_context_bounds(schedule)
@@ -1525,6 +1837,7 @@ class WalkForwardPortfolio:
         self._cum_wealth = 1.0
         self._peak_wealth = 1.0
         self._carry = pd.Series(dtype=float)  # fresh run starts flat
+        self._no_promo_streak = 0
         if self.persist:
             self._reset_backtest_tables()
         else:
@@ -1551,7 +1864,75 @@ class WalkForwardPortfolio:
         returns['cum_return'] = (1 + returns['net_return']).cumprod() - 1
         peak = (1 + returns['cum_return']).cummax()
         returns['drawdown'] = (1 + returns['cum_return']) / peak - 1
+        self._levered_stats = self._run_levered(schedule)
         return returns
+
+    def _run_levered(self, schedule) -> List[dict]:
+        """Re-run the whole walk-forward once per portfolio.report_leverage.
+
+        This exists because leverage is NOT a rescale here. The participation
+        cap bounds the DOLLAR trade per name per bar, so it does not grow with
+        the book: a 2x book needs twice as many bars to reach the same target
+        weights, fills staler against a decaying signal, and earns a different
+        (lower) Sharpe. The only honest way to report it is to trade it - which
+        costs one full extra pass per multiple.
+
+        Results are printed, never persisted - the wf_portfolio_* tables stay
+        the 1x book. Returns [] when disabled.
+        """
+        cfg = PORT.get('report_leverage', ()) or ()
+        levs = [float(x) for x in
+                (cfg if isinstance(cfg, (list, tuple)) else [cfg])
+                if float(x) > 1.0]
+        if not levs:
+            return []
+        return [s for s in (self._one_levered_run(schedule, lev)
+                            for lev in sorted(levs)) if s]
+
+    def _one_levered_run(self, schedule, lev: float) -> dict:
+        """One full walk-forward pass at `lev` x gross. Restores every piece of
+        run state it touches, so passes do not contaminate each other or the
+        1x results already collected."""
+        base_gross = PORT['gross_leverage']
+        saved = (self.windows, self._carry, self._no_promo_streak,
+                 self.persist, self._cum_wealth, self._peak_wealth)
+        logging.info("Re-running the walk-forward at %gx gross for the "
+                     "levered report (participation binds harder)...", lev)
+        try:
+            PORT['gross_leverage'] = base_gross * lev
+            self.windows = []
+            self._carry = pd.Series(dtype=float)
+            self._no_promo_streak = 0
+            self.persist = False
+            prev = None
+            from tqdm import tqdm
+            for i, (t0, t1, t2) in enumerate(
+                    tqdm(schedule, desc=f"Windows ({lev:g}x)")):
+                res = self.run_window(i, t0, t1, t2, prev)
+                if res is not None:
+                    self.windows.append(res)
+                    if res.selected:
+                        prev = res
+            oos = [w.oos_returns for w in self.windows
+                   if w.oos_returns is not None]
+            if not oos:
+                return {}
+            rr = pd.concat(oos).sort_index()
+            traded = [w for w in self.windows if w.oos_returns is not None]
+            ppy = BARS_PER_DAY * 365
+            x = rr['net_return']
+            ann = x.mean() * ppy
+            vol = x.std() * np.sqrt(ppy)
+            wealth = (1.0 + x).cumprod()
+            return {'leverage': lev, 'ann_ret': ann, 'ann_vol': vol,
+                    'sharpe': (ann / vol) if vol > 0 else 0.0,
+                    'maxdd': float((wealth / wealth.cummax() - 1.0).min()),
+                    'avg_gross': float(np.nanmean([w.avg_gross
+                                                   for w in traded]))}
+        finally:
+            PORT['gross_leverage'] = base_gross
+            (self.windows, self._carry, self._no_promo_streak,
+             self.persist, self._cum_wealth, self._peak_wealth) = saved
 
     @staticmethod
     def _reset_backtest_tables() -> None:
@@ -1578,6 +1959,19 @@ class WalkForwardPortfolio:
         rl = returns['net_return_lag1'].dropna()
         sharpe_lag = (rl.mean() / rl.std() * np.sqrt(ppy)) if rl.std() > 0 else 0.0
 
+        # Levered view - a REAL second backtest, not a rescale of this one.
+        # Rescaling net_return by L would say Sharpe is leverage-invariant.
+        # It is not, because the volume-participation cap is a DOLLAR limit:
+        #     |dw_i| * book_size_usd <= max_participation * $vol_i
+        # Doubling the book does not move that dollar cap, so a 2x book needs
+        # twice as many bars to reach the same TARGET WEIGHTS. It fills slower,
+        # holds a staler book against a decaying signal, and captures less
+        # alpha per unit of risk. Sharpe falls, and by how much is exactly the
+        # question worth asking - so the levered numbers below come from
+        # re-running the whole walk-forward at L x gross, letting the cap bind
+        # where it really binds.
+        lev_stats = self._levered_stats
+
         traded = [w for w in self.windows if w.oos_returns is not None]
         avg_mkt = np.nanmean([w.avg_abs_mkt_exposure for w in traded]) if traded else np.nan
         avg_size = np.nanmean([w.avg_abs_size_exposure for w in traded]) if traded else np.nan
@@ -1593,8 +1987,11 @@ class WalkForwardPortfolio:
         print(f"Sharpe (1-bar lag): {sharpe_lag:.2f}  (execution-fragility stress)")
         print(f"Max drawdown:       {returns['drawdown'].min() * 100:.1f}%")
         print(f"Windows traded:     {len(traded)}/{len(self.windows)}")
-        print(f"Avg |mkt beta exp|: {avg_mkt:.4f}  (market-neutrality check, ~0)")
-        print(f"Avg |size exp|:     {avg_size:.4f}  (size-neutrality check, ~0)")
+        _bands = PORT.get('neutrality_band', {})
+        print(f"Avg |mkt beta exp|: {_fmt_exposure(avg_mkt)}  "
+              f"(market-neutrality check, band {_bands.get('market', 0.0):.2f})")
+        print(f"Avg |size exp|:     {_fmt_exposure(avg_size)}  "
+              f"(size-neutrality check, band {_bands.get('size', 0.0):.2f})")
         print(f"Avg gross:          {avg_gross:.4f}")
         print(f"Avg turnover/bar:   {avg_to:.4f}")
         if 'funding_pnl' in returns.columns:
@@ -1606,28 +2003,55 @@ class WalkForwardPortfolio:
         # selected lags ('3b:5' = 5 signals held at the 3-bar lag); top
         # families are abbreviated to the three largest (full breakdown lives
         # in the notebook's attribution view).
-        row = ("  {win:<4}{period:<24}{nsig:>5}  {bkt:<20}"
-               "{sr:>8}{mkt:>9}  {fam}")
-        print("\nPer-window detail (buckets = promoted lags):")
-        print(row.format(win='Win', period='OOS test period', nsig='#sig',
-                         bkt='lag:sigs', sr='OOS_SR', mkt='|mkt|',
-                         fam='top families'))
+        from rich.box import SIMPLE
+        from rich.console import Console
+        from rich.table import Table
+
+        table = Table(title="Per-window detail (buckets = promoted lags)",
+                      box=SIMPLE, title_justify='left', title_style='bold')
+        # no_wrap on the fixed-width columns: piped output (no tty) defaults to
+        # 80 cols and rich would otherwise ellipsize the dates and lag buckets,
+        # which is where the diagnostic actually lives. Only the trailing
+        # families column, the one safe to abbreviate, is allowed to give.
+        table.add_column('Win', no_wrap=True)
+        table.add_column('OOS test period', no_wrap=True)
+        table.add_column('#sig', justify='right', no_wrap=True)
+        table.add_column('lag:sigs', no_wrap=True)
+        table.add_column('OOS_SR', justify='right', no_wrap=True)
+        table.add_column('|mkt|', justify='right', no_wrap=True)
+        table.add_column('top families')
         for w in self.windows:
             labs = sorted(w.selected, key=lambda s: int(str(s).rstrip('b') or 0))
             bkt = ' '.join(f'{b}:{len(w.selected[b])}' for b in labs)
+            # A no-signal month still carries risk while the book is held or
+            # unwound; '-' is reserved for the genuinely flat ones.
+            bkt = bkt or w.hold_state
             fam = list(self._selected_family_counts(w).items())
             fam_str = ' '.join(f'{k}:{v}' for k, v in fam[:3])
             if len(fam) > 3:
                 fam_str += f' (+{len(fam) - 3})'
-            mkt = w.avg_abs_mkt_exposure if not np.isnan(w.avg_abs_mkt_exposure) else 0.0
-            print(row.format(
-                win=f'W{w.window_idx:02d}',
-                period=f'{w.train_end.date()}-{w.test_end.date()}',
-                nsig=sum(len(s) for s in w.selected.values()),
-                bkt=bkt or '-',
-                sr=f'{w.oos_sharpe:.2f}',
-                mkt=f'{mkt:.4f}',
-                fam=fam_str))
+            table.add_row(
+                f'W{w.window_idx:02d}',
+                f'{w.train_end.date()}-{w.test_end.date()}',
+                str(sum(len(s) for s in w.selected.values())),
+                bkt or '-',
+                f'{w.oos_sharpe:.2f}',
+                _fmt_exposure(w.avg_abs_mkt_exposure),
+                fam_str)
+        print()
+        Console().print(table)
+
+        # Levered books last: each is a separate backtest, not a view of the
+        # one above, so they belong after everything the 1x run has to say.
+        for st in lev_stats:
+            print("\n" + "=" * 70)
+            print(f"AT {st['leverage']:g}X GROSS")
+            print("=" * 70)
+            print(f"Annual return:      {st['ann_ret'] * 100:+.1f}%")
+            print(f"Annual vol:         {st['ann_vol'] * 100:.1f}%")
+            print(f"Sharpe:             {st['sharpe']:.2f}")
+            print(f"Max drawdown:       {st['maxdd'] * 100:.1f}%")
+            print(f"Avg gross:          {st['avg_gross']:.4f}")
 
     def _selected_family_counts(self, w: WindowResult) -> Dict[str, int]:
         out: Dict[str, int] = {}
@@ -1645,6 +2069,7 @@ class WalkForwardPortfolio:
             'train_start': w.train_start, 'train_end': w.train_end,
             'test_end': w.test_end,
             'n_signals': w.n_candidates,
+            'hold_state': w.hold_state,
             'selected': ';'.join(f"{b}:{','.join(s[:10])}" for b, s in w.selected.items()),
             'selected_families': ';'.join(f"{k}:{v}" for k, v in family_counts.items()),
             'horizon_ic': ';'.join(f"{b}:{ic:.4f}" for b, ic in w.horizon_ic.items()),

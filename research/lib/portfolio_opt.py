@@ -71,7 +71,7 @@ def shrunk_covariance(returns: pd.DataFrame,
     return pd.DataFrame(cov, index=keep, columns=keep)
 
 
-def _band_reproject(A: np.ndarray, w: np.ndarray, band: np.ndarray) -> np.ndarray:
+def band_reproject(A: np.ndarray, w: np.ndarray, band: np.ndarray) -> np.ndarray:
     """Pull each exposure A'w back inside +/-band, removing only the EXCESS.
 
     e = A'w are the current exposures (net-dollar, factor betas). We clip each
@@ -161,7 +161,7 @@ def solve_constrained_mvo(alpha: pd.Series,
 
         clipped = np.clip(w, -cap_eff, cap_eff)
         # Re-impose neutrality within the band (band = 0 -> exact).
-        w_new = _band_reproject(A, clipped, band)
+        w_new = band_reproject(A, clipped, band)
 
         if np.max(np.abs(w_new - w)) < 1e-10:
             w = w_new
@@ -222,7 +222,7 @@ def solve_equal_weight(alpha: pd.Series,
             break
         w = w * (gross_leverage / gross)
         clipped = np.clip(w, -cap_eff, cap_eff)
-        w_new = _band_reproject(A, clipped, band)
+        w_new = band_reproject(A, clipped, band)
         if np.max(np.abs(w_new - w)) < 1e-10:
             w = w_new
             break

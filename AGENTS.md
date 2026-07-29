@@ -67,9 +67,23 @@ All configuration values MUST be in `config.py`. Never hardcode:
 - Final backtest PnL uses RAW returns - neutrality constraints do the hedging;
   realized factor exposures are the acceptance check (~0). Net PnL also
   accrues perp funding on held positions at settlement stamps.
+- A month can confirm NO signals (every promotion fails the persistence gate).
+  That means no new book, not a gap in the record: the carried book is held and
+  simulated (`_hold_window`), then unwound after
+  `portfolio.max_hold_months_no_promotion` months. Never let an unpromoted month
+  silently skip its bars - the equity curve then reads flat across a stretch
+  where real positions were live.
+- That hold applies ONLY to rolls discovery actually evaluated (present in the
+  discovery ledger). The walk-forward truncates its schedule there. A roll that
+  never ran has no verdict, so "no promotions" is missing evidence, not a
+  confirmed absence of alpha - holding a book through it would report a
+  fabricated result. Finish the rolls (`discovery.py --resume`) instead.
 - Universe: ~130 Hyperliquid-tradeable candidates, no stablecoins. Membership
   is point-in-time where universe_membership spells exist; pre-snapshot
   history is seeded as member-since-data-start.
 - The walk-forward selection speed floor is DERIVED from the execution layer
-  (min_holding_lag_bars: 'auto'); do not hand-tune selection speed and the
-  turnover budget independently.
+  (min_holding_lag_bars: 'auto'); do not hand-tune it against the execution
+  parameters independently.
+- The per-symbol volume-participation cap is the ONLY hard fill constraint in
+  the backtest. There is no whole-book turnover cap or turnover budget - do not
+  reintroduce one. Trading is priced (cost_bps, GP trade rate), not rationed.

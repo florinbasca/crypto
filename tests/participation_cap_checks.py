@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 
 from research.portfolio.walk_forward import (clamp_to_participation,
-                                             participation_caps)
+                                             participation_caps, PORT)
+from research.lib.portfolio_opt import band_reproject
 
 FAILURES = []
 
@@ -66,17 +67,22 @@ check("clamp is symmetric in trade sign",
 
 # --- sequential mini-simulation mirroring the _backtest_window ordering ---
 # GP step toward the aim -> participation clamp -> 3x (position-cap clip +
-# clamp + neutrality projection) -> gross soft-ceiling scale -> final hard
-# clamp. Asserts: the cap holds for every name on every bar AFTER all
-# adjustments; no-volume names never trade; the book still converges toward
-# the aim; neutrality slack from the final clamp stays small.
+# clamp + banded neutrality reprojection) -> gross soft-ceiling scale -> final
+# hard clamp. There is NO whole-book turnover cap in that ordering: the
+# per-symbol participation clamp is the only hard fill constraint. Asserts:
+# the cap holds for every name on every bar AFTER all adjustments; no-volume
+# names never trade; the book still converges toward the aim; dollar exposure
+# stays inside its configured band.
 N, T = 30, 60
 CAP_W = 0.05 * 0.999
 A_EFF = 0.44
 GROSS_TARGET = 1.0
 
 ones = np.ones((N, 1))
-neutralizer = np.linalg.solve(ones.T @ ones, ones.T)   # dollar neutrality
+# Dollar neutrality, imposed EXACTLY - the same step walk_forward applies per
+# bar. neutrality_band shapes the MVO aim only; letting it reach the realized
+# book injects factor variance the residual alpha cannot pay for.
+DOLLAR_BAND = np.zeros(1)
 
 
 def make_aims(seed=11):
@@ -118,7 +124,7 @@ def run_sim(book_size, vols, apply_cap=True, aims=None):
             v = np.clip(v, -CAP_W, CAP_W)
             if apply_cap:
                 v = clamp_to_participation(v, w_prev, max_dw)
-            v = v - ones @ (neutralizer @ v)
+            v = band_reproject(ones, v, DOLLAR_BAND)
         g = np.abs(v).sum()                                    # gross ceiling
         if g > 1e-12:
             v = v * min(1.0, GROSS_TARGET / g)
@@ -178,6 +184,17 @@ part_cfg = get('portfolio.participation', {})
 check("portfolio.participation block exists with all keys",
       all(k in part_cfg for k in
           ('book_size_usd', 'max_participation', 'volume_window_bars')))
+# The per-symbol participation cap is the ONLY hard fill constraint. A
+# whole-book turnover cap rationed trading against a number nothing physical
+# enforces, scaling the entire trade vector down and slowing every fill.
+check("NO whole-book turnover cap in config",
+      'max_book_turnover' not in part_cfg)
+import inspect
+import research.portfolio.walk_forward as _wf
+for _fn in ('_backtest_window', '_hold_window'):
+    _src = inspect.getsource(getattr(_wf.WalkForwardPortfolio, _fn))
+    check(f"{_fn} applies no book-turnover budget",
+          'book_turn_cap' not in _src and 'max_book_turnover' not in _src)
 check("discovery has NO backtest block (purely statistical; the "
       "walk-forward is the only money judge)",
       'backtest' not in global_config['discovery'])

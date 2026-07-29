@@ -101,6 +101,13 @@ Promotions land in `discovery_promotions` and become `disc_*` registry entries
 (`research/lib/discovered.py`). The walk-forward trades each roll's promoted
 signals in that roll's OOS month only — the month discovery never saw.
 
+A promotion is only traded once it repeats: `portfolio.min_consecutive_promotions`
+requires a confirming re-promotion, so months where every candidate is a first
+promotion confirm nothing and build no new book. The book already held is not
+skipped — it is carried and simulated (frozen positions, raw PnL, perp funding,
+forced closes) for up to `portfolio.max_hold_months_no_promotion` months, then
+unwound at the volume-participation cap.
+
 **The full design — DSL grammar, the LLM prompt, the reward, evidence
 pooling, the promotion ranking, the walk-forward windows — is documented in
 [`research/signals/signal.md`](research/signals/signal.md).**

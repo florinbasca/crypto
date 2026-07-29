@@ -963,11 +963,19 @@ config = {
         # diversification / capacity limits.
         'max_position': 0.50,
         'neutrality': ['dollar', 'market', 'size', 'momentum', 'vol', 'meme'],  # Constrained exposures B'w
-        # Neutrality BANDS: each exposure is held within +/- band rather than at
-        # exactly zero. Bands give the optimizer slack to retain alpha and cut
-        # turnover instead of fighting the position cap to hit exact zero. Units:
-        # 'dollar' = net long-short as a fraction of gross; factor entries =
-        # portfolio beta to that factor. A band of 0.0 reproduces exact neutrality.
+        # Neutrality BANDS for the MVO AIM only. Units: 'dollar' = net long-short
+        # as a fraction of gross; factor entries = portfolio beta to that factor.
+        # The band gives the optimizer an interior solution to work with instead
+        # of fighting the position cap onto an exact hyperplane.
+        #
+        # The REALIZED book is neutralized EXACTLY regardless of these (see
+        # _backtest_window). Do not "fix" that inconsistency by letting the band
+        # through to the book - it was tried and it is expensive. Signals predict
+        # RESIDUAL returns, orthogonal to these factors by construction, so
+        # factor exposure has zero expected return and pure variance. Measured:
+        # letting the book sit inside these bands earned -1.70%/yr, contributed
+        # 19.8% of book variance, and cost a further -1.70%/yr of residual alpha
+        # capture - Sharpe 0.94 -> 0.37 on an identical sample.
         'neutrality_band': {
             'dollar':   0.05,   # net exposure <= 5% of gross
             'market':   0.10,   # |portfolio beta| <= 0.10
@@ -976,6 +984,18 @@ config = {
             'vol':      0.10,
             'meme':     0.10,
         },
+        # Leverage multiples reported after the 1x summary. Each one RE-RUNS
+        # the whole walk-forward at multiple x gross_leverage, so run time is
+        # roughly (1 + len(list)) x. It has to be a real run: the volume-
+        # participation cap bounds the DOLLAR trade per name per bar, so it
+        # does not scale with the book. A 2x book needs twice as many bars to
+        # reach the same target weights, fills staler against a decaying
+        # signal, and earns a LOWER Sharpe - leverage is not free here and must
+        # not be reported as if it were. Watch avg gross in each block: the
+        # shortfall against the target is the fill the cap refused.
+        # Results are printed only, never persisted. No financing cost on the
+        # borrowed leg is modeled. Empty list (or all values <= 1) disables.
+        'report_leverage': [2.0, 4.0],
         'weight_smoothing_halflife': 6,      # legacy fixed EWM rate (fallback only)
         # No global turnover budget: the volume-participation cap below is the
         # only hard fill constraint (a budget throttled the fill to ~3.6 days
@@ -992,9 +1012,10 @@ config = {
             'enabled': True,
             'trade_urgency': 0.05,           # ~4.8%/bar fill: positions build over hours
             'ref_cost_bps': 5.0,             # cost at which trade_urgency is calibrated
-            # Discount the aim at the rate the book ACTUALLY fills (capped by the
-            # turnover budget), not the nominal trade rate. Keeps the aim from
-            # over-sizing fast alpha the budget-throttled book can't capture.
+            # Discount the aim at the rate the book ACTUALLY fills, not the
+            # nominal trade rate. Keeps the aim from over-sizing fast alpha a
+            # slow-filling book can't capture. (With no turnover budget the two
+            # rates now coincide; the hook stays for per-name fill effects.)
             'discount_at_realized_rate': True,
         },
         'min_assets': 30,                    # Leaves room for caps + neutrality constraints
@@ -1016,6 +1037,22 @@ config = {
         # +3.9bp/day. 1 = trade from first promotion (old behavior); 2 = require
         # one confirming re-promotion before trading.
         'min_consecutive_promotions': 2,
+        # NO-PROMOTION MONTHS: when every promotion in a month fails the gate
+        # above, there is no confirmed alpha to build a new book from - but the
+        # book already on the exchange does not vanish. It is HELD (frozen, not
+        # re-targeted, no new alpha) and its raw PnL, perp funding and forced
+        # closes are simulated like any other month, because that is what the
+        # position would actually have done. After this many CONSECUTIVE
+        # unconfirmed months the book is LIQUIDATED (unwound at the volume
+        # participation cap, paying the exit cost) and sits flat until a signal
+        # is confirmed again - holding a stale book indefinitely is an implicit
+        # bet that expired alpha persists, which is exactly what the gate says
+        # not to assume. 0 = liquidate on the first unconfirmed month.
+        # Skipping these months entirely (the old behavior) silently dropped
+        # the hold from the record: two months of a live 63-name book went
+        # unsimulated between W06 and W09, and the equity curve read flat
+        # across the hole.
+        'max_hold_months_no_promotion': 2,
         # Soft cluster-exposure penalty: clusters from trailing residual
         # correlations (same window as the covariance, causal). Motivated by
         # the Marchenko-Pastur diagnostic: stable super-MP structure exists
@@ -1092,16 +1129,18 @@ config = {
         'participation': {
             'book_size_usd': 1_000_000,      # notional gross book for $-based caps
             # PER-SYMBOL cap: a name's per-bar trade may not exceed this fraction
-            # of THAT name's average bar $ volume (0.5% of volume = market-impact
+            # of THAT name's average bar $ volume (1% of volume = market-impact
             # limit). Converted to weight units via book_size_usd.
-            'max_participation': 0.005,
+            'max_participation': 0.01,
             'volume_window_bars': 10,        # trailing window for the average
-            # OVERALL BOOK cap: total per-bar turnover (sum of |dw| over all names,
-            # plus forced closes of names leaving the universe) may not exceed this
-            # fraction of the book. The whole voluntary trade vector is scaled down
-            # uniformly to fit - neutrality-preserving and only ever tightens each
-            # name's volume-participation trade. None disables (per-symbol only).
-            'max_book_turnover': 0.005,
+            # There is NO whole-book turnover cap. The per-symbol volume
+            # participation limit above is the only hard fill constraint: it is
+            # the one grounded in market impact (you cannot trade more than a
+            # slice of a name's volume without moving it), whereas a book-level
+            # turnover budget is an arbitrary throttle that silently scaled the
+            # whole trade vector down and slowed every fill to protect a number
+            # nothing physical enforces. Cost discipline belongs in cost_bps and
+            # the GP trade rate, which price trading rather than forbid it.
         },
     },
 
