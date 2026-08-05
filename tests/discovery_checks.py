@@ -267,6 +267,46 @@ for label, cand in [
     except gen.ValidationError:
         check(f"boundedness: {label} rejected", True)
 
+# Production scoring releases the all-feature panel after diagnostics and
+# asks the roll store for exactly the columns referenced by each candidate.
+class _MemoryFeatureStore:
+    def __init__(self, panel):
+        self.keys = panel[['timestamp', 'symbol']].copy()
+        self.values = {c: panel[c].copy() for c in ('res_zscore', 'res_mom',
+                                                     'vol_ratio')}
+        self.requests = []
+
+    def panel(self, columns):
+        columns = sorted(columns)
+        self.requests.append(columns)
+        out = self.keys.copy()
+        for c in columns:
+            out[c] = self.values[c].values
+        return out
+
+
+fast_panel = data_mod.slice_window(
+    make_panel(plant=0.002, seed=8), ROLL.train_start, ROLL.oos_start, 0
+).reset_index(drop=True)
+fast_store = _MemoryFeatureStore(fast_panel)
+fast_cfg = test_cfg()
+fast_cfg['search'] = {**fast_cfg['search'], 'n_generations': 0}
+fast_family_cols = data_mod.resolve_family_columns(fast_panel.columns,
+                                                    fast_cfg)
+fast_seed = gen.Candidate('fast_path_probe', 'residual_shape',
+                          ('col', 'res_zscore'))
+fast_pop = search_mod.run_search(
+    fast_panel, ROLL, fast_family_cols,
+    gen.RandomProposer(dsl_cfg=fast_cfg['dsl'], mutation_prob=0.6),
+    search_mod.DiscoveryLedger(None), fast_cfg,
+    seed_candidates=[fast_seed], feature_store=fast_store)
+check("fast path: candidate requests only its AST feature columns",
+      fast_store.requests == [['res_zscore']], f"({fast_store.requests})")
+check("fast path: all-feature columns released before scoring",
+      'res_zscore' not in fast_panel.columns and 'vol_ratio' not in fast_panel.columns)
+check("fast path: exact-column candidate is fully measured",
+      any(s['candidate'].hash == fast_seed.hash for s in fast_pop))
+
 # ---------------------------------------------------------------------------
 # 4. Noise in, bounded out: rank + K slots on a pure-noise panel. There is
 #    deliberately NO significance gate anymore - the fixed book_size caps

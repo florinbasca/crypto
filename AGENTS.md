@@ -62,6 +62,20 @@ All configuration values MUST be in `config.py`. Never hardcode:
 
 ## Important Notes
 
+- Discovery builds its panel PER ROLL (`build_panel(start=, end=)`), not once
+  for all history: a whole-history panel is ~12.4 GB and grows with the
+  universe (66 tradeable names in 2022, 136 by 2025), which on a 24 GB box
+  forces the kernel to compress memory and slows scoring ~15x while still
+  reporting ~100% CPU. The windowed build pads by `liquidity_window_bars`
+  before and `target_lag_bars` after, then trims - drop either pad and the
+  is_liquid flag or the forward target silently changes. tests/
+  discovery_panel_window_checks.py asserts the two paths agree.
+- Discovery candidates compile against exact AST columns from the roll feature
+  store (normally 2-3 columns), and survivor signals are shared-grid float32
+  matrices. Do not restore per-candidate long timestamp/symbol DataFrames:
+  dozens of survivors duplicate several million keys each and force memory
+  compression. Response curves, turnover and correlation consume the matrices
+  directly; the public long-frame helpers remain only for compatibility/tests.
 - Base frequency 10min (144 bars/day); horizons 10min / 1h / 1d
 - Signals are cross-sectional; predictions target forward RESIDUAL returns
 - Final backtest PnL uses RAW returns - neutrality constraints do the hedging;

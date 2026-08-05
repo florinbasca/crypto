@@ -83,18 +83,23 @@ def _resolve_columns(cfg):
     return family_columns
 
 
-def _run_stamp(cfg: dict, panel: pd.DataFrame) -> dict:
+def _run_stamp(cfg: dict, fp: dict) -> dict:
     """Provenance for every ledger/promotion row this run writes: a fresh
     run_id, a hash of the exact discovery config, the git commit, and a
     fingerprint of the data panel (shape + date range + symbol set). Config
     tuning across runs spends the select window's honesty - the stamp makes
     a table that mixes runs/configs/data DETECTABLE instead of silently
-    blended, and lets any promotion be traced to the run that produced it."""
+    blended, and lets any promotion be traced to the run that produced it.
+
+    `fp` comes from data.panel_fingerprint(), which derives the same four
+    quantities without materializing the whole-history panel. The hashed
+    string is byte-identical to the old panel-derived one, so data_hash stays
+    comparable with rows written before panels were built per roll."""
     cfg_hash = hashlib.sha256(
         json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:12]
     data_hash = hashlib.sha256(
-        (f"{len(panel)}|{panel['timestamp'].min()}|{panel['timestamp'].max()}"
-         f"|{','.join(sorted(panel['symbol'].unique()))}"
+        (f"{fp['n_rows']}|{fp['ts_min']}|{fp['ts_max']}"
+         f"|{','.join(fp['symbols'])}"
          ).encode()).hexdigest()[:12]
     try:
         git_sha = subprocess.run(
@@ -158,14 +163,18 @@ def main():
     family_columns = _resolve_columns(cfg)
     feature_cols = data_mod.all_family_columns(family_columns)
 
-    print(f"Building the panel ({len(feature_cols)} features; verdicts are "
-          f"{cfg['curve']['horizon_bars']}-bar response curves, one "
-          f"{cfg['target_lag_bars']}b target column for diagnostics)...")
-    t0 = time.perf_counter()
-    panel = data_mod.build_panel(feature_cols, cfg)
-    print(f"Panel ready: {len(panel):,} rows, "
-          f"{panel['symbol'].nunique()} symbols "
-          f"({time.perf_counter() - t0:,.1f}s)")
+    # The panel is built PER ROLL, inside the loop below, over exactly that
+    # roll's [train_start, oos_start) window. A whole-history panel is ~12.4 GB
+    # (17.4M rows x 177 float32 features) and has to coexist with the roll's
+    # own ~3 GB working copy; on a 24 GB box that leaves nothing, and the
+    # kernel starts compressing memory - the run keeps reporting ~100% CPU
+    # while spending it on page decompression instead of candidates. It also
+    # gets worse over time on its own: the tradeable universe grew from 66
+    # names in 2022 to 136 by 2025, so the per-roll window is 2.2x wider at the
+    # end of the backtest than at the start.
+    print(f"Panels are built per roll ({len(feature_cols)} features; verdicts "
+          f"are {cfg['curve']['horizon_bars']}-bar response curves, one "
+          f"{cfg['target_lag_bars']}b target column for diagnostics)")
 
     rolls = data_mod.make_rolls(cfg)
     if args.max_rolls > 0:
@@ -176,7 +185,7 @@ def main():
           f"select {cfg['select_months']}mo / OOS {cfg['oos_months']}mo")
 
     ledger = search_mod.DiscoveryLedger(tables['ledger'] if save else None)
-    stamp = _run_stamp(cfg, panel)
+    stamp = _run_stamp(cfg, data_mod.panel_fingerprint(cfg))
     ledger.run_stamp = stamp
     print(f"run {stamp['run_id']} (config {stamp['config_hash']}, "
           f"data {stamp['data_hash']}, git {stamp['git_sha']})")
@@ -214,6 +223,19 @@ def main():
               f"| select ..{roll.oos_start.date()} "
               f"| OOS ..{roll.oos_end.date()} ===")
 
+        # This roll's window only. Rebuilding each roll costs a load the
+        # whole-history panel paid once, and buys back ~9 GB of resident
+        # memory - which is the difference between scoring candidates and
+        # decompressing pages. Bound to [train_start, oos_start): OOS bars are
+        # never loaded, so the window cannot leak into the search at all.
+        t0 = time.perf_counter()
+        panel = data_mod.build_panel(feature_cols, cfg,
+                                     start=roll.train_start,
+                                     end=roll.oos_start,
+                                     include_auxiliary=False)
+        print(f"  panel: {len(panel):,} rows, {panel['symbol'].nunique()} "
+              f"symbols ({time.perf_counter() - t0:,.1f}s)")
+
         if not seeds and roll.roll_id > 0:
             # resumed/partial runs: recover the previous roll's survivors
             seeds = ledger.survivor_candidates(roll.roll_id - 1)
@@ -239,15 +261,27 @@ def main():
         seeds = seeds + [c for c in enumerate_candidates(
             panel, roll, family_columns, cfg) if c.hash not in have]
 
+        # Diagnostics/enumeration need the full feature universe once. Actual
+        # candidate compilation references only the columns in each formula's
+        # AST, so switch to a bounded, projection-pushed Parquet cache before
+        # the hundreds of full-resolution evaluations begin.
+        feature_store = data_mod.RollFeatureStore(
+            panel[['timestamp', 'symbol']], roll.train_start, roll.oos_start,
+            int(cfg['candidate_feature_cache_columns']))
+
         usage_before = proposer.usage_snapshot()
+        search_t0 = time.perf_counter()
         survivors = search_mod.run_search(panel, roll, family_columns,
                                           proposer, ledger, cfg,
-                                          seed_candidates=seeds)
+                                          seed_candidates=seeds,
+                                          feature_store=feature_store)
         n_reseeded = len({s['candidate'].hash for s in survivors}
                          & {c.hash for c in seeds})
         print(f"search: {ledger.n_trials(roll.roll_id)} candidates tried, "
               f"{len(survivors)} survivors "
-              f"({n_reseeded} carried over from the previous roll)")
+              f"({n_reseeded} carried over from the previous roll; "
+              f"{time.perf_counter() - search_t0:,.1f}s; "
+              f"{feature_store.summary()})")
         seeds = [s['candidate'] for s in survivors]
 
         usage_after = proposer.usage_snapshot()

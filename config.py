@@ -450,8 +450,9 @@ config = {
         # target leaks across a boundary.
         'embargo_bars': 12,
         # Holding-period grid (1h/6h/12h/1d) for walk_forward_analysis's
-        # per-horizon slice-IC view. Scoring/selection use the response
-        # curve; nothing in discovery reads this anymore.
+        # implementation-lag decay view (alpha if every trade happens L bars
+        # late). Scoring/selection use the response curve; nothing in
+        # discovery reads this anymore.
         'horizon_lags_bars': [6, 36, 72, 144],
         # Reference lag for the proposer's compressed diagnostics only (the
         # decile nonlinearity view needs one fixed forward horizon to bin
@@ -498,6 +499,13 @@ config = {
         # Formula-level activity is still checked at promotion (a tight GATE
         # on a dense feature is invisible here).
         'min_feature_nonnan': 20,
+        # Candidate compilation reads only the columns present in its AST
+        # (typically 2-3, bounded at 4 in the current grammar). Diagnostics and
+        # enumeration already touch all 177 currently resolved columns, so the
+        # roll store adopts those float32 arrays before releasing the wide
+        # Pandas panel. 192 leaves room for modest feature growth without
+        # triggering repeated Parquet scans; LRU eviction still bounds it.
+        'candidate_feature_cache_columns': 192,
         'liquidity_window_bars': 144,    # trailing $vol window for the liquid-half flag
         # Input space: feature columns are resolved by matching these
         # per-family prefix patterns against the features table (bounded input
@@ -1282,6 +1290,11 @@ def validate_config() -> None:
     )
     if any(not isinstance(workers[key], int) or workers[key] < 1 for key in worker_keys):
         raise ValueError("all compute worker/thread settings must be positive integers")
+
+    feature_cache = config['discovery']['candidate_feature_cache_columns']
+    if not isinstance(feature_cache, int) or feature_cache < 1:
+        raise ValueError(
+            "discovery.candidate_feature_cache_columns must be a positive integer")
 
     ranking_weights = config['walk_forward']['candidate_ranking']['score_weights']
     if not ranking_weights or any(weight < 0 for weight in ranking_weights.values()):

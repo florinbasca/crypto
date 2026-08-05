@@ -4,8 +4,9 @@ DATA: the roll's data foundation and the compressed diagnostics.
 1. Panel construction - features + residual/raw returns + forward residual
    targets (fwd_Lb[t] = sum of residuals over t+1..t+L, the repo's
    rolling(L).sum().shift(-L) convention) + liquid-half flag + daily factor
-   betas, restricted to the point-in-time universe. Built ONCE per run; every
-   candidate evaluation afterwards is column algebra on this cached panel.
+   betas, restricted to the point-in-time universe. Discovery builds this once
+   per roll for diagnostics/enumeration, then candidate evaluation uses exact
+   AST-column views from RollFeatureStore.
 2. Rolls and window slicing - train/select/OOS windows and the purge/embargo
    discipline (the last max-target-lag + embargo bars of TRAIN and SELECT are
    dropped so no forward target leaks across a boundary). Window slicing lives
@@ -19,6 +20,7 @@ synthetic panels in tests without a database.
 """
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -129,31 +131,154 @@ def all_family_columns(family_columns: dict) -> List[str]:
     return sorted({c for cols in family_columns.values() for c in cols})
 
 
+class RollFeatureStore:
+    """Exact-column feature access for candidate compilation within one roll.
+
+    The expensive all-feature panel is still useful once for diagnostics and
+    enumeration. Candidate scoring, however, normally references only a few
+    columns. The store adopts those already-loaded arrays, then exposes only
+    each AST's columns. If a later formula needs a column that was not adopted,
+    it falls back to Polars projection/predicate pushdown. The aligned float32
+    cache is bounded and shared timestamp/symbol coordinates are never cached
+    per feature.
+    """
+
+    def __init__(self, keys: pd.DataFrame, start: pd.Timestamp,
+                 end: pd.Timestamp, max_columns: int):
+        self._keys = keys[['timestamp', 'symbol']].reset_index(drop=True)
+        self._index = None
+        self._start = pd.Timestamp(start)
+        self._end = pd.Timestamp(end)
+        self._max_columns = max(1, int(max_columns))
+        self._cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self.load_calls = 0
+        self.columns_loaded = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def _load(self, columns: Sequence[str]) -> None:
+        from dbutil import load_data
+        missing = [c for c in columns if c not in self._cache]
+        if not missing:
+            return
+        self.load_calls += 1
+        self.columns_loaded += len(missing)
+        tf = {'timestamp': [('>=', self._start), ('<', self._end)]}
+        frame = load_data('features',
+                          columns=['timestamp', 'symbol'] + missing,
+                          filters=tf)
+        if frame.empty:
+            raise RuntimeError("features table returned no rows for roll")
+        frame['timestamp'] = pd.to_datetime(frame['timestamp'])
+        if self._index is None:
+            self._index = pd.MultiIndex.from_frame(self._keys)
+        aligned = frame.set_index(['timestamp', 'symbol']).reindex(self._index)
+        for col in missing:
+            self._cache[col] = aligned[col].to_numpy(dtype=np.float32,
+                                                      copy=True)
+            self._cache.move_to_end(col)
+        while len(self._cache) > self._max_columns:
+            self._cache.popitem(last=False)
+
+    def warm(self, frame: pd.DataFrame, columns: Sequence[str]) -> None:
+        """Adopt already-loaded feature columns before the wide panel drops.
+
+        Diagnostics and enumeration necessarily touch the complete bounded
+        feature universe. Reusing those arrays is much faster than scanning
+        the same Parquet row groups hundreds of times during scoring. Candidate
+        panels still expose only their AST columns; the shared arrays remain
+        read-only roll cache entries.
+        """
+        present = [c for c in columns if c in frame.columns]
+        if len(present) > self._max_columns:
+            present = present[:self._max_columns]
+        for col in present:
+            self._cache[col] = frame[col].to_numpy(dtype=np.float32,
+                                                    copy=False)
+            self._cache.move_to_end(col)
+
+    def panel(self, columns: Sequence[str]) -> pd.DataFrame:
+        ordered = sorted(set(columns))
+        # A formula is bounded to four distinct columns today. Refuse a cache
+        # configuration that could evict one of its columns during this load.
+        if len(ordered) > self._max_columns:
+            raise RuntimeError(
+                f"candidate needs {len(ordered)} feature columns but the roll "
+                f"cache holds only {self._max_columns}")
+        for col in ordered:
+            if col in self._cache:
+                self.cache_hits += 1
+                self._cache.move_to_end(col)
+            else:
+                self.cache_misses += 1
+        self._load(ordered)
+        out = self._keys.copy(deep=False)
+        for col in ordered:
+            out[col] = self._cache[col]
+            self._cache.move_to_end(col)
+        return out
+
+    def summary(self) -> str:
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total if total else 0.0
+        return (f"{self.load_calls} projected reads, "
+                f"{self.columns_loaded} columns loaded, "
+                f"{hit_rate:.0%} column-cache hits")
+
+
 # =============================================================================
 # Panel construction (the only db-touching code in the discovery engine)
 # =============================================================================
 
 def build_panel(feature_cols: Sequence[str],
-                cfg: Optional[dict] = None) -> pd.DataFrame:
-    """One long panel [timestamp, symbol, features..., residual_return,
-    raw_return, fwd_{L}b..., is_liquid, beta_*], universe-filtered, sorted by
-    (symbol, timestamp)."""
+                cfg: Optional[dict] = None,
+                start: Optional[pd.Timestamp] = None,
+                end: Optional[pd.Timestamp] = None,
+                include_auxiliary: bool = True) -> pd.DataFrame:
+    """One long universe-filtered panel sorted by (symbol, timestamp).
+
+    ``include_auxiliary=True`` adds raw_return, is_liquid and beta_* for legacy
+    consumers and equivalence tests. Discovery passes False because its current
+    statistical scorer uses only residual returns, its diagnostic target and
+    feature columns.
+
+    `start`/`end` override the configured span so a caller can build ONE ROLL'S
+    window instead of all of history. The whole-history panel is ~12.4 GB at
+    177 float32 features and grows with the universe (66 tradeable names in
+    2022, 136 by 2025), which on a 24 GB box leaves no room for the per-roll
+    slice on top - the machine starts compressing memory and every candidate
+    evaluation slows by an order of magnitude.
+
+    A windowed build is EQUIVALENT to building everything and slicing, because
+    the two window-sensitive columns are padded before trimming:
+      - the forward target needs `target_lag_bars` AFTER the last kept bar;
+      - the liquidity rank is a `liquidity_window_bars` trailing mean, so it
+        needs that much history BEFORE the first kept bar.
+    Both paddings are loaded, used, and then trimmed away. tests/
+    discovery_panel_window_checks.py asserts the two paths agree cell for cell.
+    """
     from dbutil import load_data
     from research.lib.signal_eval import (load_universe_membership,
                                            universe_member_mask)
 
     cfg = cfg or get('discovery', {})
-    start = pd.Timestamp(cfg['start_date'])
-    end = pd.Timestamp(cfg['end_date'])
+    start = pd.Timestamp(cfg['start_date'] if start is None else start)
+    end = pd.Timestamp(cfg['end_date'] if end is None else end)
 
-    res = load_data('residual_returns',
-                    columns=['timestamp', 'symbol', 'residual_return',
-                             'raw_return'])
+    bar = pd.Timedelta(get_frequency_config(BASE_FREQUENCY)['nanos'], unit='ns')
+    load_start = start - int(cfg['liquidity_window_bars']) * bar
+    load_end = end + int(cfg['target_lag_bars']) * bar
+    tf = {'timestamp': [('>=', load_start), ('<', load_end)]}
+
+    res_cols = ['timestamp', 'symbol', 'residual_return']
+    if include_auxiliary:
+        res_cols.append('raw_return')
+    res = load_data('residual_returns', columns=res_cols, filters=tf)
     if res.empty:
         raise RuntimeError("residual_returns is empty - run "
                            "risk_model/residual_returns.py")
     res['timestamp'] = pd.to_datetime(res['timestamp'])
-    res = res[(res['timestamp'] >= start) & (res['timestamp'] < end)]
+    res = res[(res['timestamp'] >= load_start) & (res['timestamp'] < load_end)]
     res = res.sort_values(['symbol', 'timestamp']).reset_index(drop=True)
 
     # A single forward target column remains for the proposer diagnostics'
@@ -163,7 +288,8 @@ def build_panel(feature_cols: Sequence[str],
     panel = attach_targets(res, [int(cfg['target_lag_bars'])])
 
     features = load_data('features',
-                         columns=['timestamp', 'symbol'] + list(feature_cols))
+                         columns=['timestamp', 'symbol'] + list(feature_cols),
+                         filters=tf)
     features['timestamp'] = pd.to_datetime(features['timestamp'])
     panel = panel.merge(features, on=['timestamp', 'symbol'], how='left')
 
@@ -173,9 +299,40 @@ def build_panel(feature_cols: Sequence[str],
     else:
         logging.warning("universe membership unavailable - using full panel")
 
-    panel = attach_liquidity(panel, cfg)
-    panel = attach_betas(panel)
+    if include_auxiliary:
+        panel = attach_liquidity(panel, cfg, time_filter=tf)
+        panel = attach_betas(panel)
+    # Drop the padding: it existed only so the target and liquidity columns
+    # match a whole-history build.
+    panel = panel[(panel['timestamp'] >= start) & (panel['timestamp'] < end)]
     return panel.sort_values(['symbol', 'timestamp']).reset_index(drop=True)
+
+
+def panel_fingerprint(cfg: Optional[dict] = None) -> dict:
+    """Shape/span/symbols of the WHOLE-history panel, from timestamp+symbol
+    alone - no features, no merges, ~200 MB instead of 12.4 GB.
+
+    Used for the run's data-provenance stamp, which must stay comparable with
+    rows written before panels were built per roll. It is exact, not an
+    approximation: every attach_* step is a LEFT merge, so the universe filter
+    is the only thing that can drop a row, and that is reproduced here.
+    """
+    from dbutil import load_data
+    from research.lib.signal_eval import (load_universe_membership,
+                                          universe_member_mask)
+    cfg = cfg or get('discovery', {})
+    start = pd.Timestamp(cfg['start_date'])
+    end = pd.Timestamp(cfg['end_date'])
+    res = load_data('residual_returns', columns=['timestamp', 'symbol'],
+                    filters={'timestamp': [('>=', start), ('<', end)]})
+    res['timestamp'] = pd.to_datetime(res['timestamp'])
+    res = res[(res['timestamp'] >= start) & (res['timestamp'] < end)]
+    membership = load_universe_membership()
+    if membership is not None:
+        res = res[universe_member_mask(res, membership)]
+    return {'n_rows': len(res),
+            'ts_min': res['timestamp'].min(), 'ts_max': res['timestamp'].max(),
+            'symbols': sorted(res['symbol'].unique())}
 
 
 def attach_targets(res: pd.DataFrame, lags: Sequence[int]) -> pd.DataFrame:
@@ -196,14 +353,21 @@ def attach_targets(res: pd.DataFrame, lags: Sequence[int]) -> pd.DataFrame:
 
 
 def attach_liquidity(panel: pd.DataFrame,
-                     cfg: Optional[dict] = None) -> pd.DataFrame:
-    """is_liquid = top half by trailing dollar volume at each stamp."""
+                     cfg: Optional[dict] = None,
+                     time_filter: Optional[dict] = None) -> pd.DataFrame:
+    """is_liquid = top half by trailing dollar volume at each stamp.
+
+    `time_filter` bounds the price load to the panel's span (padded by the
+    caller with `liquidity_window_bars` of history, which the trailing mean
+    needs). Without it this reads every price bar ever stored, which is the
+    single largest allocation in a windowed panel build."""
     from dbutil import load_data
     cfg = cfg or get('discovery', {})
     window = int(cfg['liquidity_window_bars'])
     try:
         px = load_data('prices', columns=['timestamp', 'symbol',
-                                          'quote_asset_volume'])
+                                          'quote_asset_volume'],
+                       filters=time_filter)
         px['timestamp'] = pd.to_datetime(px['timestamp'])
         qv = px.pivot_table(index='timestamp', columns='symbol',
                             values='quote_asset_volume',

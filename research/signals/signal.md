@@ -295,8 +295,8 @@ are traded in that roll's OOS month only. All knobs live under `discovery.*` in
 
 ## Cost and run time
 
-A full run is ~36 rolls (windows; each spans 5+5+1 months, sliding monthly)
-× 16 generations. The default model is
+A full run is 36 rolls (windows; each spans 5+5+1 months, sliding monthly)
+× 24 generations. The default model is
 Gemini 3.1-flash-lite ($0.25 / $1.50 per million input / output tokens),
 measuring ~$1/roll — order $40 for the full run. Cheaper providers are one
 config switch away (`discovery.llm.provider` + the key in `.env`):
@@ -305,10 +305,11 @@ config switch away (`discovery.llm.provider` + the key in `.env`):
 other compatible endpoint. The script prints the measured tokens and dollars
 per roll; trust that over these estimates.
 
-Run time is dominated by candidate scoring (~15–20s per candidate on the
-5-month train panel), not the LLM: proposal calls run concurrently
-(`discovery.llm.parallel_requests`, default 8). Expect roughly 2–2.5 hours per
-roll, ~2–3 days for the full 28. Progress bars (per-generation, per-call,
-per-candidate) show the run is alive; lower parallel_requests if the provider
-rate-limits.
-
+Run time is dominated by candidate scoring, not the LLM: proposal calls run
+concurrently (`discovery.llm.parallel_requests`, default 8). Discovery prints
+the measured search seconds and projected-feature-cache statistics for every
+roll. The old 15–20s/candidate estimate predates exact-column compilation,
+shared-grid float32 survivor matrices, vectorized response curves and cached
+correlations, so do not use it to forecast the optimized path. Progress bars
+(per-generation, per-call, per-candidate) show the run is alive; lower
+parallel_requests if the provider rate-limits.

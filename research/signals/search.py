@@ -48,7 +48,8 @@ from research.signals.generation import (_to_list, candidate_columns,
                                                candidate_subtrees,
                                                Candidate, Proposer,
                                                ValidationError,
-                                               compile_candidate,
+                                               _CLIP, _EPS,
+                                               evaluate_candidate_raw,
                                                validate_candidate)
 
 DAYS_PER_YEAR = 365
@@ -122,7 +123,20 @@ def signal_turnover(sig: pd.DataFrame) -> float:
     'Modern Spirit of Statistical Arbitrage' (a 6.9% signal trades on its own;
     a 36.8% one does not). DIAGNOSTIC ONLY: never a reward or promotion term -
     real cost is a portfolio property, judged in the walk-forward."""
-    if sig is None or sig.empty:
+    if sig is None:
+        return float('nan')
+    if isinstance(sig, np.ndarray):
+        if sig.size == 0:
+            return float('nan')
+        w = np.asarray(sig, dtype=np.float64)
+        gross = np.nansum(np.abs(w), axis=1)
+        w = np.divide(w, gross[:, None],
+                      out=np.zeros_like(w), where=gross[:, None] > 0)
+        w[~np.isfinite(w)] = 0.0
+        if len(w) < 2:
+            return float('nan')
+        return float(np.abs(np.diff(w, axis=0)).sum(axis=1).mean() * 0.5)
+    if sig.empty:
         return float('nan')
     w = sig.pivot_table(index='timestamp', columns='symbol',
                         values='signal', aggfunc='first').sort_index()
@@ -245,6 +259,67 @@ def response_curve(sig: pd.DataFrame, res_wide: pd.DataFrame,
     }
 
 
+def response_curve_matrix(signal: np.ndarray, residuals: np.ndarray,
+                          timestamps: pd.DatetimeIndex,
+                          horizon_bars: int, entry_stride: int,
+                          min_assets: int,
+                          sample_ks: Optional[list] = None,
+                          residual_cumulative: Optional[np.ndarray] = None
+                          ) -> Optional[dict]:
+    """Array-native equivalent of :func:`response_curve`.
+
+    ``signal`` and ``residuals`` share one timestamp x symbol grid. The
+    cumulative-residual formulation computes the same path while avoiding a
+    per-candidate pivot and thousands of small Python-level matrix products.
+    """
+    if signal is None or signal.size == 0:
+        return None
+    w = np.asarray(signal, dtype=np.float64)
+    finite = np.isfinite(w)
+    counts = finite.sum(axis=1)
+    sums = np.nansum(w, axis=1)
+    means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
+    w = np.where(finite, w - means[:, None], np.nan)
+    gross = np.nansum(np.abs(w), axis=1)
+    w = np.divide(w, gross[:, None], out=np.full_like(w, np.nan),
+                  where=gross[:, None] > 0)
+    n_names = np.isfinite(w).sum(axis=1)
+
+    ok = (np.arange(len(w)) + horizon_bars < len(residuals)) \
+        & (n_names >= min_assets)
+    entry_rows = np.flatnonzero(ok)[::max(1, int(entry_stride))]
+    if len(entry_rows) == 0:
+        return None
+
+    weights = np.nan_to_num(w[entry_rows])
+    if residual_cumulative is None:
+        r = np.nan_to_num(np.asarray(residuals, dtype=np.float64))
+        cumulative = np.vstack([
+            np.zeros((1, r.shape[1]), dtype=np.float64),
+            np.cumsum(r, axis=0)])
+    else:
+        cumulative = residual_cumulative
+    base = cumulative[entry_rows + 1]
+    paths = np.empty((len(entry_rows), horizon_bars), dtype=np.float64)
+    for k in range(1, horizon_bars + 1):
+        forward = cumulative[entry_rows + k + 1] - base
+        paths[:, k - 1] = np.einsum('ij,ij->i', forward, weights,
+                                     optimize=True)
+
+    ks = sorted({int(k) for k in
+                 (sample_ks or (1, horizon_bars // 4, horizon_bars // 2,
+                                horizon_bars))
+                 if 1 <= int(k) <= horizon_bars})
+    entry_ts = timestamps[entry_rows]
+    return {
+        'A': paths.mean(axis=0),
+        'entries': int(len(entry_rows)),
+        'entry_days': int(entry_ts.normalize().nunique()),
+        'n_eff': max(1.0, len(entry_rows) * entry_stride / horizon_bars),
+        'per_entry_at': {k: paths[:, k - 1] for k in ks},
+    }
+
+
 def fit_response_curve(A: np.ndarray, n_eff: float,
                        per_entry_at: Optional[dict] = None) -> dict:
     """Deterministic anatomy of a response curve (no optimizer, grid fits
@@ -323,6 +398,15 @@ def thirds_sign_consistent(per_entry_vals) -> bool:
 def signal_correlation(sig_a: pd.DataFrame, sig_b: pd.DataFrame) -> float:
     """Pearson correlation of two compiled signal panels on their common
     (timestamp, symbol) support. 0.0 when support is too thin."""
+    if isinstance(sig_a, np.ndarray) and isinstance(sig_b, np.ndarray):
+        if sig_a.shape != sig_b.shape:
+            return 0.0
+        a = sig_a.ravel()
+        b = sig_b.ravel()
+        ok = np.isfinite(a) & np.isfinite(b)
+        if ok.sum() < 10 or a[ok].std() == 0 or b[ok].std() == 0:
+            return 0.0
+        return float(np.corrcoef(a[ok], b[ok])[0, 1])
     m = sig_a.merge(sig_b, on=['timestamp', 'symbol'], suffixes=('_a', '_b'))
     if len(m) < 10:
         return 0.0
@@ -581,7 +665,8 @@ def allocate_batch(bandit: Dict[str, dict], families: List[str],
 
 
 def select_survivors(population: List[dict], k: int, max_corr: float,
-                     max_per_column: int = 0) -> List[dict]:
+                     max_per_column: int = 0,
+                     correlation_cache: Optional[dict] = None) -> List[dict]:
     """Best-first greedy de-duplication: keep the highest-reward candidates
     whose OUTPUT (train signal correlation) stays <= max_corr vs every
     already-kept one. What a signal outputs is what the book trades - two
@@ -606,9 +691,19 @@ def select_survivors(population: List[dict], k: int, max_corr: float,
         if max_per_column and any(col_counts[c] >= max_per_column
                                   for c in cols):
             continue
-        if max_signal_correlation(
-                cand['signal_train'],
-                [x['signal_train'] for x in kept]) <= max_corr:
+        correlations = []
+        for other in kept:
+            key = tuple(sorted((cand['candidate'].hash,
+                                other['candidate'].hash)))
+            if correlation_cache is not None and key in correlation_cache:
+                corr = correlation_cache[key]
+            else:
+                corr = abs(signal_correlation(cand['signal_train'],
+                                              other['signal_train']))
+                if correlation_cache is not None:
+                    correlation_cache[key] = corr
+            correlations.append(corr)
+        if max(correlations, default=0.0) <= max_corr:
             kept.append(cand)
             col_counts.update(cols)
     return kept
@@ -618,7 +713,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                family_columns: Dict[str, list], proposer: Proposer,
                ledger: DiscoveryLedger,
                cfg: Optional[dict] = None,
-               seed_candidates: Optional[List] = None) -> List[dict]:
+               seed_candidates: Optional[List] = None,
+               feature_store=None) -> List[dict]:
     """One roll's budgeted propose -> compile -> evaluate -> keep-survivors
     loop. Returns the survivor list: dicts with candidate, direction, reward,
     metrics and the compiled SELECT-window signal. Never touches OOS.
@@ -641,9 +737,15 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     pb = purge_bars(cfg)
     # Compile on train+select only: rolling warmup inside the roll, OOS unseen.
     roll_panel = slice_window(panel, roll.train_start, roll.oos_start, 0)
-    roll_panel = roll_panel.reset_index(drop=True)
+    if len(roll_panel) == len(panel):
+        # Caller already handed us exactly this roll's window (build_panel is
+        # called per roll), so the slice selected everything. Re-materializing
+        # it would duplicate a multi-GB frame for nothing; build_panel returns
+        # a 0..n-1 index already, which is all reset_index was for.
+        roll_panel = panel
+    else:
+        roll_panel = roll_panel.reset_index(drop=True)
     train = slice_window(roll_panel, roll.train_start, roll.select_start, pb)
-    select = slice_window(roll_panel, roll.select_start, roll.oos_start, pb)
     # Coverage-floor denominator + threshold (see try_candidate).
     train_days_total = int(train['timestamp'].dt.normalize().nunique())
     min_train_coverage = float(search_cfg.get('min_train_coverage', 0.0))
@@ -657,6 +759,22 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         res_wide = (roll_panel.pivot_table(
             index='timestamp', columns='symbol',
             values='residual_return', aggfunc='first').sort_index())
+    # One shared coordinate grid for every compiled candidate. Candidate
+    # signals are retained as float32 matrices on this grid rather than as
+    # millions of repeated timestamp/symbol rows.
+    signal_timestamps = (pd.DatetimeIndex(res_wide.index)
+                         if res_wide is not None else pd.DatetimeIndex([]))
+    signal_symbols = (pd.Index(res_wide.columns)
+                      if res_wide is not None else pd.Index([]))
+    if res_wide is not None:
+        t_codes = signal_timestamps.get_indexer(roll_panel['timestamp'])
+        s_codes = signal_symbols.get_indexer(roll_panel['symbol'])
+        if (t_codes < 0).any() or (s_codes < 0).any():
+            raise RuntimeError("roll panel could not be aligned to residual grid")
+        signal_flat_positions = t_codes * len(signal_symbols) + s_codes
+        residual_values = res_wide.to_numpy(copy=False)
+        train_grid = signal_timestamps < roll.select_start
+        select_grid = ~train_grid
 
     from research.signals.data import (all_family_columns,
                                              build_diagnostics)
@@ -683,6 +801,17 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     diagnostics = build_diagnostics(train, family_columns, diag_tcol,
                                     diag_lag, cfg)
 
+    if feature_store is not None:
+        # The full feature universe was needed for the one-time diagnostics
+        # and enumeration passes. From here on each formula gets only its AST
+        # columns from RollFeatureStore. Dropping these columns in place also
+        # slims the caller's per-roll panel because it is the same object.
+        del train
+        removable = [c for c in allowed_cols if c in roll_panel.columns]
+        if hasattr(feature_store, 'warm'):
+            feature_store.warm(roll_panel, removable)
+        roll_panel.drop(columns=removable, inplace=True)
+
     families = [f for f, cols in family_columns.items() if cols]
     bandit = {f: {'n': 0, 'sum': 0.0} for f in families}
     population: List[dict] = []
@@ -691,22 +820,48 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     # tried this roll, so the LLM can be told which recipes are over-mined.
     from collections import Counter
     subtree_counts: "Counter" = Counter()
+    signal_corr_cache: dict = {}
+
+    def _population_similarity(cand_hash: str, signal,
+                               others: List[dict]) -> float:
+        correlations = []
+        for other in others:
+            key = tuple(sorted((cand_hash, other['candidate'].hash)))
+            if key not in signal_corr_cache:
+                signal_corr_cache[key] = abs(signal_correlation(
+                    signal, other['signal_train']))
+            correlations.append(signal_corr_cache[key])
+        return max(correlations, default=0.0)
 
     # Train-side residual matrix ends BEFORE the test window: a train
     # curve's paths must never read a test bar (the reward would see it).
-    res_wide_train = (res_wide[res_wide.index < roll.select_start]
+    residual_train = (residual_values[train_grid]
                       if res_wide is not None else None)
+    residual_select = (residual_values[select_grid]
+                       if res_wide is not None else None)
+    timestamps_train = signal_timestamps[train_grid]
+    timestamps_select = signal_timestamps[select_grid]
+    def _residual_cumulative(values):
+        r = np.nan_to_num(np.asarray(values, dtype=np.float64))
+        return np.vstack([np.zeros((1, r.shape[1]), dtype=np.float64),
+                          np.cumsum(r, axis=0)])
+    cumulative_train = (_residual_cumulative(residual_train)
+                        if residual_train is not None else None)
+    cumulative_select = (_residual_cumulative(residual_select)
+                         if residual_select is not None else None)
     H = int(curve_cfg.get('horizon_bars', 0) or 0)
     stride = int(curve_cfg.get('entry_stride_bars', 6) or 6)
     sample_ks = curve_cfg.get('sample_ks')
     rt_cost = (float(curve_cfg.get('roundtrip_mult', 2.0))
                * float(get('portfolio.cost_bps')) / 10000.0)
 
-    def _curve_of(sig_part, matrix) -> Optional[dict]:
+    def _curve_of(sig_part, matrix, timestamps,
+                  cumulative) -> Optional[dict]:
         """Compute + fit one response curve; None when the window can't
         host a full path (callers fall back / reject)."""
-        rc = response_curve(sig_part, matrix, H, stride, min_assets,
-                            sample_ks=sample_ks)
+        rc = response_curve_matrix(sig_part, matrix, timestamps, H, stride,
+                                   min_assets, sample_ks=sample_ks,
+                                   residual_cumulative=cumulative)
         if rc is None:
             return None
         fit = fit_response_curve(rc['A'], rc['n_eff'], rc['per_entry_at'])
@@ -764,16 +919,39 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         seen.add(cand.hash)
         try:
             validate_candidate(cand, allowed_cols, cfg['dsl'])
-            sig = compile_candidate(cand, roll_panel)
+            candidate_panel = (feature_store.panel(candidate_columns(cand))
+                               if feature_store is not None else roll_panel)
+            raw_values = evaluate_candidate_raw(cand, candidate_panel)
         except (ValidationError, Exception) as e:
             logging.debug(f"candidate rejected: {cand.name}: {e}")
             return
-        if sig.empty:
+        values = raw_values.to_numpy(dtype=np.float64, copy=False)
+        if not np.isfinite(values).any():
             return
+        signal = np.full((len(signal_timestamps), len(signal_symbols)),
+                         np.nan, dtype=np.float64)
+        signal.ravel()[signal_flat_positions] = values
+        # Exact compiler normalization on the shared grid. pandas std uses
+        # ddof=1; reproduce it explicitly while avoiding two multi-million-row
+        # timestamp groupby transforms for every formula.
+        finite = np.isfinite(signal)
+        counts = finite.sum(axis=1)
+        sums = np.nansum(signal, axis=1)
+        means = np.divide(sums, counts, out=np.zeros_like(sums),
+                          where=counts > 0)
+        centered = np.where(finite, signal - means[:, None], np.nan)
+        squares = np.nansum(centered * centered, axis=1)
+        variance = np.divide(squares, counts - 1,
+                             out=np.full_like(squares, np.nan),
+                             where=counts > 1)
+        std = np.sqrt(np.maximum(variance, 0.0))
+        signal = np.clip(centered / (std[:, None] + _EPS), -_CLIP, _CLIP)
+        signal = signal.astype(np.float32, copy=False)
         subtree_counts.update(candidate_subtrees(cand))
 
-        sig_train = sig[sig['timestamp'] < roll.select_start]
-        curve_train_raw = _curve_of(sig_train, res_wide_train)
+        sig_train = signal[train_grid]
+        curve_train_raw = _curve_of(sig_train, residual_train,
+                                    timestamps_train, cumulative_train)
         if curve_train_raw is None:
             return
 
@@ -801,12 +979,12 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             ledger.train_history(cand.hash, up_to_roll=roll.roll_id - 1)
             + [_curve_metrics(curve_train_raw)])
         if direction < 0:
-            sig = sig.assign(signal=-sig['signal'])
-            sig_train = sig[sig['timestamp'] < roll.select_start]
+            signal = -signal
+            sig_train = signal[train_grid]
             curve_train = _flip_curve(curve_train_raw)
         else:
             curve_train = curve_train_raw
-        sig_select = sig[sig['timestamp'] >= roll.select_start]
+        sig_select = signal[select_grid]
 
         # Reward = the TRAIN curve's net economic rate at its own optimal
         # holding (the identical formula promotion ranks by) minus
@@ -815,8 +993,7 @@ def run_search(panel: pd.DataFrame, roll: Roll,
                  for k, a in zip(curve_train['ks'], curve_train['A'])
                  if a is not None and int(k) > 0]
         net_rate = max(rates) if rates else float('-inf')
-        similarity = max_signal_correlation(
-            sig_train, [s['signal_train'] for s in population])
+        similarity = _population_similarity(cand.hash, sig_train, population)
         rwd, terms = compute_reward(net_rate, similarity, cfg['reward'])
         half_life = float(curve_train['half_life'])
         m_train = _curve_metrics(curve_train)
@@ -846,7 +1023,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         turnover = signal_turnover(sig_train)
 
         # TEST curve: the verdict. Feeds nothing in this loop.
-        curve = _curve_of(sig_select, res_wide)
+        curve = _curve_of(sig_select, residual_select, timestamps_select,
+                          cumulative_select)
         m_select = _curve_metrics(curve)
         profile = {}
         for key, c in (('curve', curve), ('curve_train', curve_train)):
@@ -871,8 +1049,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             'reward': rwd, 'metrics_train': m_train,
             'metrics_select': m_select,
             'turnover': turnover,
-            'signal_train': sig_train.reset_index(drop=True),
-            'signal_select': sig_select.reset_index(drop=True),
+            'signal_train': sig_train,
+            'signal_select': sig_select,
         })
 
     # Failure memory: recently-culled low-reward candidates (and coverage-
@@ -972,7 +1150,8 @@ def run_search(panel: pd.DataFrame, roll: Roll,
             population = select_survivors(eligible,
                                           int(search_cfg['survivors']),
                                           float(search_cfg['diversity_max_corr']),
-                                          max_per_column)
+                                          max_per_column,
+                                          signal_corr_cache)
             # Whatever was tried this gen but did not survive is a failure to
             # remember (low reward first is selected at prompt time).
             kept = {s['candidate'].hash for s in population}
@@ -1000,4 +1179,3 @@ def run_search(panel: pd.DataFrame, roll: Roll,
     ledger.mark_survivors(roll.roll_id,
                           [s['candidate'].hash for s in population])
     return population
-

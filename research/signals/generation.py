@@ -423,20 +423,10 @@ def eval_condition(cond, df: pd.DataFrame) -> pd.Series:
 _CLIP = 3.0
 
 
-def compile_candidate(cand: Candidate, panel: pd.DataFrame,
-                      allowed_columns=None,
-                      dsl_cfg: Optional[dict] = None) -> pd.DataFrame:
-    """Compile one candidate into [timestamp, symbol, signal].
-
-    panel must be sorted by (symbol, timestamp) - rolling operators depend on
-    it. Validation runs first when allowed_columns is given (the search always
-    passes it; tests may skip). Pipeline (hard requirement from signal.md):
-    evaluate the expression, apply gate conditions (gated-off rows are neutral
-    0, keeping the cross-section intact), then per-timestamp cross-sectional
-    demean + z-score + clip (+-3) - the same normalization
-    research/lib/signal_eval.py applies to every registered signal, so a
-    discovered signal's numbers are on the same scale as any other's.
-    """
+def evaluate_candidate_raw(cand: Candidate, panel: pd.DataFrame,
+                           allowed_columns=None,
+                           dsl_cfg: Optional[dict] = None) -> pd.Series:
+    """Evaluate expression + gates, before cross-sectional normalization."""
     if allowed_columns is not None:
         validate_candidate(cand, allowed_columns, dsl_cfg)
 
@@ -451,12 +441,42 @@ def compile_candidate(cand: Candidate, panel: pd.DataFrame,
         # position in gated-off names.
         raw = raw.where(mask | raw.isna(), 0.0)
 
-    out = panel[['timestamp', 'symbol']].copy()
-    out['signal'] = raw.astype(float).replace([np.inf, -np.inf], np.nan)
+    return raw.astype(float).replace([np.inf, -np.inf], np.nan)
 
-    g = out.groupby('timestamp')['signal']
-    out['signal'] = (out['signal'] - g.transform('mean')) / (g.transform('std') + _EPS)
-    out['signal'] = out['signal'].clip(-_CLIP, _CLIP)
+
+def compile_candidate_values(cand: Candidate, panel: pd.DataFrame,
+                             allowed_columns=None,
+                             dsl_cfg: Optional[dict] = None) -> pd.Series:
+    """Compile one candidate to a signal Series aligned to ``panel``.
+
+    Keeping the result aligned avoids copying the identical timestamp/symbol
+    columns for every candidate. ``compile_candidate`` below remains the
+    public long-frame compatibility wrapper used by tests and other callers.
+    """
+    signal = evaluate_candidate_raw(
+        cand, panel, allowed_columns=allowed_columns, dsl_cfg=dsl_cfg)
+    g = signal.groupby(panel['timestamp'])
+    signal = (signal - g.transform('mean')) / (g.transform('std') + _EPS)
+    return signal.clip(-_CLIP, _CLIP)
+
+
+def compile_candidate(cand: Candidate, panel: pd.DataFrame,
+                      allowed_columns=None,
+                      dsl_cfg: Optional[dict] = None) -> pd.DataFrame:
+    """Compile one candidate into [timestamp, symbol, signal].
+
+    panel must be sorted by (symbol, timestamp) - rolling operators depend on
+    it. Validation runs first when allowed_columns is given (the search always
+    passes it; tests may skip). Pipeline (hard requirement from signal.md):
+    evaluate the expression, apply gate conditions (gated-off rows are neutral
+    0, keeping the cross-section intact), then per-timestamp cross-sectional
+    demean + z-score + clip (+-3) - the same normalization
+    research/lib/signal_eval.py applies to every registered signal, so a
+    discovered signal's numbers are on the same scale as any other's.
+    """
+    out = panel[['timestamp', 'symbol']].copy()
+    out['signal'] = compile_candidate_values(
+        cand, panel, allowed_columns=allowed_columns, dsl_cfg=dsl_cfg)
     return out.dropna(subset=['signal']).reset_index(drop=True)
 
 
