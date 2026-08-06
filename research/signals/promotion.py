@@ -10,36 +10,38 @@ select window, ~150 days the formula never saw), directed by the sign
 committed during training. One verdict per formula per roll - no cross-roll
 pooling, no evidence accumulation: the long window IS the evidence.
 
-Four filters, then the quintile:
+Five filters, no ranking cut:
 
   1. MADE MONEY   - the verdict is net positive in the committed direction.
-                    A sign, not a bar (nothing resembling a significance
-                    threshold exists here). Directed, never |t|: a formula
-                    whose test ran backwards is rejected, not flipped -
-                    re-signing after seeing the test is how noise promotes.
+                    Directed, never |t|: a formula whose test ran backwards
+                    is rejected, not flipped - re-signing after seeing the
+                    test is how noise promotes.
   2. ENOUGH ACTIVITY - fired on at least min_select_days real days within
                     the test window. Dense formulas pass trivially; a tight
                     GATE on dense features (active 4 days/month) does not.
-  3. PAYS FOR ITSELF - expected per-bar profit from the verdict exceeds the
+  3. SIGNIFICANT  - the verdict's one-sided p (from t = a0/se_peak) clears
+                    the roll's Benjamini-Hochberg bar at fdr_alpha across
+                    every formula that received a verdict. Bounds the
+                    expected fluke fraction of the book at fdr_alpha; BH's
+                    first step is the Bonferroni bar, so a roll with no
+                    genuine quality promotes NOTHING.
+  4. PAYS FOR ITSELF - expected per-bar profit from the verdict exceeds the
                     formula's own per-bar trading cost (churn x cost rate),
                     AND the alpha is holdable at the book's measured fill
                     rate (capture floor). Measured quantities only.
-  4. NOT A DUPLICATE - signal correlation vs already-chosen formulas at
+  5. NOT A DUPLICATE - signal correlation vs already-chosen formulas at
                     most max_book_corr (greedy, best first).
 
-Then promote the BEST QUINTILE of everything that passed
-(ceil(book_frac x passers), bounded by book_min/book_max), RANKED BY THE
-TRAIN curve's net rate - the test window gates, it never ranks (ranking
-on it promoted the luckiest test windows; measured OOS anti-prediction).
-Proportional - the book breathes with how much quality exists; never a
-fixed count.
+EVERY passer is promoted, capped at book_max - possibly zero. The TRAIN
+curve's net rate only orders the greedy dedup walk (the test window gates,
+it never ranks).
 """
 
 import logging
-import math
 from typing import List, Optional
 
 import numpy as np
+from scipy.stats import norm
 
 from config import get
 from research.signals.data import Roll
@@ -52,9 +54,9 @@ from research.signals.search import (DiscoveryLedger,
 
 def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
             cfg: Optional[dict] = None) -> List[dict]:
-    """Apply the four filters to this roll's measured formulas, promote the
-    best quintile of the passers. Returns survivor dicts annotated with the
-    verdict lag and the economics."""
+    """Apply the five filters to this roll's measured formulas and promote
+    every passer (capped at book_max). Returns survivor dicts annotated
+    with the verdict lag and the economics."""
     cfg = cfg or get('discovery', {})
     promo = cfg['promotion']
     if not survivors:
@@ -88,9 +90,10 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
                         positive - one jump day passes a mean, not a median;
                         NaN median fails open)
         2 activity    - entry_days >= min_select_days
-        3 economics   - best net RATE over the sampled curve,
+        4 economics   - best net RATE over the sampled curve,
                         max_k (A(k) - roundtrip)/k, must be positive: the
-                        formula judged at its own optimal holding.
+                        formula judged at its own optimal holding (filter 3,
+                        BH significance, is applied in promote()).
         Returns None when the row has no curve or fails filters 1-2."""
         c = s.get('curve')
         if not c or not c.get('ks'):
@@ -134,24 +137,30 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
                 return max(rates)
         return verdicts[i]['score']    # rows without a train curve
 
-    # Filters over whole formulas: 1+2 (inside the verdict), 3 (pays for
-    # itself + holdable, with holding capped at the measured peak).
-    # Filter 4 applies greedily below.
+    # Filter 3 - SIGNIFICANT: Benjamini-Hochberg over the one-sided p of
+    # every verdict this roll (largest m with p(m) <= m/n * fdr_alpha).
+    # A verdict without a finite t fails closed.
+    fdr_alpha = float(promo['fdr_alpha'])
+    p_of = {i: float(norm.sf(v['tstat']))
+            for i, v in enumerate(verdicts)
+            if v is not None and np.isfinite(v['tstat'])}
+    finite = sorted(p_of.values())
+    cutoff = 0.0
+    for m, p in enumerate(finite, start=1):
+        if p <= m / len(finite) * fdr_alpha:
+            cutoff = max(cutoff, p)
+    significant = {i for i, p in p_of.items() if cutoff > 0 and p <= cutoff}
+
+    # Filters over whole formulas: 1+2 (inside the verdict), 3 (BH above),
+    # 4 (pays for itself + holdable, with holding capped at the measured
+    # peak). Filter 5 (dedup) applies greedily below.
     passers = [i for i, v in enumerate(verdicts)
-               if v is not None and v['margin'] > 0.0
+               if v is not None and i in significant
+               and v['margin'] > 0.0
                and capture(survivors[i], v.get('peak_k'),
                            v.get('half_life')) >= min_capture]
 
-    # THE QUINTILE: proportional to how much passed, bounded. frac 0 falls
-    # back to the fixed book_size (tests only). Never a hardcoded 3.
-    frac = float(promo.get('book_frac', 0.0) or 0.0)
-    if frac > 0:
-        k = int(min(max(math.ceil(frac * len(passers)),
-                        int(promo.get('book_min', 1))),
-                    int(promo.get('book_max', len(passers) or 1))))
-    else:
-        k = int(promo.get('book_size', 0))
-    k = min(k, len(passers))
+    k = min(int(promo['book_max']), len(passers))
 
     n_trials = ledger.n_trials(roll.roll_id)
     promoted: List[dict] = []
@@ -159,7 +168,7 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
         if len(promoted) >= k:
             break
         s, v = survivors[i], verdicts[i]
-        # Filter 4: not a duplicate of anything already chosen.
+        # Filter 5: not a duplicate of anything already chosen.
         if max_signal_correlation(
                 s['signal_select'],
                 [p['signal_select'] for p in promoted]) > max_book_corr:

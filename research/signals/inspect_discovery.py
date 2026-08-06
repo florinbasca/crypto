@@ -133,7 +133,8 @@ def _funnel(led: pd.DataFrame, promo_cfg: dict, curve_cfg: dict,
             rt_cost: float, rate: float) -> pd.DataFrame:
     """Per-roll CHOOSE funnel over the SURVIVORS, re-priced at the current
     config: made money (a0>0 + median) -> active (entry days) -> economics
-    (net rate > 0 and capture >= floor) -> promoted (quintile + dedup)."""
+    (net rate > 0 and capture >= floor) -> promoted (BH significance +
+    dedup)."""
     min_days = int(promo_cfg.get('min_select_days', 0))
     min_capture = float(promo_cfg.get('min_capture', 0.0))
     median_gate = bool(curve_cfg.get('median_gate', False))
@@ -176,16 +177,17 @@ def _flags(led: pd.DataFrame, funnel: pd.DataFrame,
         f = funnel.iloc[-1]
         drops = {'made money (filter 1)': f['survivors'] - f['money'],
                  'activity (filter 2)': f['money'] - f['active'],
-                 'pays for itself (filter 3, cost)': f['active'] - f['pays'],
-                 'holdable (filter 3, capture floor)':
+                 'pays for itself (filter 4, cost)': f['active'] - f['pays'],
+                 'holdable (filter 4, capture floor)':
                      f['pays'] - f['holdable'],
-                 'quintile/duplicates (filter 4)':
+                 'significance/duplicates (filters 3+5)':
                      f['holdable'] - f['promoted']}
         worst = max(drops, key=drops.get)
-        if f['promoted'] < int(promo_cfg.get('book_min', 1)):
-            out.append(f"BOOK BELOW book_min: roll {funnel.index[-1]} "
-                       f"promoted {f['promoted']} of {f['survivors']} "
-                       f"survivors; biggest cut is {worst} "
+        if f['promoted'] == 0:
+            out.append(f"EMPTY BOOK: roll {funnel.index[-1]} promoted 0 of "
+                       f"{f['survivors']} survivors (a valid outcome under "
+                       f"the BH gate - nothing was distinguishable from "
+                       f"noise); biggest cut is {worst} "
                        f"(-{drops[worst]}).")
         elif drops[worst] > 0:
             out.append(f"Funnel (latest roll): {f['survivors']} survivors -> "
@@ -206,6 +208,26 @@ def _flags(led: pd.DataFrame, funnel: pd.DataFrame,
                 out.append(f"IDEA CONCENTRATION: {n} of {len(surv)} "
                            f"survivors ({share:.0%}) use '{col}' - the "
                            f"search may be re-mining one mechanism.")
+
+    # 2b. Feature coverage: family-reachable columns no scored formula has
+    # ever referenced.
+    if table_exists('features'):
+        from research.signals.data import (resolve_family_columns,
+                                           all_family_columns)
+        from dbutil import _scan
+        feat_cols = [c for c in _scan('features').collect_schema().names()
+                     if c not in ('timestamp', 'symbol')]
+        reachable = set(all_family_columns(resolve_family_columns(feat_cols)))
+        used = set()
+        for cj in led['candidate_json']:
+            used |= _cols_used(cj)
+        untried = sorted(reachable - used)
+        if untried:
+            head = ', '.join(untried[:8]) + (' ...' if len(untried) > 8
+                                             else '')
+            out.append(f"COVERAGE: {len(untried)} of {len(reachable)} "
+                       f"reachable feature columns never appeared in any "
+                       f"scored formula this run ({head}).")
 
     # 3. Train -> test generalization among survivors.
     gaps = 0
@@ -354,10 +376,11 @@ def main():
     print(f"PROMOTED BOOK ({len(promos)} signals)")
     print("=" * 76)
     if promos.empty:
-        print("(nothing promoted yet - promotion takes the best "
-              f"{get('discovery.promotion.book_frac'):.0%} of formulas "
-              "passing the four filters on their 5-month test; an empty "
-              "book means nothing passed)")
+        print("(nothing promoted yet - promotion takes every formula "
+              "passing the five filters on its 5-month test, including "
+              "the Benjamini-Hochberg significance bar at "
+              f"fdr_alpha={get('discovery.promotion.fdr_alpha')}; an "
+              "empty book means nothing beat noise)")
     else:
         cols = ['roll_id', 'name', 'family', 'direction', 'select_lag',
                 'peak_bars', 'half_life_bars', 'capture', 'turnover',

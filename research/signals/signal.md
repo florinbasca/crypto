@@ -168,8 +168,8 @@ these" instruction.
 
 Once per roll. A formula's **verdict** is its most recent 5-month test
 window (per-bet return, not rank IC; directed by the sign committed on
-train). Four filters, then the quintile — no significance gates, no fixed
-counts:
+train). Five filters, then promote every passer — no ranking cut, no
+floor, no fixed counts:
 
 1. **Made money** — the curve's peak edge a0 is positive in the committed
    direction, AND (`curve.median_gate`) the **median** entry outcome at the
@@ -177,28 +177,34 @@ counts:
    a mean, never a median. Directed, never |t|: a formula whose test ran
    backwards is rejected, not flipped — re-signing after seeing the test
    is how noise gets promoted. (~150 test days give a true Sharpe-2
-   formula ~90% pass, Sharpe-1 ~74%, noise 50% — the filter halves noise;
-   the quintile does the actual selecting.)
+   formula ~90% pass, Sharpe-1 ~74%, noise 50% — a sign check alone
+   halves noise, which is nowhere near enough; filter 3 does the actual
+   selecting.)
 2. **Enough activity** (`min_select_days`) — enough real entry days within
    the test window for the curve to mean anything.
-3. **Pays for itself** — the curve, judged at its own optimum, must cover
+3. **Significant** (`fdr_alpha`) — the verdict's one-sided p (from
+   t = a0 / se_peak, with n_eff counted at the measured holding, not the
+   full horizon) must clear the roll's **Benjamini-Hochberg** bar across
+   every formula that received a verdict. This bounds the expected fluke
+   fraction of the promoted book at `fdr_alpha`; BH's first step is the
+   Bonferroni bar, so a roll with no genuine quality promotes NOTHING.
+4. **Pays for itself** — the curve, judged at its own optimum, must cover
    a round trip at a positive rate: `max over k of
    (A(k) − roundtrip_cost)/k > 0` (round trip = `curve.roundtrip_mult` ×
    the cost rate, `econ_cost_bps` defaulting to the portfolio layer's
    cost model). AND holdable: capture at the book's measured fill rate ≥
    `min_capture`, with holding inputs **capped at the measured peak** —
    persistence past the point where the alpha reverses is worthless.
-4. **Not a duplicate** (`max_book_corr`) — signal correlation vs formulas
+5. **Not a duplicate** (`max_book_corr`) — signal correlation vs formulas
    already chosen this roll, greedy best-first.
 
-Then promote the **best quintile of the passers**: ceil(`book_frac` ×
-n_passers), bounded by `book_min`/`book_max`, **ranked by the TRAIN
-curve's net economic rate** (money-ordered, not significance-ordered).
-The test window gates and never ranks: ranking on the test rate promoted
-the luckiest test windows — measured on 49 promotions, spearman(test,
-OOS) was −0.25 and the biggest verdicts crashed hardest. The train window
-is already spent by the search, so ordering on it adds no new bias.
-Proportional — the book breathes with how much quality exists.
+**Every passer is promoted**, capped at `book_max` — possibly zero. The
+TRAIN curve's net economic rate only orders the greedy dedup walk
+(money-ordered, not significance-ordered). The test window gates and
+never ranks: ranking on the test rate promoted the luckiest test windows
+— measured on 49 promotions, spearman(test, OOS) was −0.25 and the
+biggest verdicts crashed hardest. The train window is already spent by
+the search, so ordering on it adds no new bias.
 
 Promotions are written with the verdict lag (= the curve's peak), peak
 bars, half-life (**capped at the peak** — this is what the walk-forward
@@ -229,9 +235,9 @@ give the same formula E[t] ≈ 1.28, and the pass rates through filter 1
 |--------------------|-----------|-----|-----|-----|
 | P(pass filter 1)   | 50%       | 74% | 90% | 97% |
 
-The filter halves the noise; the **quintile** then does the real selection
-among passers, and re-qualification every roll (windows slide monthly) is
-what noise cannot sustain. Supporting choices:
+The sign check halves the noise; the **BH significance bar** then does the
+real selection among passers, and re-qualification every roll (windows
+slide monthly) is what noise cannot sustain. Supporting choices:
 
 - **Pooled direction fitting** (train-only): the traded sign comes from the
   formula's pooled *train* evidence across its rolls, so direction error

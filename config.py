@@ -546,13 +546,7 @@ config = {
             # dv_ = Electric Capital dev activity (30d-lagged);
             # ls_ = listing age (true first perp trade date).
             'dev_activity':      ['dv_'],
-            # QUARANTINED 2026-07-18 pending a feature audit: the listing
-            # family measured 36% OOS sign-agreement over 11 promotions
-            # (mean -15.6bp/bet) in the verdict-vs-OOS table - worst family
-            # by far; suspect stale/backfilled listing dates. Removing the
-            # family removes ls_ columns from the whole grammar (gates
-            # included). Restore after the audit clears the features.
-            # 'listing':         ['ls_'],
+            'listing':           ['ls_'],
             'cross_sectional':   ['cs_'],
             'factor_context':    ['fl_', 'mk_'],
             'seasonality':       ['sn_'],
@@ -563,14 +557,13 @@ config = {
             'events':            ['ev_'],
             'macro':             ['mx_'],
             'macro_beta':        ['mb_'],
-            # Calendar: perp funding-settlement proximity. Cross-sectionally
-            # CONSTANT (same for all coins) -> gate-only, like ev_/mx_.
-            'calendar':          ['tm_funding_window'],
+            # tm_ = time encodings (funding clock, day-of-week, hour).
+            # Cross-sectionally CONSTANT -> gate-only, like ev_/mx_.
+            'calendar':          ['tm_'],
+            # px_ = raw return/range primitives; weak standalone on
+            # residual returns - gate/interaction material.
+            'price_action':      ['px_'],
         },
-        'max_features_per_family': 16,   # cap resolved columns per family
-        # (16 so the order_flow family holds both the existing ms_/vl_ flow
-        # columns and the new of_ primitives after a feature rebuild; the LLM
-        # still only sees diagnostics.top_per_family of them per call)
         # DSL bounds (hypothesis space)
         'dsl': {
             'windows': [6, 36, 144, 432],   # allowed rolling windows (bars)
@@ -590,8 +583,8 @@ config = {
             # 0 = NO COUNT CAP on the survivor pool: everything passing the
             # dedup guards (output corr, per-column cap, train thirds)
             # survives, breeds and gets a verdict. The book is bounded by
-            # QUALITY (promotion's filters + quintile), never by an
-            # arbitrary pool size that discards already-measured candidates.
+            # QUALITY (promotion's filters, incl. the BH significance bar),
+            # never by a pool size that discards measured candidates.
             'survivors': 0,
             'mutation_prob': 0.6,            # mutate a parent vs sample fresh
             # Survivor de-correlation ceiling on the signal OUTPUT - what a
@@ -666,9 +659,8 @@ config = {
         },
         # CHOOSE (the agreed 5+5+1 spec): a formula's verdict is its most
         # recent 5-month test window - per roll, no cross-roll pooling.
-        # Four filters, then promote the BEST QUINTILE of everything that
-        # passed. Never a fixed count, never a significance bar (nothing
-        # resembling the old one-month t>=3.5 exists anywhere).
+        # Five filters, then promote EVERY passer (capped at book_max,
+        # possibly zero).
         'promotion': {
             # Filter 1 - MADE MONEY: the test verdict must be net positive
             # in the direction committed during training. Not a bar, a sign.
@@ -692,14 +684,14 @@ config = {
             # Filter 4 - NOT A DUPLICATE: max signal correlation vs formulas
             # already chosen this roll. (USER KNOB)
             'max_book_corr': 0.5,
-            # THE QUINTILE: promote ceil(book_frac x n_passers), bounded by
-            # book_min/book_max. Proportional - the book breathes with how
-            # much quality exists. book_frac 0 falls back to fixed
-            # book_size (tests only). (USER KNOBS)
-            'book_frac': 0.20,
-            'book_min': 5,
+            # Benjamini-Hochberg over the one-sided p of every verdict
+            # this roll: at most this expected fraction of promotions are
+            # flukes; a roll with nothing above noise promotes NOTHING
+            # (the walk-forward holds/unwinds through empty months).
+            # (USER KNOB)
+            'fdr_alpha': 0.10,
+            # Hard cap on promotions per roll (risk/ops bound, not sizing).
             'book_max': 50,
-            'book_size': 10,
             # RETENTION: formulas promoted within the last N rolls are
             # re-seeded into the search even after missing a survivor cut,
             # so book members keep getting fresh verdicts. 0 disables.
@@ -754,6 +746,9 @@ config = {
         # key is read from the gitignored repo-root .env under the GENERIC
         # name below (key_name) - switching LLMs = change provider/model here
         # and swap the key value in .env; no code or variable renames.
+        # 'random' = grammar sampling + parent mutation (no API calls);
+        # 'llm' = the provider configured in discovery.llm.
+        'proposer': 'random',
         'llm': {
             # 'anthropic', 'gemini', 'openrouter' or 'xai'. The last two
             # share one OpenAI-compatible client (plain requests, no SDK);

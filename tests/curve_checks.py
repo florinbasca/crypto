@@ -171,7 +171,7 @@ def make_curved(i, a0, peak_k=48, entry_days=120, median=None, hl=24.0,
 TCFG = copy.deepcopy(get('discovery'))
 TCFG['promotion'].update({
     'min_select_days': 20, 'min_capture': 0.0, 'max_book_corr': 0.5,
-    'book_frac': 0.20, 'book_min': 1, 'book_max': 50, 'book_size': 10,
+    'fdr_alpha': 0.10, 'book_max': 50,
 })
 
 pool = [make_curved(1, 0.0030), make_curved(2, 0.0020),
@@ -181,9 +181,11 @@ pool = [make_curved(1, 0.0030), make_curved(2, 0.0020),
         make_curved(6, 0.0025, median=-0.0001)]     # median gate: jump-day
 book = bt_mod.promote(pool, ROLL, search_mod.DiscoveryLedger(None), TCFG)
 names = [p['candidate'].name for p in book]
-check("choose: quintile of curve-passers, ranked by net rate",
-      names == ['c1'],
-      f"({names}; c1+c2 clear the 10bp round trip, quintile keeps 1)")
+# make_curved's se gives every verdict t = 3.0, so all positive curves
+# clear BH; economics still cuts c3 (10bp peak = the round trip exactly).
+check("choose: every significant passer promoted, net-rate walk order",
+      names == ['c1', 'c2'],
+      f"({names}; c1+c2 clear the 10bp round trip, c3 only matches it)")
 check("choose: backwards/thin/median-failing rejected",
       not any(n in names for n in ('c4', 'c5', 'c6')))
 check("choose: peak caps the promoted half-life (walk-forward input)",
@@ -195,9 +197,8 @@ check("choose: peak caps the promoted half-life (walk-forward input)",
 # vs 80bp at peak 144 (+0.5bp/bar)
 fast = make_curved(7, 0.0040, peak_k=12)
 slow = make_curved(8, 0.0080, peak_k=144)
-one = copy.deepcopy(TCFG)
-one['promotion'].update({'book_min': 1, 'book_frac': 0.2})
-b2 = bt_mod.promote([slow, fast], ROLL, search_mod.DiscoveryLedger(None), one)
+b2 = bt_mod.promote([slow, fast], ROLL, search_mod.DiscoveryLedger(None),
+                    TCFG)
 check("choose: ranking is net RATE at own optimum, not raw size",
       b2[0]['candidate'].name == 'c7')
 

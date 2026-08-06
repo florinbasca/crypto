@@ -68,10 +68,9 @@ def test_cfg():
     # min_select_days 0: the synthetic select window is only ~6 days long.
     # min_capture 0: a single-lag test grid fits every half-life to the
     # shortest grid value, which the production capture floor would block.
-    # book_frac 0 -> fixed book_size (deterministic small-sample tests).
     # Cost is the ONE global parameter (portfolio.cost_bps); tests that
     # vary it patch that parameter directly.
-    cfg['promotion'].update({'book_frac': 0.0, 'book_size': 10,
+    cfg['promotion'].update({'fdr_alpha': 0.10, 'book_max': 10,
                              'min_select_days': 0, 'min_capture': 0.0})
     # Small synthetic windows: short curve horizon (also keeps the purge at
     # the legacy 12 bars the window-discipline checks pin down).
@@ -308,12 +307,13 @@ check("fast path: exact-column candidate is fully measured",
       any(s['candidate'].hash == fast_seed.hash for s in fast_pop))
 
 # ---------------------------------------------------------------------------
-# 4. Noise in, bounded out: rank + K slots on a pure-noise panel. There is
-#    deliberately NO significance gate anymore - the fixed book_size caps
-#    what noise can supply, the directed floor rejects wrong-way evidence,
-#    and the walk-forward is the judge.
+# 4. Noise in, ~nothing out: the Benjamini-Hochberg gate on a pure-noise
+#    panel. Under the global null BH bounds the probability of promoting
+#    ANYTHING at fdr_alpha, so a noise roll should produce an (almost
+#    always) empty book; the directed floor still rejects wrong-way
+#    evidence for whatever does slip through.
 # ---------------------------------------------------------------------------
-print("--- 4. noise -> bounded, directed-only promotion ---")
+print("--- 4. noise -> (almost always) empty book ---")
 t0 = time.perf_counter()
 noise_panel = make_panel(plant=0.0, seed=11)
 noise_ledger = search_mod.DiscoveryLedger(None)
@@ -326,8 +326,8 @@ noise_survivors = search_mod.run_search(noise_panel, ROLL, family_cols,
 noise_promoted = bt_mod.promote(noise_survivors, ROLL, noise_ledger, CFG)
 check("noise: search ran a full budget", noise_ledger.n_trials(0) >= 10,
       f"({noise_ledger.n_trials(0)} trials)")
-check("noise: promotions capped at book_size",
-      len(noise_promoted) <= CFG['promotion']['book_size'],
+check("noise: BH promotes ~nothing on a pure-noise panel",
+      len(noise_promoted) <= 1,
       f"({len(noise_promoted)} promoted, "
       f"{time.perf_counter() - t0:,.1f}s)")
 check("noise: every promotion made money on its test (directed)",

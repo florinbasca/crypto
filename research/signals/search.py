@@ -366,7 +366,14 @@ def fit_response_curve(A: np.ndarray, n_eff: float,
         vals = np.asarray(per_entry_at[k_near], dtype=float)
         vals = vals[np.isfinite(vals)]
         if len(vals) > 1:
-            se_peak = float(np.std(vals, ddof=1) / math.sqrt(max(n_eff, 1.0)))
+            # Independent observations at the measured holding: paths
+            # entered >= k bars apart do not overlap at horizon k, so the
+            # count is (covered bars)/k = n_eff*H/k, capped by the entry
+            # count. The passed n_eff deflates by the full horizon H and
+            # over-deflates any peak earlier than H.
+            n_eff_k = min(float(len(vals)), n_eff * H / max(k_near, 1))
+            se_peak = float(np.std(vals, ddof=1)
+                            / math.sqrt(max(n_eff_k, 1.0)))
             median_peak = float(np.median(vals))
     return {'a0': a0, 'half_life': float(best_hl), 'peak_k': peak_k,
             'rev_frac': rev_frac, 'se_peak': se_peak,

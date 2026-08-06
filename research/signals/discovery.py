@@ -6,8 +6,9 @@ Discovery is PURELY STATISTICAL: it measures each candidate's per-bet return
 half-lives, and emits promotions. It never charges costs or trades -
 research/portfolio/walk_forward.py is the ONLY money judge.
 
-Outer loop per roll (train 5mo / select 1mo, advancing monthly; the roll's
-OOS month exists only as the promotion's valid_from date):
+Outer loop per roll (train 5mo / select 5mo, advancing monthly - see
+discovery.train_months/select_months; the roll's OOS month exists only as
+the promotion's valid_from date):
   1. build diagnostics on TRAIN (compressed - the proposer's entire view)
   2. SEARCH: budgeted propose -> compile -> evaluate -> reward -> keep
      best+diverse survivors (evolutionary loop, family bandit). The search
@@ -15,12 +16,12 @@ OOS month exists only as the promotion's valid_from date):
      select window. The reward's alpha term is the candidate's
      PER-BET RETURN (not rank IC), CAPTURE-WEIGHTED (x 1/(1 + phi/kappa)), so
      persistent signals outscore equally-strong fast ones.
-  3. CHOOSE: four filters on each formula's 5-month test verdict (net
-     positive in its committed direction; enough active days; pays for
-     itself after its own trading cost and holdable at the book's fill
-     rate; not a duplicate), then promote the BEST QUINTILE of the passers
-     (book_frac, bounded). No significance gates, no fixed counts; the
-     walk-forward is the judge.
+  3. CHOOSE: five filters on each formula's 5-month test verdict (net
+     positive in its committed direction; enough active days; SIGNIFICANT
+     under the roll's Benjamini-Hochberg bar at promotion.fdr_alpha; pays
+     for itself after its own trading cost and holdable at the book's fill
+     rate; not a duplicate). EVERY passer is promoted (capped at book_max,
+     possibly zero); the walk-forward is the judge.
   4. roll forward. Output: the promotions table, consumed by the
      walk-forward via research/lib/discovered.py.
 
@@ -205,10 +206,12 @@ def main():
         print(f"Resume: {last_done + 1} rolls already complete; continuing "
               f"from roll {rolls[0].roll_id} ({len(rolls)} remaining)")
 
-    proposer = make_proposer('llm')
+    proposer = make_proposer(get('discovery.proposer', 'llm'))
     provider = getattr(proposer, 'provider', '')
     if provider:
         print(f"LLM proposer: {provider} / {proposer.model}")
+    else:
+        print("proposer: random (grammar sampling + parent mutation, no API)")
 
     promo_rows = []
     usage_rows = []

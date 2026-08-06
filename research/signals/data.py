@@ -113,17 +113,17 @@ def strided_stamps(timestamps: pd.Series, stride: int) -> np.ndarray:
 
 def resolve_family_columns(available: Sequence[str],
                            cfg: Optional[dict] = None) -> dict:
-    """{family: [columns]} by matching config prefix patterns, capped per
-    family. Deterministic: patterns and available columns are both ordered."""
+    """{family: [columns]} by matching config prefix patterns; every match
+    is kept (a cap here removes columns from the whole grammar).
+    Deterministic: patterns and available columns are both ordered."""
     cfg = cfg or get('discovery', {})
     families = cfg['families']
-    cap = int(cfg['max_features_per_family'])
     reserved = {'timestamp', 'symbol'}
     out = {}
     for family, patterns in families.items():
         cols = [c for c in available
                 if c not in reserved and any(c.startswith(p) for p in patterns)]
-        out[family] = sorted(cols)[:cap]
+        out[family] = sorted(cols)
     return out
 
 

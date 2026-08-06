@@ -5,18 +5,17 @@ Synthetic checks for CHOOSE under the 5+5+1 spec
 1. Train-side direction: raw-sign curve history round-trip + pooled
    direction.
 2. Retention: promoted_candidates reseed pool query.
-3. promote(): the QUINTILE of curve-passers - proportional, bounded, never
-   a fixed count (frac 0 = fixed book_size for tests) - plus the capture
-   floor (churn prices holdability) and the duplicate filter. Per-filter
-   curve semantics (median gate, activity, net-rate economics, peak cap)
-   are covered in tests/curve_checks.py.
+3. promote(): the Benjamini-Hochberg significance gate over verdict
+   t-stats (adaptive bar, empty book allowed, book_max cap) - plus the
+   capture floor (churn prices holdability) and the duplicate filter.
+   Per-filter curve semantics (median gate, activity, net-rate economics,
+   peak cap) are covered in tests/curve_checks.py.
 
 Run: uv run tests/choose_checks.py
 """
 
 import copy
 import json
-import math
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -139,52 +138,60 @@ def make_survivor(i, sel_t, sel_alpha=None, n_days=140, direction=1,
 TCFG = copy.deepcopy(get('discovery'))
 TCFG['promotion'].update({
     'min_select_days': 20, 'min_capture': 0.0, 'max_book_corr': 0.5,
-    'book_frac': 0.20, 'book_min': 1, 'book_max': 50, 'book_size': 10,
+    'fdr_alpha': 0.10, 'book_max': 50,
 })
 
-# 10 candidates: a t-ladder of passers plus one of each failure mode.
+# 10 candidates: a t-ladder plus one of each failure mode. 7 verdicts ->
+# BH thresholds m/7 x 0.1; sorted p .0082(s6) .0139(s10) .0228(s5)
+# .0548(s4) .1151(s3) .2119(s2) .3446(s1) -> largest passing m = 4, so
+# exactly t >= 1.6 promotes.
 pool = ([make_survivor(i, sel_t=0.4 * i) for i in range(1, 7)]   # 0.4..2.4
         + [make_survivor(7, sel_t=-2.5),                # filter 1: backwards
            make_survivor(8, sel_t=9.9, n_days=8),       # filter 2: thin
            make_survivor(9, sel_t=0.0),                 # filter 1: nothing
-           make_survivor(10, sel_t=2.2)])               # passer
+           make_survivor(10, sel_t=2.2)])               # significant passer
 book = bt_mod.promote(pool, ROLL, search_mod.DiscoveryLedger(None), TCFG)
 names = [p['candidate'].name for p in book]
-# passers = s1..s6 + s10 = 7 -> quintile = ceil(0.2*7) = 2
-check("quintile: ceil(frac x passers) promoted, best first",
-      len(book) == 2 and set(names) == {'s6', 's10'}, f"({names})")
+check("BH: exactly the significant passers promoted (t >= 1.6 here)",
+      len(book) == 4 and set(names) == {'s4', 's5', 's6', 's10'},
+      f"({names})")
 check("filters: backwards / thin / empty never promote",
       not any(n in names for n in ('s7', 's8', 's9')))
 check("annotations: verdict lag, test days, econ margin present",
       all('select_lag' in p and 'test_days' in p and 'econ_margin' in p
           for p in book))
 
-# no fixed count: double the passers -> the book grows
-pool_wide = pool + [make_survivor(20 + i, sel_t=1.0 + 0.1 * i)
-                    for i in range(7)]
-book_wide = bt_mod.promote(pool_wide, ROLL,
-                           search_mod.DiscoveryLedger(None), TCFG)
-check("quintile: book grows with passers (never a fixed 3)",
-      len(book_wide) == math.ceil(0.2 * 14), f"({len(book_wide)} promoted)")
+# Empty book: sub-bar t's promote NOTHING.
+weak = [make_survivor(60 + i, sel_t=t) for i, t in
+        enumerate([0.5, 0.9, 1.3])]
+check("BH: all-weak roll promotes an EMPTY book",
+      bt_mod.promote(weak, ROLL, search_mod.DiscoveryLedger(None),
+                     TCFG) == [])
 
-# bounds: book_min floors thin months, book_max caps rich ones
-b_cfg = copy.deepcopy(TCFG)
-b_cfg['promotion'].update({'book_min': 5, 'book_max': 6})
-check("quintile: book_min floors it",
-      len(bt_mod.promote(pool, ROLL, search_mod.DiscoveryLedger(None),
-                         b_cfg)) == 5)
-check("quintile: book_max caps it",
-      len(bt_mod.promote(pool_wide + [make_survivor(40 + i, sel_t=2.0)
-                                      for i in range(30)],
+# Adaptive bar: the same t = 1.9 fails among noise, passes among quality
+# (strong companions loosen the BH bar; weak ones tighten it).
+alone_in_noise = ([make_survivor(80, sel_t=1.9)]
+                  + [make_survivor(81 + i, sel_t=0.5) for i in range(6)])
+with_quality = ([make_survivor(90, sel_t=1.9)]
+                + [make_survivor(91 + i, sel_t=4.0) for i in range(3)])
+n_noise = [p['candidate'].name
+           for p in bt_mod.promote(alone_in_noise, ROLL,
+                                   search_mod.DiscoveryLedger(None), TCFG)]
+n_qual = [p['candidate'].name
+          for p in bt_mod.promote(with_quality, ROLL,
+                                  search_mod.DiscoveryLedger(None), TCFG)]
+check("BH: t=1.9 fails surrounded by noise, passes surrounded by quality",
+      's80' not in n_noise and 's90' in n_qual,
+      f"(noise {n_noise}, quality {n_qual})")
+
+# book_max is a hard cap, not a target.
+cap_cfg = copy.deepcopy(TCFG)
+cap_cfg['promotion'].update({'book_max': 3})
+check("book_max caps a rich roll",
+      len(bt_mod.promote([make_survivor(40 + i, sel_t=4.0 + 0.1 * i)
+                          for i in range(8)],
                          ROLL, search_mod.DiscoveryLedger(None),
-                         b_cfg)) == 6)
-
-# frac 0 -> fixed book_size (test back-compat path)
-f_cfg = copy.deepcopy(TCFG)
-f_cfg['promotion'].update({'book_frac': 0.0, 'book_size': 3})
-check("quintile: frac 0 falls back to fixed book_size",
-      len(bt_mod.promote(pool_wide, ROLL, search_mod.DiscoveryLedger(None),
-                         f_cfg)) == 3)
+                         cap_cfg)) == 3)
 
 # filter 3 holdability: churn prices the capture. Same curve, one churns
 # 0.5/bar (position life 2 bars -> capture collapses), one holds steady.
@@ -205,7 +212,7 @@ check("holdability: churner rejected by the capture floor, steady twin "
 lucky = make_survivor(70, sel_t=2.0, sel_alpha=0.0050, train_alpha=0.0005)
 solid = make_survivor(71, sel_t=2.0, sel_alpha=0.0020, train_alpha=0.0040)
 r_cfg = copy.deepcopy(TCFG)
-r_cfg['promotion'].update({'book_min': 1, 'book_max': 1})
+r_cfg['promotion'].update({'book_max': 1})
 book_r = bt_mod.promote([lucky, solid], ROLL,
                         search_mod.DiscoveryLedger(None), r_cfg)
 check("ranking: train rate orders the passers, test only gates",
