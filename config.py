@@ -487,7 +487,7 @@ config = {
         # load per roll (~30s/candidate).
         'enumeration': {
             'enabled': True,
-            'top_n': 150,
+            'top_n': 300,
             'agg_bars': 6,        # screen on an hourly entry/step grid
             'horizon_steps': 24,  # 24 hourly steps = the 1-day curve
         },
@@ -574,12 +574,11 @@ config = {
         # Evolutionary search (per roll). Budget = n_generations * batch_size.
         'search': {
             'seed': 7,
-            # Breadth x3 (2026-07-18, user): 24 gens x 64 = 1,536 proposals
-            # per roll (~1,000+ scored after dedup) vs the old 512. Scoring
-            # wall-clock scales with it; the negative-train-rate screen
-            # keeps the full-measurement cost on the plausible half.
+            # Budget = n_generations x batch_size proposals per roll.
+            # Scoring wall-clock scales with it; the negative-train-rate
+            # screen keeps the full-measurement cost on the plausible half.
             'n_generations': 24,
-            'batch_size': 64,
+            'batch_size': 128,
             # 0 = NO COUNT CAP on the survivor pool: everything passing the
             # dedup guards (output corr, per-column cap, train thirds)
             # survives, breeds and gets a verdict. The book is bounded by

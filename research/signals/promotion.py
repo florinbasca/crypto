@@ -20,11 +20,13 @@ Five filters, no ranking cut:
                     the test window. Dense formulas pass trivially; a tight
                     GATE on dense features (active 4 days/month) does not.
   3. SIGNIFICANT  - the verdict's one-sided p (from t = a0/se_peak) clears
-                    the roll's Benjamini-Hochberg bar at fdr_alpha across
-                    every formula that received a verdict. Bounds the
-                    expected fluke fraction of the book at fdr_alpha; BH's
-                    first step is the Bonferroni bar, so a roll with no
-                    genuine quality promotes NOTHING.
+                    the roll's Benjamini-Hochberg bar at fdr_alpha. The BH
+                    family is the holdable verdicts only (train-side
+                    capture >= min_capture): formulas the capture floor
+                    bars from promotion are not tested hypotheses. Bounds
+                    the expected fluke fraction of the book at fdr_alpha;
+                    BH's first step is the Bonferroni bar, so a roll with
+                    no genuine quality promotes NOTHING.
   4. PAYS FOR ITSELF - expected per-bar profit from the verdict exceeds the
                     formula's own per-bar trading cost (churn x cost rate),
                     AND the alpha is holdable at the book's measured fill
@@ -138,12 +140,17 @@ def promote(survivors: List[dict], roll: Roll, ledger: DiscoveryLedger,
         return verdicts[i]['score']    # rows without a train curve
 
     # Filter 3 - SIGNIFICANT: Benjamini-Hochberg over the one-sided p of
-    # every verdict this roll (largest m with p(m) <= m/n * fdr_alpha).
-    # A verdict without a finite t fails closed.
+    # this roll's PROMOTABLE verdicts (largest m with p(m) <= m/n *
+    # fdr_alpha). The BH family is only formulas holdable at the book's
+    # fill rate, judged on TRAIN-side quantities (turnover, train
+    # half-life): a formula the capture floor bars from promotion is not a
+    # tested hypothesis and must not raise the bar for the rest. A verdict
+    # without a finite t fails closed.
     fdr_alpha = float(promo['fdr_alpha'])
     p_of = {i: float(norm.sf(v['tstat']))
             for i, v in enumerate(verdicts)
-            if v is not None and np.isfinite(v['tstat'])}
+            if v is not None and np.isfinite(v['tstat'])
+            and capture(survivors[i]) >= min_capture}
     finite = sorted(p_of.values())
     cutoff = 0.0
     for m, p in enumerate(finite, start=1):
