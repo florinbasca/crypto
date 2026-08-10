@@ -688,7 +688,7 @@ config = {
             # flukes; a roll with nothing above noise promotes NOTHING
             # (the walk-forward holds/unwinds through empty months).
             # (USER KNOB)
-            'fdr_alpha': 0.10,
+            'fdr_alpha': 0.20,
             # Hard cap on promotions per roll (risk/ops bound, not sizing).
             'book_max': 50,
             # RETENTION: formulas promoted within the last N rolls are
@@ -747,7 +747,7 @@ config = {
         # and swap the key value in .env; no code or variable renames.
         # 'random' = grammar sampling + parent mutation (no API calls);
         # 'llm' = the provider configured in discovery.llm.
-        'proposer': 'random',
+        'proposer': 'llm',
         'llm': {
             # 'anthropic', 'gemini', 'openrouter' or 'xai'. The last two
             # share one OpenAI-compatible client (plain requests, no SDK);
@@ -755,7 +755,7 @@ config = {
             # covers DeepSeek-direct or any self-hosted server. Switching =
             # change provider (+ model entry) here and swap the key value
             # in .env; nothing else.
-            'provider': 'gemini',
+            'provider': 'openrouter',
             'key_name': 'LLM_KEY',       # .env variable holding the API key
             # Endpoint override for the OpenAI-compatible providers (None =
             # the provider's default: openrouter.ai/api/v1, api.x.ai/v1).
@@ -808,9 +808,9 @@ config = {
                 # includes thinking tokens. Update here if the model or
                 # Google's rates change.
                 'gemini': {'input': 0.25, 'output': 1.50},
-                # deepseek-v4-flash via OpenRouter (checked 2026-07; verify
-                # on the model page - listings varied 0.09-0.14 in).
-                'openrouter': {'input': 0.14, 'output': 0.28},
+                # deepseek-v4-flash via OpenRouter (checked 2026-08; verify
+                # on the model page - listings vary by routed provider).
+                'openrouter': {'input': 0.08, 'output': 0.252},
                 # grok-4.1-fast (checked 2026-07).
                 'xai': {'input': 0.20, 'output': 0.50},
             },
@@ -1030,17 +1030,8 @@ config = {
         # breadth discovery measured it at (min_assets_per_timestamp = 10),
         # not the optimizer's 30.
         'min_signal_assets': 10,
-        # PERSISTENCE GATE: a discovered signal is only traded once it has been
-        # promoted in this many CONSECUTIVE discovery rolls (the roll for the OOS
-        # month plus the immediately preceding rolls). The single-window
-        # promotion t-stat does not predict OOS (strong-t and weak-t both ~50%
-        # sign-agreement), but re-promotion does: first promotions run ~42%
-        # agree / -7.9bp/day while re-promoted (2+) signals run ~71% agree /
-        # +3.9bp/day. 1 = trade from first promotion (old behavior); 2 = require
-        # one confirming re-promotion before trading.
-        'min_consecutive_promotions': 2,
-        # NO-PROMOTION MONTHS: when every promotion in a month fails the gate
-        # above, there is no confirmed alpha to build a new book from - but the
+        # NO-PROMOTION MONTHS: when a month promotes nothing, there is no
+        # confirmed alpha to build a new book from - but the
         # book already on the exchange does not vanish. It is HELD (frozen, not
         # re-targeted, no new alpha) and its raw PnL, perp funding and forced
         # closes are simulated like any other month, because that is what the
@@ -1048,8 +1039,8 @@ config = {
         # unconfirmed months the book is LIQUIDATED (unwound at the volume
         # participation cap, paying the exit cost) and sits flat until a signal
         # is confirmed again - holding a stale book indefinitely is an implicit
-        # bet that expired alpha persists, which is exactly what the gate says
-        # not to assume. 0 = liquidate on the first unconfirmed month.
+        # bet that expired alpha persists. 0 = liquidate on the first
+        # unconfirmed month.
         # Skipping these months entirely (the old behavior) silently dropped
         # the hold from the record: two months of a live 63-name book went
         # unsimulated between W06 and W09, and the equity curve read flat

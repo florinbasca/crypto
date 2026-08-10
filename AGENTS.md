@@ -81,7 +81,7 @@ All configuration values MUST be in `config.py`. Never hardcode:
 - Final backtest PnL uses RAW returns - neutrality constraints do the hedging;
   realized factor exposures are the acceptance check (~0). Net PnL also
   accrues perp funding on held positions at settlement stamps.
-- A month can confirm NO signals (every promotion fails the persistence gate).
+- A month can promote NO signals (nothing clears the promotion filters).
   That means no new book, not a gap in the record: the carried book is held and
   simulated (`_hold_window`), then unwound after
   `portfolio.max_hold_months_no_promotion` months. Never let an unpromoted month

@@ -487,9 +487,8 @@ check("economics: NaN turnover never blocks (capture fails open)",
       len(_openq) == len(_base),
       f"({len(_openq)} promoted with NaN turnover vs {len(_base)} baseline)")
 
-# survivor carry-over: the next roll is seeded with this roll's survivors,
-# they re-earn survival on the new windows, and the N-consecutive-rolls
-# persistence gate becomes satisfiable (without seeding it never can be).
+# survivor carry-over: the next roll is seeded with this roll's survivors
+# and they re-earn survival on the new windows.
 ROLL_B = data_mod.Roll(
     roll_id=1,
     train_start=pd.Timestamp('2024-01-04'),
@@ -1040,6 +1039,20 @@ try:
               "(no exception raised)")
     except SystemExit as e:
         check("openai-compat: 429 billing aborts via .code fail-fast",
+              '--resume' in str(e))
+
+    # 402 = payment required (OpenRouter's "Insufficient credits" shape):
+    # permanent regardless of wording, must abort, never skip-batch-forever.
+    _rq.post = lambda *a, **k: _FakeHTTPResp(
+        status=402, text='{"error":{"message":"Insufficient credits. This '
+                         'account never purchased credits.","code":402}}')
+    try:
+        gen.make_proposer('openrouter').propose(4, 'residual_shape', {}, [],
+                                                {}, rng)
+        check("openai-compat: 402 insufficient credits aborts", False,
+              "(no exception raised)")
+    except SystemExit as e:
+        check("openai-compat: 402 insufficient credits aborts",
               '--resume' in str(e))
 finally:
     _rq.post = _orig_post

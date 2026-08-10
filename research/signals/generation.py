@@ -879,15 +879,21 @@ class _ApiProposer(Proposer):
                         f"{self.provider} model '{self.model}' not found "
                         f"(retired or mis-named): {e}. Update "
                         f"discovery.llm.model in config.py.") from e
-                # A 429 for DEPLETED CREDITS / billing is just as permanent
-                # (a live run burned through prepay mid-flight exactly this
-                # way: every batch skipped for hours, wall-clock wasted on a
-                # seeds-only search). Ordinary 429 rate limits stay transient
-                # (retry -> skip batch): only billing-shaped messages abort.
+                # Billing failures are permanent: every later call fails
+                # too, so continuing is a seeds-only search that LOOKS like
+                # a run. HTTP 402 (payment required - OpenRouter's shape,
+                # "Insufficient credits") always aborts; a 429 aborts only
+                # when the message is billing-shaped (Gemini's shape) -
+                # ordinary 429 rate limits stay transient (retry -> skip
+                # batch).
                 msg = str(e)
-                if ('depleted' in msg.lower() or 'billing' in msg.lower()) \
-                        and ('429' in msg or 'RESOURCE_EXHAUSTED' in msg
-                             or getattr(e, 'code', None) == 429):
+                billing_words = ('depleted' in msg.lower()
+                                 or 'billing' in msg.lower()
+                                 or 'insufficient credits' in msg.lower())
+                if getattr(e, 'code', None) == 402 or '"code":402' in msg \
+                        or (billing_words
+                            and ('429' in msg or 'RESOURCE_EXHAUSTED' in msg
+                                 or getattr(e, 'code', None) == 429)):
                     raise SystemExit(
                         f"{self.provider} API credits exhausted: {e}. Top up "
                         f"(or switch LLM_KEY in .env to a funded/free-tier "

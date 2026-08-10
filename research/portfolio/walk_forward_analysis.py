@@ -231,10 +231,6 @@ def stage1_selection(wf, rolls, res_w) -> dict:
 
     oos_of = {r.roll_id: (pd.Timestamp(r.oos_start), pd.Timestamp(r.oos_end))
               for r in rolls}
-    # The promotions actually TRADED per month (i.e. that passed the
-    # persistence gate): month_meta is built with the gate applied.
-    traded_names = {oos: {m['name'] for m in metas}
-                    for oos, metas in wf.month_meta.items()}
     groups = [(rid, grp) for rid, grp in
               promos.sort_values('roll_id').groupby('roll_id', sort=True)
               if int(rid) in oos_of]
@@ -291,7 +287,6 @@ def stage1_selection(wf, rolls, res_w) -> dict:
             lines.append({
                 'roll': int(roll_id), 'name': p['name'],
                 'family': p['family'], 'rep': rep,
-                'traded': name in traded_names.get(o_start, ()),
                 'test_rate': float(p.get('econ_margin', np.nan)),
                 'oos_rate': oos_rate, 'oos_edge': oos_edge,
             })
@@ -334,14 +329,8 @@ def stage1_selection(wf, rolls, res_w) -> dict:
                   f"{float(g['oos_rate'].mean()) * BPD:+.2f} bp/day")
 
     _split('family', d.groupby('family'))
-    first, repeat = d[d['rep'] == 1], d[d['rep'] >= 2]
-    _split('repetition', [('1st promotion', first),
-                          ('re-promoted', repeat)])
-    tr, gated = d[d['traded']], d[~d['traded']]
-    _split('persistence gate', [('traded (passed)', tr),
-                                ('gated out', gated)])
-    tr_worked = float((tr['oos_edge'] > 0).mean()) if len(tr) else np.nan
-    tr_bpd = float(tr['oos_rate'].mean()) * BPD if len(tr) else np.nan
+    _split('repetition', [('1st promotion', d[d['rep'] == 1]),
+                          ('re-promoted', d[d['rep'] >= 2])])
 
     # Data-driven family lists (n >= FAMILY_MIN_N to say anything).
     fam = d.groupby('family').agg(
@@ -362,21 +351,6 @@ def stage1_selection(wf, rolls, res_w) -> dict:
         actions.append(
             "replace/augment the promotion verdict (econ_margin, test t): "
             f"it has ~no OOS ranking power (rank corr {spear:+.2f})")
-    if len(tr) >= 3 and len(gated) >= 3:
-        g_worked = float((gated['oos_edge'] > 0).mean())
-        if tr_worked > g_worked:
-            print(f"the persistence gate helps: traded cohort works "
-                  f"{tr_worked:.0%} vs {g_worked:.0%} gated out")
-            actions.append(
-                f"persistence (re-promotion) is the only measured filter "
-                f"that works ({tr_worked:.0%} vs {g_worked:.0%}); lean on "
-                f"it harder (portfolio.min_consecutive_promotions)")
-        else:
-            print(f"the persistence gate does NOT help: traded cohort "
-                  f"works {tr_worked:.0%} vs {g_worked:.0%} gated out")
-            actions.append(
-                "the persistence gate is not selecting better promotions; "
-                "find a filter that does before trusting the book")
     if len(dead):
         actions.append(
             "stop promoting families with no OOS delivery: "
@@ -392,8 +366,7 @@ def stage1_selection(wf, rolls, res_w) -> dict:
     for a in actions:
         print(f"ACTION: {a}")
     return {'test_bpd': test_bpd, 'oos_bpd': oos_bpd, 'worked': worked,
-            'spearman': spear, 'n': n, 'z': z, 'traded_worked': tr_worked,
-            'traded_bpd': tr_bpd, 'actions': actions}
+            'spearman': spear, 'n': n, 'z': z, 'actions': actions}
 
 
 # ---------------------------------------------------------------- stage 2
@@ -731,11 +704,7 @@ def print_bottom_line(s1: dict, s2: dict, s3: dict, s4: dict) -> None:
               f"months)")
     selection_fails = bool(s1) and not (s1['z'] > 2 and s1['oos_bpd'] > 0)
     if np.isfinite(net) and net > 0 and selection_fails:
-        helpers = []
-        if np.isfinite(s1.get('traded_worked', np.nan)) \
-                and s1['traded_worked'] > s1['worked']:
-            helpers.append("the persistence gate")
-        helpers.append("combining survivors into one diversified book")
+        helpers = ["combining survivors into one diversified book"]
         if s2.get('backloaded'):
             helpers.append("a slow execution layer that fits the "
                            "back-loaded alpha")

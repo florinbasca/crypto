@@ -2,7 +2,7 @@
 Checks for the no-promotion HOLD path in research/portfolio/walk_forward.py
 (_hold_window / _run_held_window, portfolio.max_hold_months_no_promotion).
 
-A month whose promotions all fail the persistence gate confirms no alpha, so
+A month that promotes nothing confirms no alpha, so
 no new book is built - but the book already on the exchange keeps earning,
 accruing funding, and losing names that leave the universe. Skipping those
 months (the old behavior) dropped that from the record entirely: between W06
@@ -11,8 +11,8 @@ read flat across the hole.
 
 The hold is capped. Past max_hold_months_no_promotion consecutive unconfirmed
 months the book is unwound at the volume-participation cap, because holding a
-stale book forever is an implicit bet that expired alpha persists - the exact
-assumption the persistence gate exists to refuse. Without the cap the tail of
+stale book forever is an implicit bet that expired alpha persists. Without
+the cap the tail of
 this dataset (rolls 18+ promote nothing, prices run to 2026-07) would park the
 W17 book on the exchange for 18 months.
 
