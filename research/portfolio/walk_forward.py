@@ -80,6 +80,18 @@ LEGACY_BACKTEST_TABLES = ('wf_portfolio_equity', 'wf_portfolio_returns_ew',
                           'wf_portfolio_returns_bench')
 
 
+def trailing_no_promo_streak(n_signals) -> int:
+    """Consecutive trailing windows that promoted nothing (drives the
+    hold-vs-unwind decision on the carried book after a resume)."""
+    streak = 0
+    for n in reversed(list(n_signals)):
+        if int(n) == 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 def _fmt_exposure(x: float) -> str:
     """Format a realized factor exposure for the acceptance-check printouts.
 
@@ -1764,7 +1776,54 @@ class WalkForwardPortfolio:
 
     # ---------------- driver ----------------
 
-    def run(self) -> pd.DataFrame:
+    def _restore_resume_state(self) -> int:
+        """Restore run state from the checkpointed wf_portfolio_* tables.
+
+        Returns the last completed window index (-1 = nothing to resume).
+        Only the contiguous prefix of completed windows counts; any rows
+        beyond a gap are cleared so the resumed run rewrites them."""
+        from dbutil import table_exists
+        if not table_exists('wf_portfolio_windows'):
+            logging.info("resume: no wf_portfolio_windows - starting fresh")
+            return -1
+        wins = load_data('wf_portfolio_windows')
+        if wins is None or wins.empty:
+            return -1
+        done = sorted(int(i) for i in wins['window_idx'].unique())
+        last = -1
+        for i in done:
+            if i == last + 1:
+                last = i
+            else:
+                break
+        for i in done:
+            if i > last:
+                self._clear_window_outputs(i)
+        if last < 0:
+            return -1
+        wins = wins[wins['window_idx'] <= last].sort_values('window_idx')
+        self._no_promo_streak = trailing_no_promo_streak(
+            wins['n_signals'].tolist())
+        ret = load_data(PORTFOLIO_RETURNS_TABLE)
+        if ret is not None and not ret.empty:
+            ret = ret.sort_values('timestamp')
+            last_row = ret.iloc[-1]
+            self._cum_wealth = 1.0 + float(last_row['cum_return'])
+            self._peak_wealth = (self._cum_wealth
+                                 / (1.0 + float(last_row['drawdown'])))
+        wts = load_data(WEIGHTS_TABLE)
+        if wts is not None and not wts.empty:
+            wts['timestamp'] = pd.to_datetime(wts['timestamp'])
+            snap = wts[wts['timestamp'] == wts['timestamp'].max()]
+            self._carry = pd.Series(snap['weight'].to_numpy(dtype=float),
+                                    index=snap['symbol'].to_numpy())
+        logging.info(f"resume: windows 0..{last} already complete; restored "
+                     f"carry ({len(self._carry)} positions), wealth "
+                     f"{self._cum_wealth:.4f}, no-promo streak "
+                     f"{self._no_promo_streak}")
+        return last
+
+    def run(self, resume: bool = False) -> pd.DataFrame:
         from tqdm import tqdm
         from research.signals.data import make_rolls
 
@@ -1810,7 +1869,10 @@ class WalkForwardPortfolio:
         self._peak_wealth = 1.0
         self._carry = pd.Series(dtype=float)  # fresh run starts flat
         self._no_promo_streak = 0
-        if self.persist:
+        last_done = -1
+        if self.persist and resume:
+            last_done = self._restore_resume_state()
+        elif self.persist:
             self._reset_backtest_tables()
         else:
             logging.warning(f"NULL-CONTROL run (control={self.control}): "
@@ -1819,6 +1881,8 @@ class WalkForwardPortfolio:
 
         prev = None
         for i, (t0, t1, t2) in enumerate(tqdm(schedule, desc="Windows")):
+            if i <= last_done:
+                continue
             res = self.run_window(i, t0, t1, t2, prev)
             if res is not None:
                 self.windows.append(res)
@@ -1827,12 +1891,22 @@ class WalkForwardPortfolio:
                 if res.selected:
                     prev = res
 
-        oos = [w.oos_returns for w in self.windows if w.oos_returns is not None]
-        if not oos:
-            logging.error("No OOS returns produced")
-            return pd.DataFrame()
-
-        returns = pd.concat(oos).sort_index()
+        if resume and self.persist:
+            # In-memory windows only cover the resumed tail; the full series
+            # lives in the checkpointed returns table.
+            db = load_data(PORTFOLIO_RETURNS_TABLE)
+            if db is None or db.empty:
+                logging.error("No OOS returns produced")
+                return pd.DataFrame()
+            db['timestamp'] = pd.to_datetime(db['timestamp'])
+            returns = db.set_index('timestamp').sort_index()
+        else:
+            oos = [w.oos_returns for w in self.windows
+                   if w.oos_returns is not None]
+            if not oos:
+                logging.error("No OOS returns produced")
+                return pd.DataFrame()
+            returns = pd.concat(oos).sort_index()
         returns['cum_return'] = (1 + returns['net_return']).cumprod() - 1
         peak = (1 + returns['cum_return']).cummax()
         returns['drawdown'] = (1 + returns['cum_return']) / peak - 1
@@ -1868,8 +1942,6 @@ class WalkForwardPortfolio:
         base_gross = PORT['gross_leverage']
         saved = (self.windows, self._carry, self._no_promo_streak,
                  self.persist, self._cum_wealth, self._peak_wealth)
-        logging.info("Re-running the walk-forward at %gx gross for the "
-                     "levered report (participation binds harder)...", lev)
         try:
             PORT['gross_leverage'] = base_gross * lev
             self.windows = []
@@ -2128,6 +2200,14 @@ def main():
     parser.add_argument('--control-seed', type=int, default=0,
                         help='Seed for shuffle/random controls (report '
                              'several seeds, not one)')
+    parser.add_argument('--fresh', action='store_true',
+                        help='Reset the wf_portfolio_* output tables and '
+                             'rebuild every window. Default is incremental: '
+                             'completed windows are kept and the run '
+                             'continues at the first missing one (carried '
+                             'book, wealth and no-promotion streak restored '
+                             'from the checkpoints). Signal/discovery '
+                             'tables are never touched either way.')
     args = parser.parse_args()
 
     logging.info("Walk-forward starting (registry -> scoring -> panels)...")
@@ -2135,7 +2215,7 @@ def main():
                               control_seed=args.control_seed)
     # run() checkpoints each window to the DB (wf_portfolio_*) as it
     # traverses - unless this is a control run (print-only).
-    returns = wf.run()
+    returns = wf.run(resume=not args.fresh)
     if returns.empty:
         print("No portfolio produced: no window had defensible tradable signals")
         return

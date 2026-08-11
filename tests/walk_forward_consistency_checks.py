@@ -27,7 +27,8 @@ import pandas as pd
 
 from research.portfolio.walk_forward import (WalkForwardPortfolio,
                                              apply_signal_control,
-                                             per_bar_alpha)
+                                             per_bar_alpha,
+                                             trailing_no_promo_streak)
 from research.lib.discovered import entries_from_promotions
 from research.signals import generation as gen
 from research.signals.search import DiscoveryLedger
@@ -155,6 +156,14 @@ r = led.to_frame().iloc[0]
 check("stamp: run/config/data/git columns on every ledger row",
       r['run_id'] == 'r1' and r['config_hash'] == 'c1'
       and r['data_hash'] == 'd1' and r['git_sha'] == 'g1')
+
+# ---------------------------------------------------------------------------
+print("--- 6. incremental run state ---")
+check("resume: trailing no-promo streak counts from the end",
+      trailing_no_promo_streak([2, 0, 0]) == 2
+      and trailing_no_promo_streak([0, 2, 3]) == 0
+      and trailing_no_promo_streak([]) == 0
+      and trailing_no_promo_streak([0, 0]) == 2)
 
 # ---------------------------------------------------------------------------
 print()

@@ -937,7 +937,8 @@ def _parse_json_array(text: str) -> list:
     except json.JSONDecodeError:
         start = text.find('[')
         if start < 0:
-            raise ValueError("no JSON array in response")
+            raise ValueError(
+                f"no JSON array in response (head: {text[:120]!r})")
         end = text.rfind(']')
         obj = None
         if end > start:
@@ -1105,17 +1106,20 @@ class OpenAICompatProposer(_ApiProposer):
         import requests
         base = str(self.llm_cfg.get('base_url')
                    or self.default_base_url).rstrip('/')
+        payload = {
+            'model': self.model,
+            'max_tokens': int(self.llm_cfg['max_tokens']),
+            'messages': [
+                {'role': 'system', 'content': _LLM_SYSTEM},
+                {'role': 'user', 'content': prompt},
+            ],
+        }
+        if self.llm_cfg.get('reasoning') is not None:
+            payload['reasoning'] = self.llm_cfg['reasoning']
         resp = requests.post(
             f'{base}/chat/completions',
             headers={'Authorization': f'Bearer {self._api_key()}'},
-            json={
-                'model': self.model,
-                'max_tokens': int(self.llm_cfg['max_tokens']),
-                'messages': [
-                    {'role': 'system', 'content': _LLM_SYSTEM},
-                    {'role': 'user', 'content': prompt},
-                ],
-            },
+            json=payload,
             timeout=float(self.llm_cfg.get('request_timeout_s', 120)))
         if resp.status_code != 200:
             e = Exception(f"{resp.status_code} {resp.text[:300]}")

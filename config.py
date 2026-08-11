@@ -779,6 +779,13 @@ config = {
             # model room to think ~3k tokens and still emit a full batch;
             # the parser salvages the prefix if a batch is ever cut.
             'max_tokens': 10240,
+            # OpenRouter's unified reasoning control, sent verbatim by the
+            # OpenAI-compatible client when set. Hybrid models
+            # (deepseek-v4-flash) think by default and can spend the whole
+            # max_tokens budget before emitting JSON; {'enabled': False}
+            # turns thinking off. None = omit from the request (use for
+            # providers that reject the parameter).
+            'reasoning': {'enabled': False},
             'candidates_per_call': 8,
             # Per-request timeout (seconds). A dropped connection (e.g. wifi
             # blip) then RAISES instead of hanging the whole run forever - the
