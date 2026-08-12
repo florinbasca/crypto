@@ -774,11 +774,11 @@ config = {
                 # ~$0.63/roll; 2M context
                 'xai': 'grok-4.1-fast',
             },
-            # max_output_tokens must cover BOTH the reasoning budget below
-            # AND the JSON (8 candidates ~= 2-3k tokens). 10240 leaves the
-            # model room to think ~3k tokens and still emit a full batch;
-            # the parser salvages the prefix if a batch is ever cut.
-            'max_tokens': 10240,
+            # Output budget per call: a full 8-candidate JSON batch is
+            # ~2-3k tokens, but occasional calls run long (verbose
+            # rationales, or an upstream that ignores the reasoning-off
+            # flag); the parser salvages the prefix if a batch is cut.
+            'max_tokens': 16384,
             # OpenRouter's unified reasoning control, sent verbatim by the
             # OpenAI-compatible client when set. Hybrid models
             # (deepseek-v4-flash) think by default and can spend the whole

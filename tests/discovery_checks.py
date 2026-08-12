@@ -307,6 +307,25 @@ check("fast path: exact-column candidate is fully measured",
       any(s['candidate'].hash == fast_seed.hash for s in fast_pop))
 
 # ---------------------------------------------------------------------------
+# 3b. Slot allocation: a dominant family may not hoover slots beyond the
+#     proposer's per-call capacity - the surplus spills to other families.
+# ---------------------------------------------------------------------------
+print("--- 3b. bandit slot allocation ---")
+_fams = ['a', 'b', 'c', 'd']
+_bandit = {'a': {'n': 100, 'sum': 8500.0},   # runaway reward mean
+           'b': {'n': 100, 'sum': 10.0},
+           'c': {'n': 100, 'sum': 5.0},
+           'd': {'n': 100, 'sum': 1.0}}
+_alloc = search_mod.allocate_batch(_bandit, _fams, 32, 1.0,
+                                   max_per_family=8)
+check("alloc: per-family cap binds and surplus spills",
+      _alloc['a'] == 8 and sum(_alloc.values()) == 32
+      and all(v <= 8 for v in _alloc.values()), f"({_alloc})")
+_uncapped = search_mod.allocate_batch(_bandit, _fams, 32, 1.0)
+check("alloc: uncapped allocation unchanged (control/random proposer)",
+      _uncapped['a'] > 8 and sum(_uncapped.values()) == 32, f"({_uncapped})")
+
+# ---------------------------------------------------------------------------
 # 4. Noise in, ~nothing out: the Benjamini-Hochberg gate on a pure-noise
 #    panel. Under the global null BH bounds the probability of promoting
 #    ANYTHING at fdr_alpha, so a noise roll should produce an (almost

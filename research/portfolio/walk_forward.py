@@ -1776,12 +1776,13 @@ class WalkForwardPortfolio:
 
     # ---------------- driver ----------------
 
-    def _restore_resume_state(self) -> int:
+    def _restore_resume_state(self, n_windows: int) -> int:
         """Restore run state from the checkpointed wf_portfolio_* tables.
 
         Returns the last completed window index (-1 = nothing to resume).
-        Only the contiguous prefix of completed windows counts; any rows
-        beyond a gap are cleared so the resumed run rewrites them."""
+        Only the contiguous prefix of completed windows counts; rows beyond
+        a gap - or beyond the current schedule, when discovery rolls were
+        deleted - are cleared so the resumed run rewrites them."""
         from dbutil import table_exists
         if not table_exists('wf_portfolio_windows'):
             logging.info("resume: no wf_portfolio_windows - starting fresh")
@@ -1796,8 +1797,11 @@ class WalkForwardPortfolio:
                 last = i
             else:
                 break
+        last = min(last, n_windows - 1)
         for i in done:
             if i > last:
+                logging.info(f"resume: clearing window {i} (beyond the "
+                             f"completed prefix / current schedule)")
                 self._clear_window_outputs(i)
         if last < 0:
             return -1
@@ -1871,7 +1875,7 @@ class WalkForwardPortfolio:
         self._no_promo_streak = 0
         last_done = -1
         if self.persist and resume:
-            last_done = self._restore_resume_state()
+            last_done = self._restore_resume_state(len(schedule))
         elif self.persist:
             self._reset_backtest_tables()
         else:
@@ -1992,6 +1996,76 @@ class WalkForwardPortfolio:
         delete_rows_where(WEIGHTS_TABLE, 'window', window_idx)
         delete_rows_where(RISK_TABLE, 'window', window_idx)
 
+    def _window_rows_for_report(self) -> List[dict]:
+        """Uniform per-window rows for summary(): from the checkpointed
+        wf_portfolio_windows table when persisting (covers windows kept by
+        an incremental run, not just those computed in-process), from the
+        in-memory WindowResults otherwise (control runs write no tables)."""
+        from dbutil import table_exists
+        if self.persist and table_exists('wf_portfolio_windows'):
+            wins = load_data('wf_portfolio_windows')
+            if wins is not None and not wins.empty:
+                traded_windows = set()
+                ret = load_data(PORTFOLIO_RETURNS_TABLE, columns=['window'])
+                if ret is not None and not ret.empty:
+                    traded_windows = {int(x) for x in ret['window'].unique()}
+                rows = []
+                for _, r in wins.sort_values('window_idx').iterrows():
+                    sel = str(r.get('selected') or '')
+                    bkt = ' '.join(
+                        f"{g.split(':', 1)[0]}:"
+                        f"{len(g.split(':', 1)[1].split(','))}"
+                        for g in sel.split(';') if ':' in g)
+                    fams = [f for f in
+                            str(r.get('selected_families') or '').split(';')
+                            if f]
+                    fam_str = ' '.join(fams[:3]) + (
+                        f' (+{len(fams) - 3})' if len(fams) > 3 else '')
+                    rows.append({
+                        'idx': int(r['window_idx']),
+                        'period': f"{pd.Timestamp(r['train_end']).date()}-"
+                                  f"{pd.Timestamp(r['test_end']).date()}",
+                        'n_sig': int(r.get('n_signals') or 0),
+                        'bkt': bkt or str(r.get('hold_state') or '') or '-',
+                        'sharpe': float(r.get('oos_sharpe') or 0.0),
+                        'mkt': float(r['avg_abs_mkt_exposure'])
+                               if pd.notna(r.get('avg_abs_mkt_exposure'))
+                               else np.nan,
+                        'size': float(r['avg_abs_size_exposure'])
+                                if pd.notna(r.get('avg_abs_size_exposure'))
+                                else np.nan,
+                        'gross': float(r['avg_gross'])
+                                 if pd.notna(r.get('avg_gross')) else np.nan,
+                        'to': float(r['avg_turnover'])
+                              if pd.notna(r.get('avg_turnover')) else np.nan,
+                        'fam': fam_str,
+                        'traded': int(r['window_idx']) in traded_windows,
+                    })
+                return rows
+        rows = []
+        for w in self.windows:
+            labs = sorted(w.selected,
+                          key=lambda s: int(str(s).rstrip('b') or 0))
+            bkt = (' '.join(f'{b}:{len(w.selected[b])}' for b in labs)
+                   or w.hold_state)
+            fam = list(self._selected_family_counts(w).items())
+            fam_str = ' '.join(f'{k}:{v}' for k, v in fam[:3]) + (
+                f' (+{len(fam) - 3})' if len(fam) > 3 else '')
+            rows.append({
+                'idx': w.window_idx,
+                'period': f'{w.train_end.date()}-{w.test_end.date()}',
+                'n_sig': sum(len(s) for s in w.selected.values()),
+                'bkt': bkt or '-',
+                'sharpe': w.oos_sharpe,
+                'mkt': w.avg_abs_mkt_exposure,
+                'size': w.avg_abs_size_exposure,
+                'gross': w.avg_gross,
+                'to': w.avg_turnover,
+                'fam': fam_str,
+                'traded': w.oos_returns is not None,
+            })
+        return rows
+
     def summary(self, returns: pd.DataFrame):
         ppy = BARS_PER_DAY * 365
         r = returns['net_return']
@@ -2016,11 +2090,12 @@ class WalkForwardPortfolio:
         # where it really binds.
         lev_stats = self._levered_stats
 
-        traded = [w for w in self.windows if w.oos_returns is not None]
-        avg_mkt = np.nanmean([w.avg_abs_mkt_exposure for w in traded]) if traded else np.nan
-        avg_size = np.nanmean([w.avg_abs_size_exposure for w in traded]) if traded else np.nan
-        avg_gross = np.nanmean([w.avg_gross for w in traded]) if traded else np.nan
-        avg_to = np.nanmean([w.avg_turnover for w in traded]) if traded else np.nan
+        report_rows = self._window_rows_for_report()
+        traded = [x for x in report_rows if x['traded']]
+        avg_mkt = np.nanmean([x['mkt'] for x in traded]) if traded else np.nan
+        avg_size = np.nanmean([x['size'] for x in traded]) if traded else np.nan
+        avg_gross = np.nanmean([x['gross'] for x in traded]) if traded else np.nan
+        avg_to = np.nanmean([x['to'] for x in traded]) if traded else np.nan
 
         print("\n" + "=" * 70)
         print("WALK-FORWARD MARKET-NEUTRAL PORTFOLIO")
@@ -2030,7 +2105,7 @@ class WalkForwardPortfolio:
         print(f"Sharpe:             {sharpe:.2f}")
         print(f"Sharpe (1-bar lag): {sharpe_lag:.2f}  (execution-fragility stress)")
         print(f"Max drawdown:       {returns['drawdown'].min() * 100:.1f}%")
-        print(f"Windows traded:     {len(traded)}/{len(self.windows)}")
+        print(f"Windows traded:     {len(traded)}/{len(report_rows)}")
         _bands = PORT.get('neutrality_band', {})
         print(f"Avg |mkt beta exp|: {_fmt_exposure(avg_mkt)}  "
               f"(market-neutrality check, band {_bands.get('market', 0.0):.2f})")
@@ -2064,24 +2139,11 @@ class WalkForwardPortfolio:
         table.add_column('OOS_SR', justify='right', no_wrap=True)
         table.add_column('|mkt|', justify='right', no_wrap=True)
         table.add_column('top families')
-        for w in self.windows:
-            labs = sorted(w.selected, key=lambda s: int(str(s).rstrip('b') or 0))
-            bkt = ' '.join(f'{b}:{len(w.selected[b])}' for b in labs)
-            # A no-signal month still carries risk while the book is held or
-            # unwound; '-' is reserved for the genuinely flat ones.
-            bkt = bkt or w.hold_state
-            fam = list(self._selected_family_counts(w).items())
-            fam_str = ' '.join(f'{k}:{v}' for k, v in fam[:3])
-            if len(fam) > 3:
-                fam_str += f' (+{len(fam) - 3})'
+        for x in report_rows:
             table.add_row(
-                f'W{w.window_idx:02d}',
-                f'{w.train_end.date()}-{w.test_end.date()}',
-                str(sum(len(s) for s in w.selected.values())),
-                bkt or '-',
-                f'{w.oos_sharpe:.2f}',
-                _fmt_exposure(w.avg_abs_mkt_exposure),
-                fam_str)
+                f"W{x['idx']:02d}", x['period'], str(x['n_sig']),
+                x['bkt'], f"{x['sharpe']:.2f}", _fmt_exposure(x['mkt']),
+                x['fam'])
         print()
         Console().print(table)
 

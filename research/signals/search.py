@@ -651,13 +651,23 @@ class DiscoveryLedger:
 # =============================================================================
 
 def allocate_batch(bandit: Dict[str, dict], families: List[str],
-                   batch_size: int, ucb_c: float) -> Dict[str, int]:
+                   batch_size: int, ucb_c: float,
+                   max_per_family: Optional[int] = None) -> Dict[str, int]:
     """UCB allocation of one generation's proposal slots across families.
-    Untried families are drawn first (deterministically, in order)."""
+    Untried families are drawn first (deterministically, in order).
+
+    max_per_family caps one family's slots per generation at the proposer's
+    per-call capacity: an API proposer makes ONE call per family per
+    generation and emits at most candidates_per_call formulas, so slots
+    beyond that are unfillable and must spill to other families instead."""
     alloc = {f: 0 for f in families}
     n_total = sum(b['n'] for b in bandit.values())
     for _ in range(batch_size):
-        untried = [f for f in families if bandit[f]['n'] + alloc[f] == 0]
+        eligible = [f for f in families
+                    if max_per_family is None or alloc[f] < max_per_family]
+        if not eligible:
+            break
+        untried = [f for f in eligible if bandit[f]['n'] + alloc[f] == 0]
         if untried:
             pick = untried[0]
         else:
@@ -666,7 +676,7 @@ def allocate_batch(bandit: Dict[str, dict], families: List[str],
                 mean = bandit[f]['sum'] / max(bandit[f]['n'], 1)
                 return mean + ucb_c * math.sqrt(
                     math.log(max(n_total + batch_size, 2)) / n)
-            pick = max(families, key=ucb)
+            pick = max(eligible, key=ucb)
         alloc[pick] += 1
     return alloc
 
@@ -1124,7 +1134,9 @@ def run_search(panel: pd.DataFrame, roll: Roll,
         for gen in gen_bar:
             alloc = allocate_batch(bandit, families,
                                    int(search_cfg['batch_size']),
-                                   float(search_cfg['bandit_ucb_c']))
+                                   float(search_cfg['bandit_ucb_c']),
+                                   max_per_family=getattr(
+                                       proposer, 'per_call_cap', None))
             parents = [s['candidate'] for s in population]
             parent_scores = _parent_scores(population)
             fail_hint = [{'expression': c.to_dict()['expression'],

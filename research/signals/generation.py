@@ -518,6 +518,11 @@ class Proposer(ABC):
     returns. Implementations must be swappable: the harness runs identically
     with the random-mutation baseline (no API) and the LLM proposer."""
 
+    # Max candidates one propose() call can emit; None = unbounded (the
+    # random baseline generates exactly n). The slot allocator caps a
+    # family's per-generation allocation at this so no slot is unfillable.
+    per_call_cap: Optional[int] = None
+
     @abstractmethod
     def propose(self, n: int, family: str, diagnostics: dict,
                 parents: Sequence[Candidate],
@@ -727,6 +732,10 @@ class _ApiProposer(Proposer):
     """
 
     provider = ''   # set by subclasses; selects model + price config entries
+
+    @property
+    def per_call_cap(self) -> Optional[int]:
+        return int(self.llm_cfg['candidates_per_call'])
 
     def __init__(self, llm_cfg: Optional[dict] = None,
                  dsl_cfg: Optional[dict] = None):
